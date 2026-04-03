@@ -1,5 +1,8 @@
 # VideoRLM Hoạt Động Như Thế Nào
 
+Nếu bạn muốn đi sâu vào data model, state machine và runtime loop, xem thêm:
+[video_rlm_technical_details.md](/share_4/users/duy/project/rlm/docs/video_rlm_technical_details.md)
+
 ## Mục Tiêu Của VideoRLM
 
 VideoRLM được thiết kế để trả lời câu hỏi trên video dài mà không cần "đọc hết video một lần".
