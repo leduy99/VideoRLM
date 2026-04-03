@@ -20,6 +20,10 @@ def get_client(
         from rlm.clients.openai import OpenAIClient
 
         return OpenAIClient(**backend_kwargs)
+    elif backend == "transformers":
+        from rlm.clients.transformers_local import TransformersClient
+
+        return TransformersClient(**backend_kwargs)
     elif backend == "vllm":
         from rlm.clients.openai import OpenAIClient
 
@@ -55,5 +59,7 @@ def get_client(
         return AzureOpenAIClient(**backend_kwargs)
     else:
         raise ValueError(
-            f"Unknown backend: {backend}. Supported backends: ['openai', 'vllm', 'portkey', 'openrouter', 'anthropic', 'azure_openai', 'gemini', 'vercel']"
+            "Unknown backend: "
+            f"{backend}. Supported backends: ['openai', 'transformers', 'vllm', "
+            "'portkey', 'openrouter', 'anthropic', 'azure_openai', 'gemini', 'vercel']"
         )

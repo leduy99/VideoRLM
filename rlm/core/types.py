@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 ClientBackend = Literal[
     "openai",
+    "transformers",
     "portkey",
     "openrouter",
     "vercel",

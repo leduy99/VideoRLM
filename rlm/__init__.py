@@ -6,9 +6,11 @@ from rlm.utils.exceptions import (
     TimeoutExceededError,
     TokenLimitExceededError,
 )
+from rlm.video import VideoRLM
 
 __all__ = [
     "RLM",
+    "VideoRLM",
     "BudgetExceededError",
     "TimeoutExceededError",
     "TokenLimitExceededError",

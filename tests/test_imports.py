@@ -15,7 +15,9 @@ class TestTopLevelImports:
         import rlm
 
         assert hasattr(rlm, "RLM")
+        assert hasattr(rlm, "VideoRLM")
         assert "RLM" in rlm.__all__
+        assert "VideoRLM" in rlm.__all__
 
     def test_rlm_rlm_import(self):
         """Test that RLM class can be imported from rlm."""
@@ -104,6 +106,30 @@ class TestCoreImports:
         from rlm.core.rlm import RLM
 
         assert RLM is not None
+
+    def test_video_rlm_import(self):
+        """Test VideoRLM import."""
+        from rlm import VideoRLM
+
+        assert VideoRLM is not None
+
+    def test_video_module_imports(self):
+        """Test VideoRLM module imports."""
+        from rlm.video import (
+            LocalQwenASRSpeechRecognizer,
+            LongShOTBenchmarkRunner,
+            VideoMemoryBuilder,
+            VideoMemoryIndex,
+            VideoRLM,
+            VideoRLMLogger,
+        )
+
+        assert VideoRLM is not None
+        assert VideoMemoryBuilder is not None
+        assert VideoMemoryIndex is not None
+        assert VideoRLMLogger is not None
+        assert LongShOTBenchmarkRunner is not None
+        assert LocalQwenASRSpeechRecognizer is not None
 
     def test_core_lm_handler_import(self):
         """Test LMHandler import."""
