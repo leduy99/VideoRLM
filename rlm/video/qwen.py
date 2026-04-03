@@ -134,6 +134,8 @@ class QwenVideoStackConfig:
         max_steps: int = 8,
         search_top_k: int = 5,
         max_frontier_items: int = 8,
+        enable_hybrid_speech_refinement: bool = False,
+        speech_refine_candidate_count: int = 4,
     ) -> QwenVideoRuntimeBundle:
         speech_recognizer = OpenAICompatibleSpeechRecognizer(
             model_name=self.speech.model_name,
@@ -175,6 +177,8 @@ class QwenVideoStackConfig:
             max_steps=max_steps,
             search_top_k=search_top_k,
             max_frontier_items=max_frontier_items,
+            enable_hybrid_speech_refinement=enable_hybrid_speech_refinement,
+            speech_refine_candidate_count=speech_refine_candidate_count,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
@@ -273,6 +277,8 @@ class QwenLocalVideoStackConfig:
         max_steps: int = 8,
         search_top_k: int = 5,
         max_frontier_items: int = 8,
+        enable_hybrid_speech_refinement: bool = False,
+        speech_refine_candidate_count: int = 4,
     ) -> QwenVideoRuntimeBundle:
         controller_client = TransformersClient(
             model_name=self.controller.model_name,
@@ -326,6 +332,8 @@ class QwenLocalVideoStackConfig:
             max_steps=max_steps,
             search_top_k=search_top_k,
             max_frontier_items=max_frontier_items,
+            enable_hybrid_speech_refinement=enable_hybrid_speech_refinement,
+            speech_refine_candidate_count=speech_refine_candidate_count,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
