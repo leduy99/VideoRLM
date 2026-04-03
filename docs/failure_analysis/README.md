@@ -1,0 +1,11 @@
+# Failure Analysis
+
+Thư mục này dùng để lưu các note phân tích failure mode cụ thể của VideoRLM.
+
+Mục tiêu của các note ở đây:
+- tách riêng phần debug ra khỏi overview tài liệu chung
+- giúp nhìn lại từng sample benchmark một cách có hệ thống
+- ghi rõ hệ đã đúng ở đâu, sai ở đâu, và vì sao
+
+Các note hiện có:
+- `sample_8563_heuristic.md`: phân tích failure của `sample_8563` ở chế độ `heuristic-only`
