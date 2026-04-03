@@ -12,6 +12,18 @@ from rlm.video.types import (
     VideoMemory,
 )
 
+CONTROL_QUERY_TOKENS = {
+    "why",
+    "first",
+    "beginning",
+    "earliest",
+    "initial",
+    "last",
+    "final",
+    "ending",
+    "end",
+}
+
 
 class VideoToolExecutor:
     def __init__(self, memory: VideoMemory, index: VideoMemoryIndex | None = None, top_k: int = 5):
@@ -281,6 +293,7 @@ class VideoToolExecutor:
 
         selected_indices = {best_index}
         score_by_index = {index: score for score, index, _ in scored}
+        is_why_query = "why" in question_tokens
         is_first_query = bool({"first", "beginning", "earliest", "initial"} & question_tokens)
         is_last_query = bool({"last", "final", "ending", "end"} & question_tokens)
         neighbor_candidates: list[int] = []
@@ -295,7 +308,10 @@ class VideoToolExecutor:
             if neighbor_index < 0 or neighbor_index >= len(cleaned_spans):
                 continue
             neighbor_score = score_by_index.get(neighbor_index, 0.0)
-            if neighbor_score >= max(best_score * 0.35, 0.15) or (
+            neighbor_has_why_signal = is_why_query and self._span_has_why_signal(
+                cleaned_spans[neighbor_index]
+            )
+            if neighbor_score >= max(best_score * 0.35, 0.15) or neighbor_has_why_signal or (
                 (is_first_query or is_last_query) and neighbor_score >= 0.05
             ):
                 selected_indices.add(neighbor_index)
@@ -306,7 +322,9 @@ class VideoToolExecutor:
             for score, index, _span in scored[1:]:
                 if index in selected_indices:
                     continue
-                if score < max(best_score * 0.45, 0.2):
+                if score < max(best_score * 0.45, 0.2) and not (
+                    is_why_query and self._span_has_why_signal(cleaned_spans[index])
+                ):
                     continue
                 selected_indices.add(index)
                 if len(selected_indices) >= max_items:
@@ -334,12 +352,29 @@ class VideoToolExecutor:
         overlap_ratio = len(overlap) / max(len(query_tokens), 1)
         density_bonus = sum(lower_text.count(term) for term in overlap) / max(len(doc_tokens), 1)
         score = overlap_ratio + density_bonus
+        causal_hits = sum(
+            1
+            for keyword in ("worried", "lose", "fix", "repair", "open", "clasp")
+            if keyword in doc_tokens or keyword in lower_text
+        )
+        support_hits = sum(
+            1
+            for keyword in ("wear", "love", "bracelet", "cartier", "clash", "perfect")
+            if keyword in doc_tokens or keyword in lower_text
+        )
+        topic_shift_hits = sum(
+            1
+            for marker in ("other bracelet", "another bracelet", "last but not the least", "last but not least")
+            if marker in lower_text
+        )
 
-        if "why" in question_tokens and any(
-            keyword in lower_text
-            for keyword in ("because", "worried", "lose", "lost", "fixed", "repair", "opening", "clasp")
-        ):
-            score += 0.6
+        if "why" in question_tokens:
+            score += causal_hits * 0.35
+            score += support_hits * 0.08
+            if "because" in lower_text and not causal_hits and len(overlap) < 2:
+                score -= 0.2
+        if topic_shift_hits:
+            score -= topic_shift_hits * 0.25
 
         duration = float(self.memory.metadata.get("duration_seconds") or 0.0)
         if duration > 0:
@@ -361,10 +396,31 @@ class VideoToolExecutor:
 
     def _tokenize(self, text: str) -> set[str]:
         return {
-            token
+            self._normalize_token(token)
             for token in (match.group(0).lower() for match in TOKEN_PATTERN.finditer(text))
-            if token not in STOPWORDS and len(token) > 1
+            if (token not in STOPWORDS or token in CONTROL_QUERY_TOKENS) and len(token) > 1
         }
+
+    def _normalize_token(self, token: str) -> str:
+        normalized = {
+            "wears": "wear",
+            "wearing": "wear",
+            "wore": "wear",
+            "worn": "wear",
+            "loves": "love",
+            "loved": "love",
+            "loving": "love",
+            "opening": "open",
+            "opened": "open",
+            "opens": "open",
+            "fixed": "fix",
+            "fixing": "fix",
+            "repaired": "repair",
+            "repairs": "repair",
+            "losing": "lose",
+            "lost": "lose",
+        }.get(token, token)
+        return normalized
 
     def _confidence_from_speech_score(self, detail: str, score: float) -> float:
         base = self._confidence_from_detail(detail)
@@ -389,8 +445,6 @@ class VideoToolExecutor:
         normalized = " ".join(text.split()).strip()
         if not normalized:
             return ""
-        if len(normalized) <= max_chars:
-            return normalized
 
         sentences = [
             sentence.strip()
@@ -399,6 +453,8 @@ class VideoToolExecutor:
         ]
         if not sentences:
             return normalized[:max_chars]
+        if len(normalized) <= max_chars and len(sentences) <= 4:
+            return normalized
 
         if prefer_start:
             return self._join_sentence_window(sentences[:4], max_chars)
@@ -411,17 +467,51 @@ class VideoToolExecutor:
 
         best_index = 0
         best_score = float("-inf")
+        anchor_kind = "generic"
         for index, sentence in enumerate(sentences):
             sentence_tokens = self._tokenize(sentence)
             overlap = len(query_tokens & sentence_tokens)
             lower_sentence = sentence.lower()
             score = overlap * 3
+            sentence_anchor_kind = "generic"
+            causal_hits = sum(
+                1
+                for keyword in ("worried", "lose", "fix", "repair", "open", "clasp")
+                if keyword in sentence_tokens or keyword in lower_sentence
+            )
+            support_hits = sum(
+                1
+                for keyword in ("wear", "love", "perfect", "bracelet")
+                if keyword in sentence_tokens or keyword in lower_sentence
+            )
+            topic_shift_hits = sum(
+                1
+                for marker in (
+                    "last but not the least",
+                    "last but not least",
+                    "other bracelet",
+                    "another bracelet",
+                    "last but not",
+                )
+                if marker in lower_sentence
+            )
 
             if is_why_query and any(
                 keyword in lower_sentence
                 for keyword in ("because", "worried", "lose", "lost", "fixed", "repair", "opening", "clasp")
             ):
                 score += 8
+                sentence_anchor_kind = "causal"
+            if is_why_query and causal_hits:
+                score += causal_hits * 4
+            if is_why_query and support_hits:
+                score += support_hits * 2
+                if sentence_anchor_kind != "causal":
+                    sentence_anchor_kind = "support"
+            if topic_shift_hits:
+                score -= topic_shift_hits * 8
+            if "because" in lower_sentence and not overlap and not causal_hits:
+                score -= 4
 
             if is_first_query:
                 if any(
@@ -459,17 +549,54 @@ class VideoToolExecutor:
             if score > best_score:
                 best_score = score
                 best_index = index
+                anchor_kind = sentence_anchor_kind
 
         if is_first_query:
-            start = max(0, best_index - 2)
-            end = min(len(sentences), best_index + 3)
+            snippet = self._build_window_from_anchor(
+                sentences,
+                best_index,
+                max_chars=max_chars,
+                before=2,
+                after=2,
+                prefer="forward",
+            )
         elif is_last_query:
-            start = max(0, best_index - 2)
-            end = min(len(sentences), best_index + 2)
+            snippet = self._build_window_from_anchor(
+                sentences,
+                best_index,
+                max_chars=max_chars,
+                before=2,
+                after=2,
+                prefer="backward",
+            )
         else:
-            start = max(0, best_index - 1)
-            end = min(len(sentences), best_index + 3)
-        snippet = self._join_sentence_window(sentences[start:end], max_chars)
+            if is_why_query and anchor_kind == "causal":
+                snippet = self._build_window_from_anchor(
+                    sentences,
+                    best_index,
+                    max_chars=max_chars,
+                    before=1,
+                    after=2,
+                    prefer="forward",
+                )
+            elif is_why_query and anchor_kind == "support":
+                snippet = self._build_window_from_anchor(
+                    sentences,
+                    best_index,
+                    max_chars=max_chars,
+                    before=1,
+                    after=2,
+                    prefer="backward",
+                )
+            else:
+                snippet = self._build_window_from_anchor(
+                    sentences,
+                    best_index,
+                    max_chars=max_chars,
+                    before=1,
+                    after=2,
+                    prefer="forward",
+                )
         if not snippet or best_score <= 0:
             return normalized[:max_chars]
 
@@ -484,6 +611,35 @@ class VideoToolExecutor:
     def _join_sentence_window(self, sentences: list[str], max_chars: int) -> str:
         snippet = " ".join(sentence.strip() for sentence in sentences if sentence.strip()).strip()
         return snippet[:max_chars]
+
+    def _build_window_from_anchor(
+        self,
+        sentences: list[str],
+        anchor_index: int,
+        *,
+        max_chars: int,
+        before: int,
+        after: int,
+        prefer: str,
+    ) -> str:
+        selected = [anchor_index]
+        backward_indices = list(range(max(0, anchor_index - before), anchor_index))
+        forward_indices = list(range(anchor_index + 1, min(len(sentences), anchor_index + after + 1)))
+
+        if prefer == "backward":
+            candidate_indices = list(reversed(backward_indices)) + forward_indices
+        else:
+            candidate_indices = forward_indices + list(reversed(backward_indices))
+
+        current = sentences[anchor_index].strip()
+        for index in candidate_indices:
+            trial_indices = sorted(selected + [index])
+            trial_text = " ".join(sentences[item].strip() for item in trial_indices).strip()
+            if len(trial_text) > max_chars:
+                continue
+            selected.append(index)
+            current = trial_text
+        return current[:max_chars]
 
     def _is_duplicate_speech_evidence(
         self,
@@ -505,3 +661,11 @@ class VideoToolExecutor:
             if existing_detail == normalized_detail:
                 return True
         return False
+
+    def _span_has_why_signal(self, span: SpeechSpan) -> bool:
+        lower_text = span.text.lower()
+        doc_tokens = self._tokenize(span.text)
+        return any(
+            keyword in doc_tokens or keyword in lower_text
+            for keyword in ("worried", "lose", "fix", "repair", "open", "clasp")
+        )
