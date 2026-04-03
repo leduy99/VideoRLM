@@ -32,6 +32,9 @@ class VideoRLM:
         max_steps: int = 8,
         search_top_k: int = 5,
         max_frontier_items: int = 8,
+        enable_hybrid_speech_refinement: bool = False,
+        speech_snippet_refiner_client: BaseLM | None = None,
+        speech_refine_candidate_count: int = 4,
     ):
         self.controller_backend = controller_backend
         self.controller_backend_kwargs = controller_backend_kwargs or {}
@@ -42,6 +45,11 @@ class VideoRLM:
         self.max_steps = max_steps
         self.search_top_k = search_top_k
         self.max_frontier_items = max_frontier_items
+        self.enable_hybrid_speech_refinement = enable_hybrid_speech_refinement
+        self.speech_snippet_refiner_client = speech_snippet_refiner_client or (
+            self.controller_client if enable_hybrid_speech_refinement else None
+        )
+        self.speech_refine_candidate_count = speech_refine_candidate_count
 
     def run(
         self,
@@ -52,7 +60,14 @@ class VideoRLM:
     ) -> VideoRLMResult:
         start_time = time.perf_counter()
         index = VideoMemoryIndex(memory)
-        tools = VideoToolExecutor(memory=memory, index=index, top_k=self.search_top_k)
+        tools = VideoToolExecutor(
+            memory=memory,
+            index=index,
+            top_k=self.search_top_k,
+            speech_snippet_refiner=self.speech_snippet_refiner_client,
+            enable_hybrid_speech_refinement=self.enable_hybrid_speech_refinement,
+            speech_refine_candidate_count=self.speech_refine_candidate_count,
+        )
         state = self._build_initial_state(
             question=question,
             memory=memory,
@@ -69,6 +84,7 @@ class VideoRLM:
                     "video_id": memory.video_id,
                     "max_steps": self.max_steps,
                     "search_top_k": self.search_top_k,
+                    "hybrid_speech_refinement": self.enable_hybrid_speech_refinement,
                 }
             )
 

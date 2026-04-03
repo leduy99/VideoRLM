@@ -491,3 +491,102 @@
 - The system already knew where to look.
 - The failure came from how evidence was carved out of the right span, not from the absence of the right span.
 - In practice, this means targeted evidence-extraction fixes can recover benchmark behavior without rerunning the whole preprocessing stack.
+
+## Update: Hybrid Speech Snippet Refinement Experiment
+
+### What we tried
+- Added an optional hybrid mode to `OPEN(..., speech)`:
+  - heuristic span selection still runs first
+  - the tool then builds a small shortlist of grounded candidate snippets from the raw transcript
+  - if the span looks ambiguous, a language model can choose candidate ids instead of generating free-form text
+- The implementation is behind `enable_hybrid_speech_refinement=False` by default, so the stable runtime path is unchanged unless explicitly enabled.
+
+### Why we tried it
+- The heuristic-only tool is cheap and debuggable, but it still has a blind spot on long, messy spans with multiple topics.
+- The goal of the hybrid experiment was:
+  - keep exact snippet text grounded in the transcript
+  - let the LLM help only with the final `candidate -> chosen snippet` selection
+  - avoid fully replacing `OPEN(..., speech)` with free-form LLM summarization
+
+### Code changes
+- `rlm/video/tools.py`
+  - added candidate-snippet generation for speech evidence
+  - added hybrid gating and prompt construction for candidate-id selection
+  - added metadata fields like `selection_mode`, `refinement_triggered`, and `selected_candidate_ids`
+- `rlm/video/controller.py`
+  - threads hybrid configuration into the tool executor
+- `rlm/video/qwen.py`
+  - exposes hybrid flags in the Qwen stack bundle builders
+- `tests/video/test_video_tools.py`
+  - added tests for:
+    - hybrid refiner selecting a better causal snippet
+    - hybrid refiner staying idle on short, already-clear spans
+
+### Validation
+- Focused checks:
+  - `conda run -n videorlm python -m pytest tests/video/test_video_tools.py tests/video/test_video_controller.py tests/video/test_video_qwen_local.py -q`
+  - result: `18 passed`
+- Full repo checks:
+  - `conda run -n videorlm python -m ruff check .`
+  - `conda run -n videorlm python -m pytest -q`
+  - result: `334 passed, 7 skipped`
+
+### 4-sample LongShOT evaluation
+- Compared heuristic-only vs hybrid on 4 cached LongShOT samples:
+  - `sample_6009`
+  - `sample_6168`
+  - `sample_6815`
+  - `sample_8563`
+- Output files:
+  - `output/longshot_hybrid_eval_4samples/results.json`
+  - `output/longshot_hybrid_eval_4samples/summary.md`
+
+### Result summary
+- `sample_6009`
+  - baseline F1 vs gold: `0.5041`
+  - hybrid F1 vs gold: `0.5280`
+  - small improvement
+- `sample_6168`
+  - baseline F1 vs gold: `0.6116`
+  - hybrid F1 vs gold: `0.4773`
+  - regression
+- `sample_6815`
+  - baseline F1 vs gold: `0.6275`
+  - hybrid F1 vs gold: `0.3590`
+  - strong regression
+- `sample_8563`
+  - baseline F1 vs gold: `0.2449`
+  - hybrid F1 vs gold: `0.1860`
+  - regression
+- Average token-F1 over the 4 samples:
+  - baseline: `0.4970`
+  - hybrid: `0.3876`
+
+### What we learned
+- The hybrid path is not good enough to enable by default.
+- It can help on some `why` questions by selecting a more direct quote.
+- But it currently introduces two important failure modes:
+  - **Over-compression on causal questions**
+    - Example: `sample_6168`
+    - the hybrid refiner selected a strong causal snippet (`opening / worried / Cartier fixed`) but encouraged the controller to stop earlier
+    - the final answer lost the follow-up support (`now it's really perfect`, `still hasn't worn it much`)
+  - **Over-selection of quirky early snippets on `first` questions**
+    - Example: `sample_8563`
+    - the refiner selected an early snippet about `chicken skin` / `lightly bizarre fried treats`
+    - this pulled the answer away from the correct target: `chicken head`
+
+### Debug artifacts for the regressions
+- Saved extra hybrid debug runs to:
+  - `output/longshot_hybrid_eval_4samples/debug/sample_6168_hybrid_debug.json`
+  - `output/longshot_hybrid_eval_4samples/debug/sample_8563_hybrid_debug.json`
+- These confirm:
+  - `sample_6168`: the refiner chose a good causal snippet, but the loop stopped with only one evidence item
+  - `sample_8563`: the refiner chose the wrong early candidate and amplified the error
+
+### Current recommendation
+- Keep the hybrid path as an **experimental, opt-in feature only**.
+- Do **not** turn it on by default yet.
+- The next upgrade should likely be narrower than this first hybrid attempt:
+  - only trigger LLM refinement for ambiguous `why` cases
+  - keep heuristic-only behavior for `first / last` temporal questions
+  - add a way to preserve follow-up support evidence instead of letting the controller stop after one concise causal snippet

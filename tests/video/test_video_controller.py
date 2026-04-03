@@ -101,6 +101,52 @@ def test_videorlm_controller_synthesizes_fallback_answer_from_evidence():
     assert result.answer == "The plan changes early in the meeting after reviewing the numbers."
 
 
+def test_videorlm_controller_can_use_hybrid_speech_refinement():
+    memory = build_memory()
+    controller_responses = [
+        json.dumps(
+            {
+                "action_type": "OPEN",
+                "node_id": "meeting_scene_001",
+                "modality": "speech",
+                "evidence_ids": [],
+                "query": None,
+                "answer": None,
+                "rationale": "Inspect the main speech node.",
+            }
+        ),
+        json.dumps(
+            {
+                "action_type": "STOP",
+                "node_id": None,
+                "modality": None,
+                "evidence_ids": ["evidence_00001"],
+                "query": None,
+                "answer": "The plan changes after reviewing the numbers.",
+                "rationale": "The opened speech evidence already answers the question.",
+            }
+        ),
+    ]
+    controller_model = MockLM(model_name="mock-controller", responses=controller_responses)
+    refiner_model = MockLM(
+        model_name="mock-refiner",
+        responses=['{"selected_candidate_ids":["c1"],"reason":"c1 is already focused."}'],
+    )
+    runner = VideoRLM(
+        controller_client=controller_model,
+        speech_snippet_refiner_client=refiner_model,
+        enable_hybrid_speech_refinement=True,
+        max_steps=4,
+        search_top_k=3,
+        max_frontier_items=4,
+    )
+
+    result = runner.run("When does the plan change?", memory, task_type="retrieval")
+
+    assert "reviewing the numbers" in result.answer
+    assert result.state.evidence_ledger[0].metadata["selection_mode"] in {"heuristic", "hybrid_llm"}
+
+
 def test_videorlm_controller_stops_after_repeated_empty_open_steps():
     memory = build_memory()
     responses = [

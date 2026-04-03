@@ -1,6 +1,7 @@
 from rlm.video.memory import PreparedVideoArtifacts, VideoMemoryBuilder
 from rlm.video.tools import VideoToolExecutor
 from rlm.video.types import ControllerState, SpeechSpan, TimeSpan
+from tests.mock_lm import MockLM
 
 
 def build_memory_for_tools(spans: list[SpeechSpan]):
@@ -323,3 +324,108 @@ def test_open_speech_why_query_does_not_pull_unrelated_intro_span():
     assert len(observation.evidence) == 1
     assert observation.evidence[0].time_span.start == 10.0
     assert "leon diamond" not in observation.evidence[0].detail.lower()
+
+
+def test_open_speech_hybrid_refiner_selects_better_candidate_for_why_query():
+    memory = build_memory_for_tools(
+        [
+            SpeechSpan(
+                text=(
+                    "The one bracelet that I probably wore the most of all is my Cartier I Love "
+                    "pave bracelet. This bracelet I've also done an unboxing for. Actually, wow, "
+                    "it's quite heavy now. One other bracelet that made my best and worst purchases "
+                    "list is my Cartier Clash bracelet. For the Clash bracelet the clasp was opening "
+                    "a lot, and I was really worried that I would lose it because I love it so much. "
+                    "So I brought it back to Cartier and they fixed it very quickly."
+                ),
+                time_span=TimeSpan(0.0, 45.0),
+            )
+        ]
+    )
+    def pick_causal_candidate(prompt):
+        prompt_text = str(prompt)
+        for line in prompt_text.splitlines():
+            if ": " not in line or not line.startswith("c"):
+                continue
+            candidate_id, detail = line.split(": ", maxsplit=1)
+            if "clasp was opening" in detail.lower():
+                return (
+                    '{"selected_candidate_ids":["'
+                    + candidate_id
+                    + '"],"reason":"The selected candidate is the direct causal snippet."}'
+                )
+        return '{"selected_candidate_ids":["c1"],"reason":"fallback"}'
+
+    refiner = MockLM(
+        model_name="mock-refiner",
+        response_fn=pick_causal_candidate,
+    )
+    executor = VideoToolExecutor(
+        memory,
+        speech_snippet_refiner=refiner,
+        enable_hybrid_speech_refinement=True,
+    )
+    state = ControllerState(
+        question=(
+            "Why did she say she only wears her Cartier Clash bracelet sometimes "
+            "even though she loves it so much?"
+        ),
+        action_history=[
+            {
+                "action_type": "SEARCH",
+                "query": "why she only wears Cartier Clash bracelet sometimes",
+                "modality": "speech",
+            }
+        ],
+    )
+
+    observation = executor.open("tool_sample_scene_001", "speech", state)
+
+    assert len(observation.evidence) == 1
+    detail = observation.evidence[0].detail.lower()
+    assert "clasp was opening" in detail
+    assert "worried" in detail
+    assert observation.evidence[0].metadata["selection_mode"] == "hybrid_llm"
+    assert observation.evidence[0].metadata["selected_candidate_ids"]
+    usage = refiner.get_usage_summary()
+    assert usage.model_usage_summaries["mock-refiner"].total_calls == 1
+
+
+def test_open_speech_hybrid_refiner_skips_short_clear_span():
+    memory = build_memory_for_tools(
+        [
+            SpeechSpan(
+                text=(
+                    "My Clash bracelet clasp was opening a lot, and I was worried I would lose it. "
+                    "So I brought it back to Cartier and they fixed it."
+                ),
+                time_span=TimeSpan(0.0, 15.0),
+            )
+        ]
+    )
+    refiner = MockLM(
+        model_name="mock-refiner",
+        responses=['{"selected_candidate_ids":["c1"],"reason":"unused"}'],
+    )
+    executor = VideoToolExecutor(
+        memory,
+        speech_snippet_refiner=refiner,
+        enable_hybrid_speech_refinement=True,
+    )
+    state = ControllerState(
+        question="Why did she say she only wears her Cartier Clash bracelet sometimes?",
+        action_history=[
+            {
+                "action_type": "SEARCH",
+                "query": "why she only wears Cartier Clash bracelet sometimes",
+                "modality": "speech",
+            }
+        ],
+    )
+
+    observation = executor.open("tool_sample_scene_001", "speech", state)
+
+    assert len(observation.evidence) == 1
+    assert observation.evidence[0].metadata["selection_mode"] == "heuristic"
+    usage = refiner.get_usage_summary()
+    assert usage.model_usage_summaries["mock-refiner"].total_calls == 0

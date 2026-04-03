@@ -1,5 +1,7 @@
+import json
 import re
 
+from rlm.clients.base_lm import BaseLM
 from rlm.video.index import STOPWORDS, TOKEN_PATTERN, VideoMemoryIndex
 from rlm.video.types import (
     ControllerAction,
@@ -26,11 +28,25 @@ CONTROL_QUERY_TOKENS = {
 
 
 class VideoToolExecutor:
-    def __init__(self, memory: VideoMemory, index: VideoMemoryIndex | None = None, top_k: int = 5):
+    def __init__(
+        self,
+        memory: VideoMemory,
+        index: VideoMemoryIndex | None = None,
+        top_k: int = 5,
+        *,
+        speech_snippet_refiner: BaseLM | None = None,
+        enable_hybrid_speech_refinement: bool = False,
+        speech_refine_candidate_count: int = 4,
+    ):
         self.memory = memory
         self.index = index or VideoMemoryIndex(memory)
         self.top_k = top_k
         self._evidence_counter = 0
+        self.speech_snippet_refiner = speech_snippet_refiner
+        self.enable_hybrid_speech_refinement = (
+            enable_hybrid_speech_refinement and speech_snippet_refiner is not None
+        )
+        self.speech_refine_candidate_count = speech_refine_candidate_count
 
     def execute(self, action: ControllerAction, state: ControllerState) -> Observation:
         if action.action_type == "SEARCH":
@@ -240,6 +256,16 @@ class VideoToolExecutor:
             )
             if not detail:
                 continue
+            detail, selection_metadata = self._maybe_refine_speech_detail(
+                span=span,
+                detail=detail,
+                state=state,
+                question_tokens=question_tokens,
+                query_tokens=query_tokens,
+                search_query=query_hint,
+                prefer_start=prefer_start,
+                prefer_end=prefer_end,
+            )
             if self._is_duplicate_speech_evidence(state, span, detail):
                 continue
             evidence.append(
@@ -256,6 +282,7 @@ class VideoToolExecutor:
                         "parent_node_id": node.node_id,
                         "selection_score": round(score, 4),
                         "search_query": query_hint,
+                        **selection_metadata,
                     },
                 )
             )
@@ -432,6 +459,185 @@ class VideoToolExecutor:
         base_path = clip_path.split("#t=", maxsplit=1)[0]
         return f"{base_path}#t={time_span.start:.2f},{time_span.end:.2f}"
 
+    def _split_sentences(self, text: str) -> list[str]:
+        normalized = " ".join(text.split()).strip()
+        if not normalized:
+            return []
+        return [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", normalized)
+            if sentence.strip()
+        ]
+
+    def _score_speech_sentence(
+        self,
+        sentence: str,
+        *,
+        index: int,
+        sentence_count: int,
+        question_tokens: set[str],
+        query_tokens: set[str],
+    ) -> tuple[float, str]:
+        sentence_tokens = self._tokenize(sentence)
+        overlap = len(query_tokens & sentence_tokens)
+        lower_sentence = sentence.lower()
+        score = overlap * 3
+        sentence_anchor_kind = "generic"
+        causal_hits = sum(
+            1
+            for keyword in ("worried", "lose", "fix", "repair", "open", "clasp")
+            if keyword in sentence_tokens or keyword in lower_sentence
+        )
+        support_hits = sum(
+            1
+            for keyword in ("wear", "love", "perfect", "bracelet")
+            if keyword in sentence_tokens or keyword in lower_sentence
+        )
+        topic_shift_hits = sum(
+            1
+            for marker in (
+                "last but not the least",
+                "last but not least",
+                "other bracelet",
+                "another bracelet",
+                "last but not",
+            )
+            if marker in lower_sentence
+        )
+        is_first_query = bool({"first", "beginning", "earliest", "initial"} & question_tokens)
+        is_last_query = bool({"last", "final", "ending", "end"} & question_tokens)
+        is_why_query = "why" in question_tokens
+
+        if is_why_query and any(
+            keyword in lower_sentence
+            for keyword in ("because", "worried", "lose", "lost", "fixed", "repair", "opening", "clasp")
+        ):
+            score += 8
+            sentence_anchor_kind = "causal"
+        if is_why_query and causal_hits:
+            score += causal_hits * 4
+        if is_why_query and support_hits:
+            score += support_hits * 2
+            if sentence_anchor_kind != "causal":
+                sentence_anchor_kind = "support"
+        if topic_shift_hits:
+            score -= topic_shift_hits * 8
+        if "because" in lower_sentence and not overlap and not causal_hits:
+            score -= 4
+
+        if is_first_query:
+            if any(
+                keyword in lower_sentence
+                for keyword in (
+                    "this is",
+                    "what about",
+                    "never had",
+                    "different",
+                    "exotic",
+                    "bizarre",
+                    "unusual",
+                    "first",
+                )
+            ):
+                score += 5
+            if any(
+                keyword in lower_sentence
+                for keyword in (
+                    "chicken head",
+                    "pounds",
+                    "flour",
+                    "deep fry",
+                    "fried",
+                    "tastes",
+                    "surprisingly",
+                )
+            ):
+                score += 4
+            score += max(0.0, 1.0 - (index / max(sentence_count, 1))) * 2
+
+        if is_last_query:
+            score += (index / max(sentence_count, 1)) * 2
+
+        return score, sentence_anchor_kind
+
+    def _rank_speech_sentences(
+        self,
+        sentences: list[str],
+        *,
+        question_tokens: set[str],
+        query_tokens: set[str],
+    ) -> list[tuple[float, int, str]]:
+        ranked: list[tuple[float, int, str]] = []
+        for index, sentence in enumerate(sentences):
+            score, anchor_kind = self._score_speech_sentence(
+                sentence,
+                index=index,
+                sentence_count=len(sentences),
+                question_tokens=question_tokens,
+                query_tokens=query_tokens,
+            )
+            ranked.append((score, index, anchor_kind))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return ranked
+
+    def _snippet_from_anchor(
+        self,
+        sentences: list[str],
+        *,
+        anchor_index: int,
+        anchor_kind: str,
+        question_tokens: set[str],
+        max_chars: int,
+    ) -> str:
+        is_first_query = bool({"first", "beginning", "earliest", "initial"} & question_tokens)
+        is_last_query = bool({"last", "final", "ending", "end"} & question_tokens)
+        is_why_query = "why" in question_tokens
+
+        if is_first_query:
+            return self._build_window_from_anchor(
+                sentences,
+                anchor_index,
+                max_chars=max_chars,
+                before=2,
+                after=2,
+                prefer="forward",
+            )
+        if is_last_query:
+            return self._build_window_from_anchor(
+                sentences,
+                anchor_index,
+                max_chars=max_chars,
+                before=2,
+                after=2,
+                prefer="backward",
+            )
+        if is_why_query and anchor_kind == "causal":
+            return self._build_window_from_anchor(
+                sentences,
+                anchor_index,
+                max_chars=max_chars,
+                before=1,
+                after=2,
+                prefer="forward",
+            )
+        if is_why_query and anchor_kind == "support":
+            return self._build_window_from_anchor(
+                sentences,
+                anchor_index,
+                max_chars=max_chars,
+                before=1,
+                after=2,
+                prefer="backward",
+            )
+        return self._build_window_from_anchor(
+            sentences,
+            anchor_index,
+            max_chars=max_chars,
+            before=1,
+            after=2,
+            prefer="forward",
+        )
+
     def _focus_speech_detail(
         self,
         text: str,
@@ -446,11 +652,7 @@ class VideoToolExecutor:
         if not normalized:
             return ""
 
-        sentences = [
-            sentence.strip()
-            for sentence in re.split(r"(?<=[.!?])\s+", normalized)
-            if sentence.strip()
-        ]
+        sentences = self._split_sentences(normalized)
         if not sentences:
             return normalized[:max_chars]
         if len(normalized) <= max_chars and len(sentences) <= 4:
@@ -461,142 +663,19 @@ class VideoToolExecutor:
         if prefer_end:
             return self._join_sentence_window(sentences[-4:], max_chars)
 
-        is_first_query = bool({"first", "beginning", "earliest", "initial"} & question_tokens)
-        is_last_query = bool({"last", "final", "ending", "end"} & question_tokens)
-        is_why_query = "why" in question_tokens
-
-        best_index = 0
-        best_score = float("-inf")
-        anchor_kind = "generic"
-        for index, sentence in enumerate(sentences):
-            sentence_tokens = self._tokenize(sentence)
-            overlap = len(query_tokens & sentence_tokens)
-            lower_sentence = sentence.lower()
-            score = overlap * 3
-            sentence_anchor_kind = "generic"
-            causal_hits = sum(
-                1
-                for keyword in ("worried", "lose", "fix", "repair", "open", "clasp")
-                if keyword in sentence_tokens or keyword in lower_sentence
-            )
-            support_hits = sum(
-                1
-                for keyword in ("wear", "love", "perfect", "bracelet")
-                if keyword in sentence_tokens or keyword in lower_sentence
-            )
-            topic_shift_hits = sum(
-                1
-                for marker in (
-                    "last but not the least",
-                    "last but not least",
-                    "other bracelet",
-                    "another bracelet",
-                    "last but not",
-                )
-                if marker in lower_sentence
-            )
-
-            if is_why_query and any(
-                keyword in lower_sentence
-                for keyword in ("because", "worried", "lose", "lost", "fixed", "repair", "opening", "clasp")
-            ):
-                score += 8
-                sentence_anchor_kind = "causal"
-            if is_why_query and causal_hits:
-                score += causal_hits * 4
-            if is_why_query and support_hits:
-                score += support_hits * 2
-                if sentence_anchor_kind != "causal":
-                    sentence_anchor_kind = "support"
-            if topic_shift_hits:
-                score -= topic_shift_hits * 8
-            if "because" in lower_sentence and not overlap and not causal_hits:
-                score -= 4
-
-            if is_first_query:
-                if any(
-                    keyword in lower_sentence
-                    for keyword in (
-                        "this is",
-                        "what about",
-                        "never had",
-                        "different",
-                        "exotic",
-                        "bizarre",
-                        "unusual",
-                        "first",
-                    )
-                ):
-                    score += 5
-                if any(
-                    keyword in lower_sentence
-                    for keyword in (
-                        "chicken head",
-                        "pounds",
-                        "flour",
-                        "deep fry",
-                        "fried",
-                        "tastes",
-                        "surprisingly",
-                    )
-                ):
-                    score += 4
-                score += max(0.0, 1.0 - (index / max(len(sentences), 1))) * 2
-
-            if is_last_query:
-                score += (index / max(len(sentences), 1)) * 2
-
-            if score > best_score:
-                best_score = score
-                best_index = index
-                anchor_kind = sentence_anchor_kind
-
-        if is_first_query:
-            snippet = self._build_window_from_anchor(
-                sentences,
-                best_index,
-                max_chars=max_chars,
-                before=2,
-                after=2,
-                prefer="forward",
-            )
-        elif is_last_query:
-            snippet = self._build_window_from_anchor(
-                sentences,
-                best_index,
-                max_chars=max_chars,
-                before=2,
-                after=2,
-                prefer="backward",
-            )
-        else:
-            if is_why_query and anchor_kind == "causal":
-                snippet = self._build_window_from_anchor(
-                    sentences,
-                    best_index,
-                    max_chars=max_chars,
-                    before=1,
-                    after=2,
-                    prefer="forward",
-                )
-            elif is_why_query and anchor_kind == "support":
-                snippet = self._build_window_from_anchor(
-                    sentences,
-                    best_index,
-                    max_chars=max_chars,
-                    before=1,
-                    after=2,
-                    prefer="backward",
-                )
-            else:
-                snippet = self._build_window_from_anchor(
-                    sentences,
-                    best_index,
-                    max_chars=max_chars,
-                    before=1,
-                    after=2,
-                    prefer="forward",
-                )
+        ranked = self._rank_speech_sentences(
+            sentences,
+            question_tokens=question_tokens,
+            query_tokens=query_tokens,
+        )
+        best_score, best_index, anchor_kind = ranked[0]
+        snippet = self._snippet_from_anchor(
+            sentences,
+            anchor_index=best_index,
+            anchor_kind=anchor_kind,
+            question_tokens=question_tokens,
+            max_chars=max_chars,
+        )
         if not snippet or best_score <= 0:
             return normalized[:max_chars]
 
@@ -607,6 +686,228 @@ class VideoToolExecutor:
         if full_overlap > 0 and snippet_overlap == 0:
             return normalized[:max_chars]
         return snippet
+
+    def _maybe_refine_speech_detail(
+        self,
+        *,
+        span: SpeechSpan,
+        detail: str,
+        state: ControllerState,
+        question_tokens: set[str],
+        query_tokens: set[str],
+        search_query: str,
+        prefer_start: bool,
+        prefer_end: bool,
+    ) -> tuple[str, dict[str, object]]:
+        candidates = self._build_speech_refinement_candidates(
+            span.text,
+            question_tokens=question_tokens,
+            query_tokens=query_tokens,
+            initial_detail=detail,
+            prefer_start=prefer_start,
+            prefer_end=prefer_end,
+        )
+        metadata: dict[str, object] = {
+            "selection_mode": "heuristic",
+            "refinement_triggered": False,
+            "candidate_count": len(candidates),
+        }
+        if not self._should_refine_speech_detail(
+            span=span,
+            question_tokens=question_tokens,
+            candidates=candidates,
+        ):
+            return detail, metadata
+
+        prompt = self._build_speech_refinement_prompt(
+            question=state.question,
+            search_query=search_query,
+            candidates=candidates,
+        )
+        raw_response = self.speech_snippet_refiner.completion(prompt)
+        selected_ids, reason = self._parse_refinement_response(raw_response, candidates)
+        if not selected_ids:
+            metadata["selection_mode"] = "heuristic_fallback"
+            metadata["refinement_triggered"] = True
+            metadata["refiner_reason"] = "No valid candidate ids returned by refiner."
+            return detail, metadata
+
+        selected_detail = self._combine_selected_candidates(candidates, selected_ids)
+        if not selected_detail:
+            metadata["selection_mode"] = "heuristic_fallback"
+            metadata["refinement_triggered"] = True
+            metadata["refiner_reason"] = "Refiner selected empty candidate set."
+            return detail, metadata
+
+        metadata["selection_mode"] = "hybrid_llm"
+        metadata["refinement_triggered"] = True
+        metadata["selected_candidate_ids"] = selected_ids
+        if reason:
+            metadata["refiner_reason"] = reason
+        return selected_detail, metadata
+
+    def _build_speech_refinement_candidates(
+        self,
+        text: str,
+        *,
+        question_tokens: set[str],
+        query_tokens: set[str],
+        initial_detail: str,
+        prefer_start: bool,
+        prefer_end: bool,
+        max_chars: int = 900,
+    ) -> list[dict[str, object]]:
+        candidates: list[dict[str, object]] = []
+        seen_details: set[str] = set()
+
+        def add_candidate(detail: str, source: str) -> None:
+            normalized_detail = " ".join(detail.split()).strip()
+            if not normalized_detail or normalized_detail in seen_details:
+                return
+            seen_details.add(normalized_detail)
+            candidates.append(
+                {
+                    "candidate_id": f"c{len(candidates) + 1}",
+                    "detail": normalized_detail,
+                    "source": source,
+                }
+            )
+
+        add_candidate(initial_detail, "heuristic")
+        sentences = self._split_sentences(text)
+        if not sentences:
+            return candidates
+        if prefer_start:
+            add_candidate(self._join_sentence_window(sentences[:4], max_chars), "prefer_start")
+        if prefer_end:
+            add_candidate(self._join_sentence_window(sentences[-4:], max_chars), "prefer_end")
+
+        ranked = self._rank_speech_sentences(
+            sentences,
+            question_tokens=question_tokens,
+            query_tokens=query_tokens,
+        )
+        for _score, index, anchor_kind in ranked[: self.speech_refine_candidate_count]:
+            add_candidate(
+                self._snippet_from_anchor(
+                    sentences,
+                    anchor_index=index,
+                    anchor_kind=anchor_kind,
+                    question_tokens=question_tokens,
+                    max_chars=max_chars,
+                ),
+                f"anchor:{anchor_kind}:{index}",
+            )
+
+        add_candidate(self._join_sentence_window(sentences[:3], max_chars), "head")
+        add_candidate(self._join_sentence_window(sentences[-3:], max_chars), "tail")
+        return candidates
+
+    def _should_refine_speech_detail(
+        self,
+        *,
+        span: SpeechSpan,
+        question_tokens: set[str],
+        candidates: list[dict[str, object]],
+    ) -> bool:
+        if not self.enable_hybrid_speech_refinement or self.speech_snippet_refiner is None:
+            return False
+        if len(candidates) < 2:
+            return False
+        normalized = " ".join(span.text.split()).strip()
+        sentences = self._split_sentences(normalized)
+        lower_text = normalized.lower()
+        topic_shift = any(
+            marker in lower_text
+            for marker in (
+                "last but not the least",
+                "last but not least",
+                "other bracelet",
+                "another bracelet",
+            )
+        )
+        return bool(
+            {"why", "first", "beginning", "earliest", "initial", "last", "final", "ending", "end"}
+            & question_tokens
+        ) or len(normalized) > 320 or len(sentences) > 4 or topic_shift
+
+    def _build_speech_refinement_prompt(
+        self,
+        *,
+        question: str,
+        search_query: str,
+        candidates: list[dict[str, object]],
+    ) -> str:
+        candidate_lines = []
+        for candidate in candidates:
+            candidate_lines.append(
+                f"{candidate['candidate_id']}: {candidate['detail']}"
+            )
+        candidate_block = "\n".join(candidate_lines)
+        return (
+            "You are selecting grounded transcript snippets for a long-video QA tool.\n"
+            "Choose the candidate snippet or snippets that most directly answer the question.\n"
+            "Prefer causal explanation for 'why', earliest evidence for 'first', and latest evidence for 'last'.\n"
+            "Select at most 2 candidate ids. Do not paraphrase. Only choose from the candidates below.\n"
+            "Return strict JSON with this schema:\n"
+            '{"selected_candidate_ids":["c1"],"reason":"short reason"}\n'
+            f"Question: {question}\n"
+            f"Search hint: {search_query}\n"
+            "Candidates:\n"
+            f"{candidate_block}\n"
+        )
+
+    def _parse_refinement_response(
+        self,
+        raw_response: str,
+        candidates: list[dict[str, object]],
+    ) -> tuple[list[str], str]:
+        valid_ids = {str(candidate["candidate_id"]) for candidate in candidates}
+        candidate_ids: list[str] = []
+        reason = ""
+        payload = raw_response.strip()
+        parsed: dict[str, object] | None = None
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", payload, flags=re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(0))
+        if parsed is not None:
+            raw_ids = parsed.get("selected_candidate_ids") or parsed.get("selected_candidates") or []
+            if isinstance(raw_ids, list):
+                candidate_ids = [str(item) for item in raw_ids if str(item) in valid_ids]
+            raw_reason = parsed.get("reason")
+            if raw_reason is not None:
+                reason = str(raw_reason).strip()
+        if not candidate_ids:
+            candidate_ids = [match for match in re.findall(r"c\d+", payload.lower()) if match in valid_ids]
+        deduped_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for candidate_id in candidate_ids:
+            if candidate_id in seen_ids:
+                continue
+            seen_ids.add(candidate_id)
+            deduped_ids.append(candidate_id)
+        return deduped_ids[:2], reason
+
+    def _combine_selected_candidates(
+        self,
+        candidates: list[dict[str, object]],
+        selected_ids: list[str],
+        *,
+        max_chars: int = 900,
+    ) -> str:
+        if not selected_ids:
+            return ""
+        selected_lookup = {candidate_id: index for index, candidate_id in enumerate(selected_ids)}
+        selected_details = [
+            str(candidate["detail"])
+            for candidate in candidates
+            if str(candidate["candidate_id"]) in selected_lookup
+        ]
+        combined = " ".join(selected_details).strip()
+        return combined[:max_chars]
 
     def _join_sentence_window(self, sentences: list[str], max_chars: int) -> str:
         snippet = " ".join(sentence.strip() for sentence in sentences if sentence.strip()).strip()
