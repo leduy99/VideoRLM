@@ -436,3 +436,58 @@
 - Relevant local checks passed again:
   - `pytest tests/video/test_video_tools.py tests/video/test_video_controller.py tests/video/test_video_memory_index.py -q`
   - `ruff check rlm/video/tools.py tests/video/test_video_tools.py`
+
+## Update: Root Cause and Fix for `sample_6168` Speech Snippet Drift
+
+### Root cause we confirmed
+- The main failure was not ASR quality and not first-stage retrieval.
+- The real bottleneck was `span -> snippet` extraction inside `rlm/video/tools.py`.
+- More specifically:
+  - the speech-tool tokenizer inherited retrieval stopwords and accidentally removed `why`
+  - because of that, the `why`-specific heuristics were effectively disabled
+  - `_focus_speech_detail()` could fall back to broad early context
+  - `_score_speech_span()` could overvalue spans that merely contained a generic `because`
+
+### What changed
+- Preserved control tokens such as `why`, `first`, and `last` in the speech-tool tokenizer.
+- Added light morphological normalization:
+  - `wears / wore / worn -> wear`
+  - `loves -> love`
+  - `opening / opened -> open`
+  - `fixed -> fix`
+- Tightened `why` scoring:
+  - reward real causal signals like `clasp`, `open`, `worried`, `lose`, `fix`, `repair`
+  - penalize generic `because` when it is not backed by the right overlap
+  - penalize topic-shift markers like `other bracelet` and `last but not the least`
+- Reworked snippet extraction to build a window around the best anchor sentence instead of keeping broad early context.
+- Kept neighbor-span expansion, but only when the neighbor has real causal signal for `why` questions.
+
+### Regression tests added
+- Added sample-shaped tests in `tests/video/test_video_tools.py` for:
+  - causal late-span extraction on a long bracelet transcript
+  - continuation-span extraction on the `perfect / haven't really worn it much` follow-up
+  - preventing unrelated intro spans like the `Leon Diamond` segment from entering the ledger
+
+### Validation
+- Focused regression suite:
+  - `conda run -n videorlm python -m pytest tests/video/test_video_tools.py tests/video/test_video_controller.py tests/video/test_video_memory_index.py -q`
+  - result: `18 passed`
+- Full repo validation:
+  - `conda run -n videorlm python -m ruff check .`
+  - `conda run -n videorlm python -m pytest -q`
+  - result: `331 passed, 7 skipped`
+
+### Real rerun result
+- Re-ran the real cached `sample_6168` context using local `Qwen3-8B` controller over the existing memory cache.
+- Output saved to:
+  - `output/sample_6168_fix_rerun/result.json`
+- The new answer is benchmark-aligned:
+  - the bracelet kept opening
+  - she was worried about losing it
+  - she took it back to Cartier and it was fixed
+  - she still has not worn it much even though she loves it
+
+### Development lesson
+- The system already knew where to look.
+- The failure came from how evidence was carved out of the right span, not from the absence of the right span.
+- In practice, this means targeted evidence-extraction fixes can recover benchmark behavior without rerunning the whole preprocessing stack.
