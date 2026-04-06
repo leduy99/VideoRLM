@@ -8,4 +8,5 @@ Mục tiêu của các note ở đây:
 - ghi rõ hệ đã đúng ở đâu, sai ở đâu, và vì sao
 
 Các note hiện có:
+- `longshot_90run_analysis.md`: postmortem chi tiết cho `90` sample đầu tiên của run full benchmark, gồm số liệu tổng hợp, failure taxonomy, case study, và danh sách ưu tiên sửa
 - `sample_8563_heuristic.md`: phân tích failure của `sample_8563` ở chế độ `heuristic-only`
