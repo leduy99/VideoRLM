@@ -3,6 +3,9 @@
 Nếu bạn muốn đi sâu vào data model, state machine và runtime loop, xem thêm:
 [video_rlm_technical_details.md](/share_4/users/duy/project/rlm/docs/video_rlm_technical_details.md)
 
+Nếu bạn muốn đọc code theo đúng workflow benchmark đang chạy, xem thêm:
+[video_rlm_code_reading_guide.md](/share_4/users/duy/project/rlm/docs/video_rlm_code_reading_guide.md)
+
 ## Mục Tiêu Của VideoRLM
 
 VideoRLM được thiết kế để trả lời câu hỏi trên video dài mà không cần "đọc hết video một lần".

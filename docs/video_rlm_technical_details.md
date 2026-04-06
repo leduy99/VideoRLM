@@ -2,6 +2,9 @@
 
 Tài liệu này giải thích phần kỹ thuật của VideoRLM theo đúng kiến trúc hiện đang có trong repo. Nếu tài liệu [video_rlm_how_it_works.md](/share_4/users/duy/project/rlm/docs/video_rlm_how_it_works.md) là bản giải thích trực quan, thì file này là bản "mở nắp máy" để hiểu từng component hoạt động ra sao.
 
+Nếu bạn muốn đọc code theo đúng call graph của benchmark runtime, xem thêm:
+[video_rlm_code_reading_guide.md](/share_4/users/duy/project/rlm/docs/video_rlm_code_reading_guide.md)
+
 ## 1. Mục Tiêu Kỹ Thuật Của VideoRLM
 
 VideoRLM v1 không cố train một video model mới. Nó ghép các thành phần sau thành một hệ suy luận có cấu trúc:
