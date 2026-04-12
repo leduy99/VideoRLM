@@ -9,6 +9,10 @@ from rlm.video.longshot import (
     LongShOTVideoResolver,
     load_longshot_samples,
 )
+from rlm.video.longshot_official_eval import (
+    LongShOTOfficialEvalConfig,
+    evaluate_predictions_official_style,
+)
 from rlm.video.memory import VideoMemoryBuilder
 from rlm.video.qwen import QwenLocalVideoStackConfig, QwenVideoStackConfig
 
@@ -132,6 +136,22 @@ def build_parser() -> argparse.ArgumentParser:
     longshot_local.add_argument("--speech-device", default="cuda:2")
     _add_local_qwen_args(longshot_local)
 
+    official_eval = subparsers.add_parser(
+        "eval-longshot-official",
+        help="Evaluate LongShOT predictions with official-style rubric prompts and scoring.",
+    )
+    official_eval.add_argument("--predictions", required=True, help="Input predictions JSONL file")
+    official_eval.add_argument("--eval-output", required=True, help="Output evaluated JSONL file")
+    official_eval.add_argument("--score-output", required=True, help="Human-readable score report")
+    official_eval.add_argument("--summary-output", required=True, help="Machine-readable score summary")
+    official_eval.add_argument("--judge-repo", default="Qwen/Qwen3-14B")
+    official_eval.add_argument("--judge-model-path")
+    official_eval.add_argument("--judge-device", default="cuda:0")
+    official_eval.add_argument("--torch-dtype", default="bfloat16")
+    official_eval.add_argument("--attn-implementation")
+    official_eval.add_argument("--max-new-tokens", type=int, default=96)
+    official_eval.add_argument("--sample-limit", type=int)
+
     return parser
 
 
@@ -151,6 +171,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_download_qwen_local_models(args)
     if args.command == "run-longshot-local":
         return _cmd_run_longshot_local(args)
+    if args.command == "eval-longshot-official":
+        return _cmd_eval_longshot_official(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 
@@ -279,6 +301,28 @@ def _cmd_run_longshot_local(args: argparse.Namespace) -> int:
     )
     results = runner.run_samples(samples, output_path=output_path)
     print(f"Saved {len(results)} LongShOT prediction records to {output_path}")
+    return 0
+
+
+def _cmd_eval_longshot_official(args: argparse.Namespace) -> int:
+    config = LongShOTOfficialEvalConfig(
+        predictions_path=Path(args.predictions),
+        eval_path=Path(args.eval_output),
+        score_path=Path(args.score_output),
+        summary_path=Path(args.summary_output),
+        judge_model_name=args.judge_repo,
+        judge_model_path=args.judge_model_path,
+        judge_device=args.judge_device,
+        torch_dtype=args.torch_dtype,
+        attn_implementation=args.attn_implementation,
+        max_new_tokens=args.max_new_tokens,
+        sample_limit=args.sample_limit,
+    )
+    result = evaluate_predictions_official_style(config)
+    print(
+        "Saved official-style eval to "
+        f"{config.eval_path} with overall accuracy {result.overall_accuracy * 100:.2f}%"
+    )
     return 0
 
 

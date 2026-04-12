@@ -590,3 +590,81 @@
   - only trigger LLM refinement for ambiguous `why` cases
   - keep heuristic-only behavior for `first / last` temporal questions
   - add a way to preserve follow-up support evidence instead of letting the controller stop after one concise causal snippet
+
+## 2026-04-12: Official-style LongShOT evaluation
+
+### What changed
+- Added a local `official-style` LongShOT evaluator in:
+  - `rlm/video/longshot_official_eval.py`
+  - `rlm/video/cli.py` via `eval-longshot-official`
+- This evaluator mirrors the public LongShOT evaluation structure more closely than our old proxy metrics:
+  - judge each assistant turn criterion separately
+  - store `criteria_met` back into the benchmark JSONL
+  - compute weighted task/category/overall accuracy using the LongShOT scoring rules
+- The main runtime adaptation is that we use a local Hugging Face judge model instead of the public repo's OpenAI-compatible / vLLM server requirement.
+
+### Important implementation notes
+- Reused the official-style criterion prompt:
+  - compare `Ground Truth Response`
+  - compare `Model Response`
+  - evaluate a single rubric criterion at a time
+  - return strict JSON with `criteria_met`
+- Added retry logic for malformed judge output:
+  - up to 3 attempts per criterion
+  - if still invalid, mark `criteria_met = None` and store the raw error
+- Added progress logging per sample so long eval runs are observable and resumable.
+
+### Why this was needed
+- Our old `token_f1` and `rouge_l_f1` numbers were useful for quick internal comparison, but they were not the LongShOT benchmark metric.
+- LongShOT is rubric-based:
+  - each assistant turn has weighted criteria
+  - positive criteria contribute to score when met
+  - penalties do not add to the denominator
+  - task accuracy is weighted score obtained divided by total positive score
+  - overall is the mean of category averages
+
+### 90-sample official-style run
+- Input predictions:
+  - `output/longshot_single_gpu_full/predictions.jsonl`
+- Official-style evaluation outputs:
+  - `output/longshot_single_gpu_full_official_eval/eval.jsonl`
+  - `output/longshot_single_gpu_full_official_eval/score.txt`
+  - `output/longshot_single_gpu_full_official_eval/summary.json`
+- Judge model used:
+  - `Qwen/Qwen2.5-7B-Instruct`
+  - device: `cuda:3`
+- Coverage:
+  - `90` samples
+  - `133` assistant turns
+  - `663` rubric criteria
+- Eval robustness:
+  - `0` criteria parse failures
+  - `0` criteria with `evaluation_error`
+
+### Official-style result summary
+- Overall accuracy:
+  - `14.97%`
+- Category averages:
+  - `Core Perception Tasks`: `15.79%`
+  - `Reasoning Tasks`: `9.79%`
+  - `Information Tasks`: `12.24%`
+  - `Multimodal Tasks`: `22.06%`
+
+### Task highlights
+- Better relative buckets in this 90-sample subset:
+  - `audio_visual_alignment`: `29.17%`
+  - `temporal_reasoning`: `26.77%`
+  - `summarization`: `24.43%`
+- Weak buckets:
+  - `event_understanding`: `8.10%`
+  - `instruction_extraction`: `8.00%`
+  - `compositional_reasoning`: `0.00%`
+  - `sentiment_analysis`: `0.00%`
+
+### Main takeaway
+- The official-style score is much harsher than proxy overlap metrics, which is expected.
+- This confirms that the current system is still getting partial lexical overlap on many samples without satisfying enough weighted rubric criteria.
+- The biggest quality gap continues to be:
+  - event-level understanding
+  - deeper reasoning/composition
+  - instruction extraction with precise grounded details
