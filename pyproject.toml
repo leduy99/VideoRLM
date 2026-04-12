@@ -34,6 +34,9 @@ Homepage = "https://github.com/alexzhang13/rlm"
 Repository = "https://github.com/alexzhang13/rlm"
 Issues = "https://github.com/alexzhang13/rlm/issues"
 
+[project.scripts]
+videorlm = "rlm.video.cli:main"
+
 [project.optional-dependencies]
 modal = ["modal>=0.73.0", "dill>=0.3.7"]
 e2b = ["e2b-code-interpreter>=0.0.11", "dill>=0.3.7"]
