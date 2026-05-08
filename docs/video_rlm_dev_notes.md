@@ -258,6 +258,182 @@
     - `fixed`
     - `repair`
   - grounded answer synthesis now uses focused `excerpt` text rather than misleading truncated `claim`
+
+## 2026-05-09 - Evidence-Aware Search & Open v2
+
+### Why this refactor was chosen
+- The recurring benchmark failure pattern was:
+  - search often landed near the right region
+  - open returned broad or background-heavy evidence
+  - controller did not know whether the returned evidence actually filled the question
+  - final answer was then generic, incomplete, or unsupported
+- The official-style eval on 90 completed samples made this very clear:
+  - the system often touched the right topic
+  - but lost points on `key_details`, `completeness`, and `essential_information`
+- Instead of adding another planner layer, graph runtime, or RL, we replaced the contract of the existing `SEARCH + OPEN + ANSWER` path with a slot-aware evidence path.
+
+### What was added
+- `rlm/video/types.py`
+  - added `EvidenceSlotSpec`
+  - added `QuestionSpec`
+  - added `EvidenceBoardSlot`
+  - added `OpenedTarget`
+  - added `EvidenceBoard`
+  - extended `ControllerAction` with `target_slot`
+  - extended `ControllerState` with:
+    - `question_spec`
+    - `evidence_board`
+    - `no_progress_steps`
+- New module: `rlm/video/evidence_pipeline.py`
+  - `build_question_spec(...)`
+  - `build_evidence_board(...)`
+  - `select_target_slot(...)`
+  - `build_slot_queries(...)`
+  - `search_v2(...)`
+  - `open_v2(...)`
+  - `update_evidence_board(...)`
+  - `choose_next_action(...)`
+- `rlm/video/tools.py`
+  - `SEARCH` now routes through `search_v2(...)`
+  - `OPEN` now routes through `open_v2(...)`
+  - added no-reopen guard on `(node_id, modality, target_slot)`
+  - `OPEN` now emits metadata like:
+    - `target_slot`
+    - `filled_slots`
+    - `missing_slots`
+    - `background_only`
+    - `duplicate_evidence_count`
+    - `progress_made`
+    - `result`
+- `rlm/video/controller.py`
+  - initial state now builds `QuestionSpec + EvidenceBoard`
+  - initial frontier is seeded with slot-aware `search_v2(...)`
+  - controller now gets default `target_slot` if the model omits it
+  - observation updates now also update the evidence board
+  - `no_progress_steps` now increments when an action fails to fill/support a slot
+  - final fallback answer now:
+    - answers only from `core/support` evidence when possible
+    - otherwise returns a diagnostic abstain message listing missing slots
+  - global evidence metrics are now tracked in state:
+    - `slot_fill_rate`
+    - `background_only_open_rate`
+    - `duplicate_evidence_rate`
+    - `no_progress_rate`
+    - `tokens_per_step`
+- `rlm/video/prompts.py`
+  - controller prompt now includes `target_slot` in the JSON schema
+  - prompt now shows:
+    - `question_spec`
+    - compact `evidence_board`
+    - compact `evidence_ledger`
+    - `no_progress_steps`
+  - prompt now explicitly forbids reopening the same `(node, modality, target_slot)`
+
+### Important design choices
+- This refactor did not throw away the existing speech heuristics.
+  - The existing span-selection logic in `tools.py` still does the local transcript narrowing work.
+  - v2 wraps that with a better contract:
+    - which slot are we trying to fill?
+    - is the evidence `core`, `support`, `background`, or `noise`?
+    - did this open make progress?
+- We did not add a second agent or a full graph runtime.
+  - `EvidenceBoard` is intentionally a lightweight graph substitute.
+  - It is enough to stop evidence collapse into one flat ledger.
+
+### Integration bugs found during implementation
+- Bug 1: `why` queries were being parsed as generic.
+  - Root cause:
+    - the v2 tokenizer in `evidence_pipeline.py` reused stopword logic that dropped `why`
+  - Effect:
+    - `QuestionSpec` for `why` questions became `generic`
+    - `OPEN` classified evidence into `main_claim` instead of `reason`
+  - Fix:
+    - preserve control tokens such as:
+      - `why`
+      - `first`
+      - `last`
+      - `earliest`
+      - `initial`
+
+- Bug 2: the default target slot for `why` was wrong.
+  - Root cause:
+    - `select_target_slot(...)` picked the first slot in the spec even when that slot was optional
+  - Effect:
+    - `why` questions targeted `object` before `reason`
+    - correct causal evidence was downgraded to `support`
+  - Fix:
+    - target-slot selection now prioritizes `required` slots first
+
+- Bug 3: isolated tool tests did not populate `question_spec`.
+  - Root cause:
+    - some direct unit tests call `VideoToolExecutor.open(...)` with a bare `ControllerState(question=...)`
+  - Effect:
+    - `OPEN v2` would fall back to generic classification in tests even though runtime states were fine
+  - Fix:
+    - `tools.py` now derives a fallback `QuestionSpec` on the fly if the state does not already carry one
+
+- Bug 4: reaction follow-up spans for `first` questions were under-classified.
+  - Root cause:
+    - reaction keyword coverage was too narrow
+  - Effect:
+    - follow-up evidence like `tastes like chicken` could be dropped
+  - Fix:
+    - expanded reaction slot keywords with:
+      - `tastes`
+      - `bite`
+      - `bit`
+
+### What v2 changes behavior-wise
+- Before:
+  - `SEARCH` asked "which node is generally related?"
+  - `OPEN` asked "what summary or excerpt can I pull from this node?"
+  - `ANSWER` saw a flat ledger and often guessed from background evidence
+- After:
+  - `SEARCH v2` asks "which node can help fill this missing slot?"
+  - `OPEN v2` asks "which evidence here is core/support/background for this slot?"
+  - `ANSWER` only trusts `core/support` evidence, otherwise abstains diagnostically
+
+### Verification for this phase
+- `conda run -n videorlm python -m pytest tests/video/test_video_types.py tests/video/test_video_prompts.py tests/video/test_video_evidence_pipeline.py tests/video/test_video_tools.py tests/video/test_video_controller.py -q`
+  - passed
+  - result: `25 passed`
+- `conda run -n videorlm python -m pytest tests/video -q`
+  - passed
+  - result: `70 passed`
+- `conda run -n videorlm python -m pytest tests/test_imports.py -q`
+  - passed
+  - result: `32 passed, 3 skipped`
+- `conda run -n videorlm python -m ruff check rlm/video/types.py rlm/video/evidence_pipeline.py rlm/video/tools.py rlm/video/controller.py rlm/video/prompts.py tests/video/test_video_types.py tests/video/test_video_prompts.py tests/video/test_video_evidence_pipeline.py tests/video/test_video_tools.py tests/video/test_video_controller.py`
+  - passed
+
+### Current limitations after v2
+- `search_v2(...)` is slot-aware, but still uses heuristic query expansion plus the existing index.
+  - There is no LLM reranker yet.
+- `open_v2(...)` classifies evidence by slot/role, but still depends on heuristic matching.
+  - This is a good runtime step, but not the final answer to hard abstract questions.
+- The controller still chooses the action with a single LM call and a JSON action schema.
+  - We improved the contract, not the planner training.
+
+### Best next steps from here
+- Add optional top-k LLM reranking inside `search_v2(...)` for difficult slot types:
+  - `why`
+  - `first`
+  - `main challenge`
+  - `connect / relate`
+- Add trace logging for slot-level outcomes per step:
+  - which slot was targeted
+  - whether it was filled
+  - whether the result was background-only
+- Re-run the strongest previous fail samples with v2:
+  - `sample_6009`
+  - `sample_6168`
+  - `sample_8563`
+  - Tom/Jerry reaction case
+- Then re-run a partial benchmark slice and compare:
+  - slot fill rate
+  - background-only open rate
+  - no-progress rate
+  - official-style score
   - answer prompt now explicitly asks to mention both the problem and the later repair when present
 
 ### Result after fixes
@@ -668,3 +844,97 @@
   - event-level understanding
   - deeper reasoning/composition
   - instruction extraction with precise grounded details
+
+## 2026-04-14: Qwen3.5-9B controller experiment on the existing 90-sample subset
+
+### Goal
+- Re-run the same 90 LongShOT samples already generated by the `Qwen3-8B` controller.
+- Keep the comparison fair by:
+  - reusing the exact same sample IDs,
+  - reusing the existing video memories in `output/longshot_single_gpu_full/memories`,
+  - changing only the controller model to `Qwen/Qwen3.5-9B`.
+
+### What worked
+- `Qwen/Qwen3.5-9B` now loads successfully through the local controller stack.
+- The key path-resolution bug was fixed in `rlm/video/qwen.py`:
+  - before: an empty placeholder directory under `output/models/...` could cause the loader to prefer the empty local path over the Hugging Face repo ID,
+  - after: `LocalModelConfig.resolved_model_path()` falls back to the repo ID when the local directory exists but contains no real model artifacts.
+- This fix was validated with targeted tests in `tests/video/test_video_qwen_local.py`.
+
+### New failure mode observed
+- The first real 90-sample `Qwen3.5-9B` benchmark attempt completed `sample_6095` but crashed on `sample_6096`.
+- Root cause:
+  - the controller produced a valid-looking JSON action prefix,
+  - but the response was truncated before the JSON object finished,
+  - `VideoRLM._parse_action()` then failed with `ValueError: Could not parse controller action JSON`.
+- In practice this happened because `Qwen3.5-9B` produced a longer `MERGE` action with a longer `answer` and `rationale` than the old controller, while the run still used the old local default `max_new_tokens=256`.
+
+### Why this matters
+- This is not a retrieval bug.
+- It is not a memory-cache bug.
+- It is not a LongShOT data bug.
+- It is a controller-generation budget mismatch:
+  - `Qwen3.5-9B` tends to emit more verbose action JSON than `Qwen3-8B`,
+  - the old token budget was enough for `Qwen3-8B` much of the time,
+  - but it was not robust enough for `Qwen3.5-9B`.
+
+### Mitigation applied
+- For the `Qwen3.5-9B` 90-sample benchmark runner in `output/longshot_single_gpu_full_qwen35_9b/run_benchmark.py`, increase:
+  - `config.controller.max_new_tokens` from the inherited default to `512`.
+- This keeps the experiment simple:
+  - controller model changes,
+  - benchmark memory stays reused,
+  - tool policy stays heuristic-only,
+  - no other runtime behavior is intentionally changed.
+
+### Early signal
+- `sample_6095` finished successfully with `Qwen3.5-9B`.
+- The generated answer was concise and grounded, but somewhat less complete than the older baseline answer.
+- So the early signal is mixed:
+  - the model works in the stack,
+  - but better overall benchmark quality is not yet established.
+
+### Follow-up issue after the first fix
+- After increasing the local generation budget once, the 90-sample run still failed again on `sample_6604`.
+- The failure was the same class of issue:
+  - the controller emitted a very long JSON action,
+  - especially a very long `rationale`,
+  - the output was truncated before the JSON closed,
+  - action parsing failed.
+
+### Stronger mitigation applied
+- Tightened the controller system prompt in `rlm/video/prompts.py`:
+  - explicitly tell the controller to be terse,
+  - forbid explanatory deliberation,
+  - make `rationale` optional,
+  - require `rationale` to be at most 12 words if present.
+- Compacted `recent_action_history` in the controller prompt:
+  - remove prior `answer` text,
+  - remove prior `rationale` text,
+  - keep only the structural fields needed for planning.
+- Increased the `Qwen3.5-9B` benchmark runner budget again:
+  - `controller_max_new_tokens = 2048`
+
+### Why the prompt compaction matters
+- The controller was seeing its own previous verbose `rationale` fields inside `recent_action_history`.
+- That creates a feedback loop where later actions become even more verbose.
+- Removing that verbose history should make the action format more stable and reduce needless token usage.
+
+### Final official-style result on the same 90-sample subset
+- `Qwen/Qwen3.5-9B` completed the same 90-sample subset used earlier for `Qwen/Qwen3-8B`.
+- Official-style eval with the same judge model (`Qwen/Qwen2.5-7B-Instruct`) gave:
+  - `Qwen3-8B`: `14.97%`
+  - `Qwen3.5-9B`: `8.00%`
+  - delta: `-6.97`
+
+### Main interpretation
+- The newer controller finished the benchmark after prompt/runtime stabilization, but the final quality was worse.
+- The strongest observed pattern is:
+  - shorter answers,
+  - fewer steps,
+  - lower rubric completeness.
+- This suggests the current controller interface and prompt regime still fit `Qwen3-8B` better than `Qwen3.5-9B`.
+
+### Follow-up note
+- Detailed comparison is documented in:
+  - `docs/failure_analysis/qwen3_8b_vs_qwen3_5_9b_90run.md`

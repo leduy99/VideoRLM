@@ -1,6 +1,7 @@
+from rlm.video.evidence_pipeline import build_evidence_board, build_question_spec
 from rlm.video.memory import PreparedVideoArtifacts, VideoMemoryBuilder
 from rlm.video.tools import VideoToolExecutor
-from rlm.video.types import ControllerState, SpeechSpan, TimeSpan
+from rlm.video.types import ControllerState, OpenedTarget, SpeechSpan, TimeSpan
 from tests.mock_lm import MockLM
 
 
@@ -59,6 +60,8 @@ def test_open_speech_selects_relevant_causal_spans():
     assert len(observation.evidence) == 2
     assert observation.evidence[0].time_span.start == 10.0
     assert observation.evidence[1].time_span.start == 20.0
+    assert observation.evidence[0].metadata["slot"] == "reason"
+    assert observation.evidence[0].metadata["role"] == "core"
     assert "clasp was opening a lot" in observation.evidence[0].detail
     assert "brought it back to Cartier" in observation.evidence[1].detail
     assert "other rings" not in observation.evidence[0].detail
@@ -195,6 +198,42 @@ def test_open_speech_skips_duplicate_existing_evidence():
     observation = executor.open("tool_sample_scene_001", "speech", state)
 
     assert observation.evidence == []
+
+
+def test_open_reopen_guard_blocks_same_node_modality_and_slot():
+    memory = build_memory_for_tools(
+        [
+            SpeechSpan(
+                text="She wore it right away because she wanted to show the new diamond.",
+                time_span=TimeSpan(0.0, 10.0),
+            )
+        ]
+    )
+    executor = VideoToolExecutor(memory)
+    question = "Why did she decide to wear the new diamond add-on right away instead of saving it?"
+    question_spec = build_question_spec(question, task_type="causal_reasoning")
+    evidence_board = build_evidence_board(question_spec)
+    state = ControllerState(
+        question=question,
+        question_spec=question_spec,
+        evidence_board=evidence_board,
+    )
+    first = executor.open("tool_sample_scene_001", "speech", state, target_slot="reason")
+    state.evidence_ledger.extend(first.evidence)
+    state.evidence_board.opened_targets.append(
+        OpenedTarget(
+            node_id="tool_sample_scene_001",
+            modality="speech",
+            target_slot="reason",
+            result="slot_filled",
+            step_index=1,
+        )
+    )
+
+    second = executor.open("tool_sample_scene_001", "speech", state, target_slot="reason")
+
+    assert second.evidence == []
+    assert second.metadata["result"] == "reopen_blocked"
 
 
 def test_open_speech_why_query_prefers_causal_late_snippet_over_early_setup():

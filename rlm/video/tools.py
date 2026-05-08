@@ -2,6 +2,13 @@ import json
 import re
 
 from rlm.clients.base_lm import BaseLM
+from rlm.video.evidence_pipeline import (
+    build_question_spec,
+    is_reopen_blocked,
+    open_v2,
+    search_v2,
+    select_target_slot,
+)
 from rlm.video.index import STOPWORDS, TOKEN_PATTERN, VideoMemoryIndex
 from rlm.video.types import (
     ControllerAction,
@@ -50,9 +57,20 @@ class VideoToolExecutor:
 
     def execute(self, action: ControllerAction, state: ControllerState) -> Observation:
         if action.action_type == "SEARCH":
-            return self.search(action.query or "", action.modality, self.top_k)
+            return self.search(
+                query=action.query or "",
+                modality=action.modality,
+                top_k=self.top_k,
+                state=state,
+                target_slot=action.target_slot,
+            )
         if action.action_type == "OPEN":
-            return self.open(action.node_id or "", action.modality, state)
+            return self.open(
+                node_id=action.node_id or "",
+                modality=action.modality,
+                state=state,
+                target_slot=action.target_slot,
+            )
         if action.action_type == "SPLIT":
             return self.split(action.node_id or "")
         if action.action_type == "MERGE":
@@ -61,15 +79,40 @@ class VideoToolExecutor:
             return self.stop(action.answer or "", action.evidence_ids, state)
         raise ValueError(f"Unsupported action type: {action.action_type}")
 
-    def search(self, query: str, modality: Modality | None, top_k: int) -> Observation:
-        hits = self.index.search(query=query, modality=modality, top_k=top_k)
-        frontier = [hit.to_frontier_item() for hit in hits]
-        summary = f"SEARCH found {len(frontier)} candidate nodes for query '{query}'."
+    def search(
+        self,
+        query: str,
+        modality: Modality | None,
+        top_k: int,
+        state: ControllerState,
+        target_slot: str | None,
+    ) -> Observation:
+        question_spec = state.question_spec or build_question_spec(state.question, state.task_type)
+        selected_slot = target_slot or select_target_slot(question_spec, state.evidence_board)
+        frontier, metadata = search_v2(
+            index=self.index,
+            question_spec=question_spec,
+            target_slot=selected_slot,
+            state=state,
+            top_k=top_k,
+            query_override=query or None,
+            modality=modality,
+        )
+        summary = (
+            f"SEARCH v2 found {len(frontier)} candidate nodes for "
+            f"slot '{selected_slot or 'generic'}'."
+        )
         return Observation(
             kind="search",
             summary=summary,
             frontier=frontier,
-            metadata={"query": query, "modality": modality, "hit_count": len(frontier)},
+            metadata={
+                "query": query,
+                "modality": metadata["modality"],
+                "hit_count": len(frontier),
+                "target_slot": selected_slot,
+                "queries": metadata["queries"],
+            },
         )
 
     def open(
@@ -77,23 +120,42 @@ class VideoToolExecutor:
         node_id: str,
         modality: Modality | None,
         state: ControllerState,
+        target_slot: str | None = None,
     ) -> Observation:
         node = self.memory.get_node(node_id)
         selected_modality = modality or "visual"
+        question_spec = state.question_spec or build_question_spec(state.question, state.task_type)
+        selected_slot = target_slot or select_target_slot(question_spec, state.evidence_board)
+
+        if is_reopen_blocked(state.evidence_board, node.node_id, selected_modality, selected_slot):
+            return Observation(
+                kind="open",
+                summary=(
+                    f"OPEN skipped {selected_modality} on node {node.node_id} because "
+                    f"slot '{selected_slot or 'generic'}' was already opened."
+                ),
+                node_id=node.node_id,
+                metadata={
+                    "modality": selected_modality,
+                    "clip_path": node.clip_path,
+                    "target_slot": selected_slot,
+                    "background_only": False,
+                    "no_new_information": True,
+                    "filled_slots": [],
+                    "missing_slots": [],
+                    "duplicate_evidence_count": 0,
+                    "suggested_queries": [],
+                    "progress_made": False,
+                    "result": "reopen_blocked",
+                },
+            )
 
         if selected_modality == "speech":
-            evidence = self._build_speech_evidence(node, state)
-            if evidence:
-                summary = (
-                    f"OPEN gathered {len(evidence)} {selected_modality} evidence items "
-                    f"from node {node.node_id}."
-                )
-            else:
-                summary = f"OPEN found no {selected_modality} evidence in node {node.node_id}."
+            raw_evidence = self._build_speech_evidence(node, state)
         else:
             detail = self._build_detail(node, selected_modality)
             if detail:
-                evidence = [
+                raw_evidence = [
                     Evidence(
                         evidence_id=self._next_evidence_id(),
                         claim=self._to_claim(detail, selected_modality),
@@ -105,17 +167,38 @@ class VideoToolExecutor:
                         metadata={"clip_path": node.clip_path},
                     )
                 ]
-                summary = f"OPEN gathered {selected_modality} evidence from node {node.node_id}."
             else:
-                evidence = []
-                summary = f"OPEN found no {selected_modality} evidence in node {node.node_id}."
+                raw_evidence = []
+
+        evidence, open_metadata = open_v2(
+            question_spec=question_spec,
+            target_slot=selected_slot,
+            state=state,
+            node_id=node.node_id,
+            modality=selected_modality,
+            evidence_items=raw_evidence,
+        )
+        if evidence:
+            summary = (
+                f"OPEN v2 gathered {len(evidence)} {selected_modality} evidence items "
+                f"for slot '{selected_slot or 'generic'}' from node {node.node_id}."
+            )
+        else:
+            summary = (
+                f"OPEN v2 found no answer-bearing {selected_modality} evidence for "
+                f"slot '{selected_slot or 'generic'}' in node {node.node_id}."
+            )
 
         return Observation(
             kind="open",
             summary=summary,
             evidence=evidence,
             node_id=node.node_id,
-            metadata={"modality": selected_modality, "clip_path": node.clip_path},
+            metadata={
+                "modality": selected_modality,
+                "clip_path": node.clip_path,
+                **open_metadata,
+            },
         )
 
     def split(self, node_id: str) -> Observation:

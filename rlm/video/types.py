@@ -7,6 +7,8 @@ VideoNodeLevel = Literal["video", "scene", "segment", "clip"]
 Modality = Literal["speech", "visual", "ocr", "audio", "cross_modal"]
 ActionType = Literal["SEARCH", "OPEN", "SPLIT", "MERGE", "STOP"]
 FrontierStatus = Literal["unopened", "opened", "expanded", "exhausted"]
+SlotRole = Literal["core", "support", "background", "noise"]
+SlotStatus = Literal["missing", "filled", "background_only"]
 
 
 @dataclass
@@ -259,6 +261,187 @@ class FrontierItem:
 
 
 @dataclass
+class EvidenceSlotSpec:
+    slot: str
+    description: str
+    required: bool = True
+    preferred_modality: Modality | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "slot": self.slot,
+            "description": self.description,
+            "required": self.required,
+            "preferred_modality": self.preferred_modality,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EvidenceSlotSpec":
+        return cls(
+            slot=data["slot"],
+            description=data["description"],
+            required=bool(data.get("required", True)),
+            preferred_modality=data.get("preferred_modality"),
+        )
+
+
+@dataclass
+class QuestionSpec:
+    question_type: str
+    required_slots: list[EvidenceSlotSpec]
+    preferred_modality: Modality | None = None
+    answer_policy: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "question_type": self.question_type,
+            "required_slots": [slot.to_dict() for slot in self.required_slots],
+            "preferred_modality": self.preferred_modality,
+            "answer_policy": self.answer_policy,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "QuestionSpec":
+        return cls(
+            question_type=data["question_type"],
+            required_slots=[
+                EvidenceSlotSpec.from_dict(item) for item in data.get("required_slots", [])
+            ],
+            preferred_modality=data.get("preferred_modality"),
+            answer_policy=data.get("answer_policy"),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+    def slot_names(self) -> list[str]:
+        return [slot.slot for slot in self.required_slots]
+
+    def get_slot(self, slot_name: str) -> EvidenceSlotSpec | None:
+        for slot in self.required_slots:
+            if slot.slot == slot_name:
+                return slot
+        return None
+
+
+@dataclass
+class EvidenceBoardSlot:
+    slot: str
+    description: str
+    required: bool = True
+    status: SlotStatus = "missing"
+    core_evidence_ids: list[str] = field(default_factory=list)
+    support_evidence_ids: list[str] = field(default_factory=list)
+    background_evidence_ids: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "slot": self.slot,
+            "description": self.description,
+            "required": self.required,
+            "status": self.status,
+            "core_evidence_ids": list(self.core_evidence_ids),
+            "support_evidence_ids": list(self.support_evidence_ids),
+            "background_evidence_ids": list(self.background_evidence_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EvidenceBoardSlot":
+        return cls(
+            slot=data["slot"],
+            description=data["description"],
+            required=bool(data.get("required", True)),
+            status=data.get("status", "missing"),
+            core_evidence_ids=list(data.get("core_evidence_ids", [])),
+            support_evidence_ids=list(data.get("support_evidence_ids", [])),
+            background_evidence_ids=list(data.get("background_evidence_ids", [])),
+        )
+
+
+@dataclass
+class OpenedTarget:
+    node_id: str
+    modality: Modality
+    target_slot: str | None
+    result: str
+    step_index: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "modality": self.modality,
+            "target_slot": self.target_slot,
+            "result": self.result,
+            "step_index": self.step_index,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "OpenedTarget":
+        return cls(
+            node_id=data["node_id"],
+            modality=data["modality"],
+            target_slot=data.get("target_slot"),
+            result=data["result"],
+            step_index=int(data.get("step_index", 0)),
+        )
+
+
+@dataclass
+class EvidenceBoard:
+    question_type: str
+    slots: dict[str, EvidenceBoardSlot]
+    opened_targets: list[OpenedTarget] = field(default_factory=list)
+    missing_required_slots: list[str] = field(default_factory=list)
+    core_evidence_ids: list[str] = field(default_factory=list)
+    support_evidence_ids: list[str] = field(default_factory=list)
+    background_evidence_ids: list[str] = field(default_factory=list)
+    slot_fill_count: int = 0
+    background_only_open_count: int = 0
+    duplicate_evidence_count: int = 0
+    no_progress_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "question_type": self.question_type,
+            "slots": {name: slot.to_dict() for name, slot in self.slots.items()},
+            "opened_targets": [item.to_dict() for item in self.opened_targets],
+            "missing_required_slots": list(self.missing_required_slots),
+            "core_evidence_ids": list(self.core_evidence_ids),
+            "support_evidence_ids": list(self.support_evidence_ids),
+            "background_evidence_ids": list(self.background_evidence_ids),
+            "slot_fill_count": self.slot_fill_count,
+            "background_only_open_count": self.background_only_open_count,
+            "duplicate_evidence_count": self.duplicate_evidence_count,
+            "no_progress_count": self.no_progress_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EvidenceBoard":
+        return cls(
+            question_type=data["question_type"],
+            slots={
+                name: EvidenceBoardSlot.from_dict(slot_data)
+                for name, slot_data in data.get("slots", {}).items()
+            },
+            opened_targets=[
+                OpenedTarget.from_dict(item) for item in data.get("opened_targets", [])
+            ],
+            missing_required_slots=list(data.get("missing_required_slots", [])),
+            core_evidence_ids=list(data.get("core_evidence_ids", [])),
+            support_evidence_ids=list(data.get("support_evidence_ids", [])),
+            background_evidence_ids=list(data.get("background_evidence_ids", [])),
+            slot_fill_count=int(data.get("slot_fill_count", 0)),
+            background_only_open_count=int(data.get("background_only_open_count", 0)),
+            duplicate_evidence_count=int(data.get("duplicate_evidence_count", 0)),
+            no_progress_count=int(data.get("no_progress_count", 0)),
+        )
+
+    def is_slot_filled(self, slot_name: str) -> bool:
+        slot = self.slots.get(slot_name)
+        return slot is not None and slot.status == "filled"
+
+
+@dataclass
 class Evidence:
     evidence_id: str
     claim: str
@@ -338,6 +521,7 @@ class ControllerAction:
     query: str | None = None
     modality: Modality | None = None
     node_id: str | None = None
+    target_slot: str | None = None
     evidence_ids: list[str] = field(default_factory=list)
     answer: str | None = None
     rationale: str | None = None
@@ -358,6 +542,7 @@ class ControllerAction:
             "query": self.query,
             "modality": self.modality,
             "node_id": self.node_id,
+            "target_slot": self.target_slot,
             "evidence_ids": list(self.evidence_ids),
             "answer": self.answer,
             "rationale": self.rationale,
@@ -370,6 +555,7 @@ class ControllerAction:
             query=data.get("query"),
             modality=data.get("modality"),
             node_id=data.get("node_id"),
+            target_slot=data.get("target_slot"),
             evidence_ids=list(data.get("evidence_ids", [])),
             answer=data.get("answer"),
             rationale=data.get("rationale"),
@@ -401,24 +587,30 @@ class ControllerState:
     question: str
     task_type: str | None = None
     dialogue_context: list[dict[str, str]] = field(default_factory=list)
+    question_spec: QuestionSpec | None = None
     subquestion: str | None = None
     frontier: list[FrontierItem] = field(default_factory=list)
     evidence_ledger: list[Evidence] = field(default_factory=list)
+    evidence_board: EvidenceBoard | None = None
     action_history: list[dict[str, Any]] = field(default_factory=list)
     budget: BudgetState = field(default_factory=BudgetState)
     global_context: dict[str, Any] = field(default_factory=dict)
+    no_progress_steps: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "question": self.question,
             "task_type": self.task_type,
             "dialogue_context": list(self.dialogue_context),
+            "question_spec": self.question_spec.to_dict() if self.question_spec else None,
             "subquestion": self.subquestion,
             "frontier": [item.to_dict() for item in self.frontier],
             "evidence_ledger": [item.to_dict() for item in self.evidence_ledger],
+            "evidence_board": self.evidence_board.to_dict() if self.evidence_board else None,
             "action_history": list(self.action_history),
             "budget": self.budget.to_dict(),
             "global_context": dict(self.global_context),
+            "no_progress_steps": self.no_progress_steps,
         }
 
     @classmethod
@@ -427,14 +619,25 @@ class ControllerState:
             question=data["question"],
             task_type=data.get("task_type"),
             dialogue_context=list(data.get("dialogue_context", [])),
+            question_spec=(
+                QuestionSpec.from_dict(data["question_spec"])
+                if data.get("question_spec") is not None
+                else None
+            ),
             subquestion=data.get("subquestion"),
             frontier=[FrontierItem.from_dict(item) for item in data.get("frontier", [])],
             evidence_ledger=[
                 Evidence.from_dict(item) for item in data.get("evidence_ledger", [])
             ],
+            evidence_board=(
+                EvidenceBoard.from_dict(data["evidence_board"])
+                if data.get("evidence_board") is not None
+                else None
+            ),
             action_history=list(data.get("action_history", [])),
             budget=BudgetState.from_dict(data.get("budget", {})),
             global_context=dict(data.get("global_context", {})),
+            no_progress_steps=int(data.get("no_progress_steps", 0)),
         )
 
     def frontier_ids(self) -> set[str]:
