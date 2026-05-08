@@ -7,6 +7,13 @@ from typing import Any
 from rlm.clients import get_client
 from rlm.clients.base_lm import BaseLM
 from rlm.core.types import ClientBackend
+from rlm.video.evidence_pipeline import (
+    build_evidence_board,
+    build_question_spec,
+    search_v2,
+    select_target_slot,
+    update_evidence_board,
+)
 from rlm.video.index import STOPWORDS, TOKEN_PATTERN, VideoMemoryIndex
 from rlm.video.logger import VideoRLMLogger
 from rlm.video.prompts import build_controller_prompt
@@ -99,6 +106,8 @@ class VideoRLM:
             )
             raw_response = self.controller_client.completion(prompt)
             action = self._parse_action(raw_response)
+            if action.target_slot is None:
+                action.target_slot = select_target_slot(state.question_spec, state.evidence_board)
             previous_state = copy.deepcopy(state.to_dict())
             observation = tools.execute(action, state)
             state = self._apply_observation(state, action, observation)
@@ -126,6 +135,9 @@ class VideoRLM:
             if consecutive_empty_open_steps >= 2 and state.evidence_ledger:
                 answer = self._fallback_answer_from_state(state)
                 break
+            if state.no_progress_steps >= 2:
+                answer = self._fallback_answer_from_state(state)
+                break
 
         if answer is None:
             answer = self._fallback_answer_from_state(state)
@@ -147,22 +159,12 @@ class VideoRLM:
         dialogue_context: list[dict[str, str]],
         task_type: str | None,
     ) -> ControllerState:
-        initial_hits = index.search(question, top_k=self.max_frontier_items)
-        if initial_hits:
-            frontier = [item.to_frontier_item() for item in initial_hits]
-        else:
-            frontier = [
-                FrontierItem(
-                    node_id=node.node_id,
-                    time_span=node.time_span,
-                    level=node.level,
-                    score=0.1,
-                    why_candidate=f"Top-level node {node.node_id}",
-                    recommended_modalities=["visual", "speech"],
-                )
-                for node in memory.top_level_nodes()
-            ]
-
+        question_spec = build_question_spec(
+            question=question,
+            task_type=task_type,
+            dialogue_context=dialogue_context,
+        )
+        evidence_board = build_evidence_board(question_spec)
         scene_summaries = []
         for node in memory.top_level_nodes()[:6]:
             summary = node.visual_summary or node.node_id
@@ -182,15 +184,44 @@ class VideoRLM:
             "video_length_seconds": memory.metadata.get("duration_seconds"),
             "node_count": len(memory.nodes),
             "topical_index": scene_summaries,
+            "evidence_metrics": {
+                "slot_fill_rate": 0.0,
+                "background_only_open_rate": 0.0,
+                "duplicate_evidence_rate": 0.0,
+                "no_progress_rate": 0.0,
+                "tokens_per_step": 0.0,
+            },
         }
-        return ControllerState(
+        state = ControllerState(
             question=question,
             task_type=task_type,
             dialogue_context=dialogue_context,
-            frontier=frontier[: self.max_frontier_items],
+            question_spec=question_spec,
+            evidence_board=evidence_board,
             budget=budget,
             global_context=global_context,
         )
+        frontier, _ = search_v2(
+            index=index,
+            question_spec=question_spec,
+            target_slot=select_target_slot(question_spec, evidence_board),
+            state=state,
+            top_k=self.max_frontier_items,
+        )
+        if not frontier:
+            frontier = [
+                FrontierItem(
+                    node_id=node.node_id,
+                    time_span=node.time_span,
+                    level=node.level,
+                    score=0.1,
+                    why_candidate=f"Top-level node {node.node_id}",
+                    recommended_modalities=["visual", "speech"],
+                )
+                for node in memory.top_level_nodes()
+            ]
+        state.frontier = frontier[: self.max_frontier_items]
+        return state
 
     def _apply_observation(
         self,
@@ -207,6 +238,13 @@ class VideoRLM:
         usage = self.controller_client.get_usage_summary()
         state.budget.tokens_spent = usage.total_input_tokens + usage.total_output_tokens
         state.action_history.append(action.to_dict())
+        if state.evidence_board is not None:
+            state.evidence_board = update_evidence_board(
+                state.evidence_board,
+                state.question_spec,
+                observation,
+                state.budget.steps_used,
+            )
 
         if action.action_type == "SEARCH":
             state.frontier = self._merge_frontier(state.frontier, observation.frontier)
@@ -224,6 +262,16 @@ class VideoRLM:
             for evidence in state.evidence_ledger:
                 if evidence.evidence_id in selected:
                     evidence.used_in_final_answer = True
+
+        progress_made = bool(observation.metadata.get("progress_made"))
+        if progress_made:
+            state.no_progress_steps = 0
+        else:
+            state.no_progress_steps += 1
+            if state.evidence_board is not None:
+                state.evidence_board.no_progress_count += 1
+
+        state.global_context["evidence_metrics"] = self._build_evidence_metrics(state)
 
         return state
 
@@ -290,13 +338,24 @@ class VideoRLM:
         raise ValueError(f"Could not parse controller action JSON from: {text}")
 
     def _fallback_answer_from_state(self, state: ControllerState) -> str:
+        if state.evidence_board is not None and state.evidence_board.missing_required_slots:
+            return self._diagnostic_abstain_from_state(state)
         if state.evidence_ledger:
             return self._synthesize_answer_from_evidence(state)
         return "Controller exhausted its budget before collecting grounded evidence."
 
     def _synthesize_answer_from_evidence(self, state: ControllerState) -> str:
+        if state.evidence_board is not None:
+            allowed_ids = set(
+                state.evidence_board.core_evidence_ids + state.evidence_board.support_evidence_ids
+            )
+        else:
+            allowed_ids = set()
+        filtered_evidence = [
+            item for item in state.evidence_ledger if not allowed_ids or item.evidence_id in allowed_ids
+        ]
         top_evidence = sorted(
-            state.evidence_ledger,
+            filtered_evidence or state.evidence_ledger,
             key=lambda item: (-item.confidence, item.time_span.start),
         )[:4]
         evidence_lines = []
@@ -305,6 +364,8 @@ class VideoRLM:
                 json.dumps(
                     {
                         "evidence_id": item.evidence_id,
+                        "slot": item.metadata.get("slot"),
+                        "role": item.metadata.get("role"),
                         "modality": item.modality,
                         "time_span": item.time_span.to_dict(),
                         "excerpt": _focus_evidence_detail(item.detail, state.question),
@@ -327,6 +388,48 @@ class VideoRLM:
             + "\n".join(evidence_lines)
         )
         return self.controller_client.completion(prompt).strip()
+
+    def _diagnostic_abstain_from_state(self, state: ControllerState) -> str:
+        if state.evidence_board is None:
+            return "I could not collect enough grounded evidence to answer safely."
+        missing = ", ".join(state.evidence_board.missing_required_slots) or "unknown"
+        background_slots = [
+            slot_name
+            for slot_name, slot in state.evidence_board.slots.items()
+            if slot.status == "background_only"
+        ]
+        if background_slots:
+            return (
+                "I found related background evidence, but the required answer-bearing slots are "
+                f"still missing: {missing}. Background-only slots: {', '.join(background_slots)}."
+            )
+        return (
+            "I could not fill all required evidence slots needed for a grounded answer. "
+            f"Missing slots: {missing}."
+        )
+
+    def _build_evidence_metrics(self, state: ControllerState) -> dict[str, float]:
+        board = state.evidence_board
+        if board is None:
+            return {
+                "slot_fill_rate": 0.0,
+                "background_only_open_rate": 0.0,
+                "duplicate_evidence_rate": 0.0,
+                "no_progress_rate": 0.0,
+                "tokens_per_step": 0.0,
+            }
+        opened_count = max(1, len(board.opened_targets))
+        total_slots = max(1, len(board.slots))
+        return {
+            "slot_fill_rate": round(board.slot_fill_count / total_slots, 4),
+            "background_only_open_rate": round(board.background_only_open_count / opened_count, 4),
+            "duplicate_evidence_rate": round(board.duplicate_evidence_count / opened_count, 4),
+            "no_progress_rate": round(board.no_progress_count / max(1, state.budget.steps_used), 4),
+            "tokens_per_step": round(
+                state.budget.tokens_spent / max(1, state.budget.steps_used),
+                4,
+            ),
+        }
 
 
 def _focus_evidence_detail(detail: str, question: str, max_chars: int = 1200) -> str:

@@ -1,0 +1,608 @@
+from __future__ import annotations
+
+import hashlib
+from collections import defaultdict
+from typing import Any
+
+from rlm.video.index import STOPWORDS, TOKEN_PATTERN, SearchHit, VideoMemoryIndex
+from rlm.video.types import (
+    ControllerState,
+    Evidence,
+    EvidenceBoard,
+    EvidenceBoardSlot,
+    EvidenceSlotSpec,
+    FrontierItem,
+    Modality,
+    Observation,
+    OpenedTarget,
+    QuestionSpec,
+)
+
+GENERIC_SLOT_KEYWORDS: dict[str, list[str]] = {
+    "reason": ["because", "reason", "why", "decided", "chose", "so", "therefore"],
+    "decision": ["decided", "wore", "wear", "tried", "did", "chose"],
+    "object": ["item", "object", "thing", "piece", "bracelet", "diamond", "food"],
+    "first_thing_tried": ["first", "initial", "earliest", "tried", "what about", "this is"],
+    "why_different": ["different", "not regular", "unusual", "realize", "street food"],
+    "reaction": ["reaction", "responded", "said", "felt", "tasted", "tastes", "bite", "bit", "surprised"],
+    "anchor_event": ["stopped", "stared", "paused", "chasing", "moving"],
+    "mouse_reaction": ["mouse", "reaction", "responded", "paused", "looked"],
+    "shared_sensing": ["both", "seemed", "sensed", "noticed", "realized"],
+    "main_claim": ["main", "claim", "answer", "point"],
+    "supporting_detail": ["detail", "support", "evidence", "specific", "example"],
+    "missing_context": ["context", "missing", "unclear", "not enough"],
+}
+CONTROL_QUERY_TOKENS = {"why", "first", "last", "earliest", "initial", "beginning", "final"}
+
+
+def build_question_spec(
+    question: str,
+    task_type: str | None = None,
+    dialogue_context: list[dict[str, str]] | None = None,
+) -> QuestionSpec:
+    del dialogue_context
+    tokens = _tokenize(question)
+    preferred_modality: Modality | None = "speech"
+    question_type = "generic"
+    slots: list[EvidenceSlotSpec]
+    answer_policy = "answer_only_if_required_slots_filled"
+
+    if "why" in tokens:
+        question_type = "why_reason"
+        slots = [
+            EvidenceSlotSpec(
+                slot="object",
+                description=_object_description(question),
+                required=False,
+            ),
+            EvidenceSlotSpec(
+                slot="decision",
+                description=_decision_description(question),
+                required=False,
+            ),
+            EvidenceSlotSpec(
+                slot="reason",
+                description=f"Why {question.rstrip('?')}".strip(),
+                required=True,
+                preferred_modality="speech",
+            ),
+        ]
+    elif {"first", "earliest", "initial", "beginning"} & tokens:
+        question_type = "first_event_realization"
+        slots = [
+            EvidenceSlotSpec(
+                slot="first_thing_tried",
+                description="The earliest item, action, or event directly asked by the question",
+            ),
+            EvidenceSlotSpec(
+                slot="why_different",
+                description="Why that first item or event felt different or revealing",
+            ),
+            EvidenceSlotSpec(
+                slot="reaction",
+                description="Immediate reaction after that first item or event",
+                required=False,
+            ),
+        ]
+    elif "reaction" in tokens and ("sense" in tokens or "seemed" in tokens):
+        question_type = "reaction_inference"
+        preferred_modality = "visual"
+        slots = [
+            EvidenceSlotSpec(
+                slot="anchor_event",
+                description="The key moment or anchor event mentioned in the question",
+                preferred_modality="visual",
+            ),
+            EvidenceSlotSpec(
+                slot="reaction",
+                description="How the subject reacted at that moment",
+                preferred_modality="visual",
+            ),
+            EvidenceSlotSpec(
+                slot="shared_sensing",
+                description="What the participants seemed to sense or realize together",
+                preferred_modality="visual",
+            ),
+        ]
+    elif task_type == "summarization":
+        question_type = "summarization"
+        preferred_modality = "cross_modal"
+        slots = [
+            EvidenceSlotSpec(slot="main_claim", description="Main answer or summary claim"),
+            EvidenceSlotSpec(
+                slot="supporting_detail",
+                description="Specific supporting detail needed for the summary",
+                required=False,
+            ),
+        ]
+    else:
+        slots = [
+            EvidenceSlotSpec(slot="main_claim", description=f"Main answer to: {question}"),
+            EvidenceSlotSpec(
+                slot="supporting_detail",
+                description="Most important supporting detail for the main answer",
+                required=False,
+            ),
+        ]
+
+    return QuestionSpec(
+        question_type=question_type,
+        required_slots=slots,
+        preferred_modality=preferred_modality,
+        answer_policy=answer_policy,
+        metadata={"question": question, "task_type": task_type},
+    )
+
+
+def build_evidence_board(question_spec: QuestionSpec) -> EvidenceBoard:
+    slots = {
+        slot.slot: EvidenceBoardSlot(
+            slot=slot.slot,
+            description=slot.description,
+            required=slot.required,
+        )
+        for slot in question_spec.required_slots
+    }
+    return EvidenceBoard(
+        question_type=question_spec.question_type,
+        slots=slots,
+        missing_required_slots=[slot.slot for slot in question_spec.required_slots if slot.required],
+    )
+
+
+def select_target_slot(
+    question_spec: QuestionSpec | None,
+    board: EvidenceBoard | None,
+) -> str | None:
+    if question_spec is None:
+        return None
+    if board is None:
+        for slot in question_spec.required_slots:
+            if slot.required:
+                return slot.slot
+        return question_spec.required_slots[0].slot if question_spec.required_slots else None
+    for slot in question_spec.required_slots:
+        if not slot.required:
+            continue
+        board_slot = board.slots.get(slot.slot)
+        if board_slot is None or board_slot.status != "filled":
+            return slot.slot
+    return question_spec.required_slots[0].slot if question_spec.required_slots else None
+
+
+def search_v2(
+    index: VideoMemoryIndex,
+    question_spec: QuestionSpec | None,
+    target_slot: str | None,
+    state: ControllerState,
+    top_k: int,
+    query_override: str | None = None,
+    modality: Modality | None = None,
+) -> tuple[list[FrontierItem], dict[str, Any]]:
+    queries = build_slot_queries(query_override or state.question, question_spec, target_slot)
+    hits_by_node: dict[str, SearchHit] = {}
+    query_sources: dict[str, list[str]] = defaultdict(list)
+    selected_modality = modality or _preferred_modality(question_spec, target_slot)
+
+    for query in queries:
+        hits = index.search(query=query, modality=selected_modality, top_k=max(top_k * 2, 8))
+        for hit in hits:
+            candidate = SearchHit(
+                node_id=hit.node_id,
+                time_span=hit.time_span,
+                level=hit.level,
+                score=_adjust_search_score(hit, state, target_slot),
+                reason=hit.reason,
+                modality=hit.modality,
+                matched_terms=hit.matched_terms,
+                score_breakdown=dict(hit.score_breakdown),
+            )
+            current = hits_by_node.get(candidate.node_id)
+            if current is None or candidate.score > current.score:
+                hits_by_node[candidate.node_id] = candidate
+            query_sources[candidate.node_id].append(query)
+
+    ranked_hits = sorted(
+        hits_by_node.values(),
+        key=lambda item: (-item.score, item.time_span.start, item.node_id),
+    )[:top_k]
+    frontier = [hit.to_frontier_item() for hit in ranked_hits]
+    for item in frontier:
+        item.why_candidate = (
+            f"{item.why_candidate}; target_slot={target_slot or 'none'}; "
+            f"queries={query_sources.get(item.node_id, [])[:2]}"
+        )
+
+    return frontier, {
+        "target_slot": target_slot,
+        "queries": queries,
+        "modality": selected_modality,
+        "hit_count": len(frontier),
+        "query_sources": dict(query_sources),
+    }
+
+
+def open_v2(
+    question_spec: QuestionSpec | None,
+    target_slot: str | None,
+    state: ControllerState,
+    node_id: str,
+    modality: Modality,
+    evidence_items: list[Evidence],
+) -> tuple[list[Evidence], dict[str, Any]]:
+    if question_spec is None:
+        return evidence_items, {
+            "target_slot": target_slot,
+            "missing_slots": [],
+            "background_only": False,
+            "no_new_information": not evidence_items,
+            "filled_slots": [],
+            "duplicate_evidence_count": 0,
+            "suggested_queries": [],
+            "progress_made": bool(evidence_items),
+            "result": "generic_open",
+        }
+
+    classified: list[Evidence] = []
+    duplicate_count = 0
+    filled_slots: set[str] = set()
+    background_only = True
+
+    for item in evidence_items:
+        slot_name, slot_score = _best_slot_match(item, question_spec, target_slot)
+        role = _classify_slot_role(slot_name, slot_score, item, target_slot)
+        claim_hash = _claim_hash(item.claim)
+        if _is_duplicate_evidence(state, item, slot_name, claim_hash):
+            duplicate_count += 1
+            continue
+
+        answers_question = role == "core"
+        relevance = min(1.0, 0.35 + slot_score)
+        novelty = _estimate_novelty(state, node_id, modality, target_slot)
+        item.metadata.update(
+            {
+                "slot": slot_name,
+                "role": role,
+                "answers_question": answers_question,
+                "relevance": round(relevance, 4),
+                "novelty": round(novelty, 4),
+                "target_slot": target_slot,
+                "claim_hash": claim_hash,
+            }
+        )
+        if role != "noise":
+            classified.append(item)
+        if role == "core":
+            filled_slots.add(slot_name)
+            background_only = False
+        elif role == "support" and slot_name == target_slot:
+            background_only = False
+
+    missing_slots = [
+        slot.slot
+        for slot in question_spec.required_slots
+        if slot.required and slot.slot not in filled_slots and not _slot_already_filled(state, slot.slot)
+    ]
+    no_new_information = not classified
+    if classified and all(item.metadata.get("role") == "background" for item in classified):
+        background_only = True
+
+    return classified, {
+        "target_slot": target_slot,
+        "missing_slots": missing_slots,
+        "filled_slots": sorted(filled_slots),
+        "background_only": background_only,
+        "no_new_information": no_new_information,
+        "duplicate_evidence_count": duplicate_count,
+        "suggested_queries": build_slot_queries(state.question, question_spec, target_slot)[1:3],
+        "progress_made": bool(filled_slots) or any(
+            item.metadata.get("role") == "support" for item in classified
+        ),
+        "result": _open_result_label(classified, background_only, no_new_information),
+    }
+
+
+def update_evidence_board(
+    board: EvidenceBoard | None,
+    question_spec: QuestionSpec | None,
+    observation: Observation,
+    step_index: int,
+) -> EvidenceBoard | None:
+    if board is None or question_spec is None:
+        return board
+
+    metadata = observation.metadata
+    target_slot = metadata.get("target_slot")
+    modality = metadata.get("modality")
+    if observation.kind == "open" and observation.node_id and modality:
+        board.opened_targets.append(
+            OpenedTarget(
+                node_id=observation.node_id,
+                modality=modality,
+                target_slot=target_slot,
+                result=metadata.get("result", "unknown"),
+                step_index=step_index,
+            )
+        )
+
+    filled_slots_before = {
+        name for name, slot in board.slots.items() if slot.status == "filled"
+    }
+    for item in observation.evidence:
+        slot_name = item.metadata.get("slot")
+        role = item.metadata.get("role")
+        if slot_name not in board.slots:
+            continue
+        board_slot = board.slots[slot_name]
+        if role == "core":
+            board_slot.core_evidence_ids.append(item.evidence_id)
+            board_slot.status = "filled"
+            board.core_evidence_ids.append(item.evidence_id)
+        elif role == "support":
+            board_slot.support_evidence_ids.append(item.evidence_id)
+            if board_slot.status == "missing":
+                board_slot.status = "background_only"
+            board.support_evidence_ids.append(item.evidence_id)
+        elif role == "background":
+            board_slot.background_evidence_ids.append(item.evidence_id)
+            if board_slot.status == "missing":
+                board_slot.status = "background_only"
+            board.background_evidence_ids.append(item.evidence_id)
+
+    board.duplicate_evidence_count += int(metadata.get("duplicate_evidence_count", 0))
+    if metadata.get("background_only"):
+        board.background_only_open_count += 1
+
+    filled_slots_after = {
+        name for name, slot in board.slots.items() if slot.status == "filled"
+    }
+    board.slot_fill_count += max(0, len(filled_slots_after - filled_slots_before))
+    board.missing_required_slots = [
+        slot.slot
+        for slot in question_spec.required_slots
+        if slot.required and board.slots[slot.slot].status != "filled"
+    ]
+    return board
+
+
+def choose_next_action(
+    state: ControllerState,
+    board: EvidenceBoard | None,
+    frontier: list[FrontierItem],
+) -> dict[str, Any]:
+    target_slot = select_target_slot(state.question_spec, board)
+    if board is not None and not board.missing_required_slots:
+        return {"action_type": "STOP", "target_slot": target_slot}
+    if frontier:
+        return {
+            "action_type": "OPEN",
+            "node_id": frontier[0].node_id,
+            "modality": frontier[0].recommended_modalities[0]
+            if frontier[0].recommended_modalities
+            else "speech",
+            "target_slot": target_slot,
+        }
+    return {
+        "action_type": "SEARCH",
+        "query": build_slot_queries(state.question, state.question_spec, target_slot)[0],
+        "modality": _preferred_modality(state.question_spec, target_slot),
+        "target_slot": target_slot,
+    }
+
+
+def build_slot_queries(
+    question: str,
+    question_spec: QuestionSpec | None,
+    target_slot: str | None,
+) -> list[str]:
+    queries = [question.strip()]
+    if question_spec is None:
+        return queries
+    slot = question_spec.get_slot(target_slot) if target_slot else None
+    if slot is not None:
+        queries.append(slot.description)
+        queries.append(f"{question} {slot.description}".strip())
+        queries.extend(_keyword_queries(slot.slot, slot.description))
+    else:
+        for required_slot in question_spec.required_slots[:2]:
+            queries.append(required_slot.description)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        normalized = " ".join(query.split())
+        if not normalized or normalized in seen:
+            continue
+        deduped.append(normalized)
+        seen.add(normalized)
+    return deduped[:5]
+
+
+def is_reopen_blocked(
+    board: EvidenceBoard | None,
+    node_id: str,
+    modality: Modality,
+    target_slot: str | None,
+) -> bool:
+    if board is None:
+        return False
+    for opened in board.opened_targets:
+        if (
+            opened.node_id == node_id
+            and opened.modality == modality
+            and opened.target_slot == target_slot
+        ):
+            return True
+    return False
+
+
+def _adjust_search_score(hit: SearchHit, state: ControllerState, target_slot: str | None) -> float:
+    score = hit.score
+    if state.evidence_board and is_reopen_blocked(
+        state.evidence_board,
+        hit.node_id,
+        hit.modality,
+        target_slot,
+    ):
+        score -= 0.25
+    if target_slot:
+        slot_tokens = _tokenize(target_slot.replace("_", " "))
+        overlap_bonus = len(slot_tokens & set(hit.matched_terms)) * 0.08
+        score += overlap_bonus
+    return round(score, 4)
+
+
+def _preferred_modality(question_spec: QuestionSpec | None, target_slot: str | None) -> Modality:
+    if question_spec is None:
+        return "speech"
+    if target_slot:
+        slot = question_spec.get_slot(target_slot)
+        if slot is not None and slot.preferred_modality is not None:
+            return slot.preferred_modality
+    return question_spec.preferred_modality or "speech"
+
+
+def _best_slot_match(
+    item: Evidence,
+    question_spec: QuestionSpec,
+    target_slot: str | None,
+) -> tuple[str, float]:
+    text_tokens = _tokenize(" ".join(part for part in [item.claim, item.detail] if part))
+    best_slot = target_slot or question_spec.required_slots[0].slot
+    best_score = 0.0
+    for slot in question_spec.required_slots:
+        slot_tokens = _tokenize(f"{slot.slot.replace('_', ' ')} {slot.description}")
+        keyword_tokens = _tokenize(" ".join(GENERIC_SLOT_KEYWORDS.get(slot.slot, [])))
+        overlap = len(text_tokens & slot_tokens)
+        keyword_overlap = len(text_tokens & keyword_tokens)
+        score = overlap * 0.18 + keyword_overlap * 0.22
+        if slot.slot == target_slot:
+            score += 0.12
+        if score > best_score:
+            best_slot = slot.slot
+            best_score = score
+    return best_slot, round(best_score, 4)
+
+
+def _classify_slot_role(
+    slot_name: str,
+    slot_score: float,
+    item: Evidence,
+    target_slot: str | None,
+) -> str:
+    text = " ".join(part for part in [item.claim, item.detail] if part).lower()
+    if slot_score <= 0.12:
+        return "noise"
+    if slot_name == target_slot and any(
+        cue in text
+        for cue in (
+            "because",
+            "so ",
+            "therefore",
+            "decided",
+            "worried",
+            "fixed",
+            "reaction",
+            "tasted",
+            "first",
+            "this is",
+            "what about",
+        )
+    ):
+        return "core"
+    if slot_name == target_slot and slot_score >= 0.3:
+        return "core"
+    if slot_score >= 0.2:
+        return "support"
+    return "background"
+
+
+def _is_duplicate_evidence(
+    state: ControllerState,
+    item: Evidence,
+    slot_name: str,
+    claim_hash: str,
+) -> bool:
+    for existing in state.evidence_ledger:
+        if existing.source_node_id != item.source_node_id:
+            continue
+        if existing.modality != item.modality:
+            continue
+        if existing.metadata.get("slot") != slot_name:
+            continue
+        if existing.metadata.get("claim_hash") == claim_hash:
+            return True
+    return False
+
+
+def _estimate_novelty(
+    state: ControllerState,
+    node_id: str,
+    modality: Modality,
+    target_slot: str | None,
+) -> float:
+    if state.evidence_board is None:
+        return 1.0
+    if is_reopen_blocked(state.evidence_board, node_id, modality, target_slot):
+        return 0.1
+    return 0.85
+
+
+def _slot_already_filled(state: ControllerState, slot_name: str) -> bool:
+    if state.evidence_board is None:
+        return False
+    slot = state.evidence_board.slots.get(slot_name)
+    return slot is not None and slot.status == "filled"
+
+
+def _open_result_label(
+    evidence_items: list[Evidence],
+    background_only: bool,
+    no_new_information: bool,
+) -> str:
+    if no_new_information:
+        return "no_new_information"
+    if background_only:
+        return "background_only"
+    if any(item.metadata.get("role") == "core" for item in evidence_items):
+        return "slot_filled"
+    return "support_only"
+
+
+def _tokenize(text: str) -> set[str]:
+    return {
+        token
+        for token in (match.group(0).lower() for match in TOKEN_PATTERN.finditer(text))
+        if (token not in STOPWORDS or token in CONTROL_QUERY_TOKENS) and len(token) > 1
+    }
+
+
+def _keyword_queries(slot_name: str, description: str) -> list[str]:
+    keywords = GENERIC_SLOT_KEYWORDS.get(slot_name, [])
+    if not keywords:
+        return []
+    return [f"{description} {' '.join(keywords[:4])}".strip(), " ".join(keywords[:5]).strip()]
+
+
+def _object_description(question: str) -> str:
+    lowered = question.lower()
+    if "diamond" in lowered:
+        return "The diamond item or add-on being discussed"
+    if "bracelet" in lowered:
+        return "The bracelet or jewelry item being discussed"
+    if "food" in lowered or "tried" in lowered:
+        return "The first food item or unusual object being discussed"
+    return f"The main object or entity in: {question}"
+
+
+def _decision_description(question: str) -> str:
+    lowered = question.lower()
+    if "wear" in lowered:
+        return "The choice to wear or not wear the item"
+    if "try" in lowered or "tried" in lowered:
+        return "The choice to try the item or action"
+    return f"The decision or action directly asked by: {question}"
+
+
+def _claim_hash(text: str) -> str:
+    normalized = " ".join(text.split()).lower()
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
