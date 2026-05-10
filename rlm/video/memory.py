@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from rlm.video.adapters import (
     AudioEventExtractor,
@@ -75,6 +75,8 @@ class VideoMemoryBuilder:
         scene_duration_seconds: float = 180.0,
         segment_duration_seconds: float = 45.0,
         clip_duration_seconds: float = 15.0,
+        visual_span_mode: Literal["scene_and_clip", "clip"] = "scene_and_clip",
+        aggregate_child_visual_summaries: bool = False,
     ):
         self.speech_recognizer = speech_recognizer
         self.visual_summarizer = visual_summarizer
@@ -83,6 +85,8 @@ class VideoMemoryBuilder:
         self.scene_duration_seconds = scene_duration_seconds
         self.segment_duration_seconds = segment_duration_seconds
         self.clip_duration_seconds = clip_duration_seconds
+        self.visual_span_mode = visual_span_mode
+        self.aggregate_child_visual_summaries = aggregate_child_visual_summaries
 
     def prepare_artifacts(
         self,
@@ -94,9 +98,7 @@ class VideoMemoryBuilder:
         if not video_id:
             video_id = Path(video_path).stem
 
-        scene_spans = self._subdivide(TimeSpan(0.0, duration_seconds), self.scene_duration_seconds)
-        clip_spans = self._subdivide(TimeSpan(0.0, duration_seconds), self.clip_duration_seconds)
-        visual_spans = scene_spans + clip_spans
+        visual_spans = self._visual_spans(TimeSpan(0.0, duration_seconds))
 
         speech_spans = (
             self.speech_recognizer.recognize(video_path) if self.speech_recognizer else []
@@ -112,6 +114,11 @@ class VideoMemoryBuilder:
         payload = dict(metadata or {})
         payload.setdefault("source_video_path", video_path)
         payload.setdefault("duration_seconds", duration_seconds)
+        payload.setdefault("visual_span_mode", self.visual_span_mode)
+        payload.setdefault(
+            "aggregate_child_visual_summaries",
+            self.aggregate_child_visual_summaries,
+        )
         return PreparedVideoArtifacts(
             video_id=video_id,
             duration_seconds=duration_seconds,
@@ -195,6 +202,11 @@ class VideoMemoryBuilder:
         metadata.setdefault("scene_duration_seconds", self.scene_duration_seconds)
         metadata.setdefault("segment_duration_seconds", self.segment_duration_seconds)
         metadata.setdefault("clip_duration_seconds", self.clip_duration_seconds)
+        metadata.setdefault("visual_span_mode", self.visual_span_mode)
+        metadata.setdefault(
+            "aggregate_child_visual_summaries",
+            self.aggregate_child_visual_summaries,
+        )
         metadata.setdefault("node_count", len(nodes))
         return VideoMemory(
             video_id=artifacts.video_id,
@@ -237,7 +249,7 @@ class VideoMemoryBuilder:
         time_span: TimeSpan,
         parent_id: str | None,
     ) -> VideoNode:
-        summaries = self._matching_visual_summaries(artifacts.visual_summaries, time_span, level)
+        summaries = self._matching_visual_summaries(artifacts, time_span, level)
         speech_spans = self._overlapping_items(artifacts.speech_spans, time_span)
         ocr_spans = self._overlapping_items(artifacts.ocr_spans, time_span)
         audio_events = self._overlapping_items(artifacts.audio_events, time_span)
@@ -276,15 +288,25 @@ class VideoMemoryBuilder:
             cursor = next_end
         return spans
 
+    def _visual_spans(self, root_span: TimeSpan) -> list[TimeSpan]:
+        clip_spans = self._subdivide(root_span, self.clip_duration_seconds)
+        if self.visual_span_mode == "clip":
+            return clip_spans
+        if self.visual_span_mode == "scene_and_clip":
+            scene_spans = self._subdivide(root_span, self.scene_duration_seconds)
+            return scene_spans + clip_spans
+        raise ValueError(f"Unsupported visual_span_mode: {self.visual_span_mode}")
+
     def _overlapping_items(self, items: list[Any], span: TimeSpan) -> list[Any]:
         return [item for item in items if item.time_span.overlaps(span)]
 
     def _matching_visual_summaries(
         self,
-        summaries: list[VisualSummarySpan],
+        artifacts: PreparedVideoArtifacts,
         span: TimeSpan,
         level: VideoNodeLevel,
     ) -> list[VisualSummarySpan]:
+        summaries = artifacts.visual_summaries
         exact = [
             item
             for item in summaries
@@ -293,7 +315,20 @@ class VideoMemoryBuilder:
         if exact:
             return exact
 
-        return [item for item in summaries if item.granularity == level and item.time_span.overlaps(span)]
+        matching = [
+            item for item in summaries if item.granularity == level and item.time_span.overlaps(span)
+        ]
+        if matching:
+            return matching
+        aggregate_child_summaries = bool(
+            artifacts.metadata.get(
+                "aggregate_child_visual_summaries",
+                self.aggregate_child_visual_summaries,
+            )
+        )
+        if aggregate_child_summaries and level in {"scene", "segment"}:
+            return [item for item in summaries if item.granularity == "clip" and item.time_span.overlaps(span)]
+        return []
 
     def _same_span(self, left: TimeSpan, right: TimeSpan, tol: float = 1e-6) -> bool:
         return abs(left.start - right.start) <= tol and abs(left.end - right.end) <= tol

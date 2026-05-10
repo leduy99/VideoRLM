@@ -46,6 +46,29 @@ class FakeClient:
         self.embeddings = FakeEmbeddings()
 
 
+class RecordingChatCompletions:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"summary":"Selected frames","tags":[],"entities":[]}'
+                    )
+                )
+            ]
+        )
+
+
+class RecordingClient:
+    def __init__(self):
+        self.chat_completions = RecordingChatCompletions()
+        self.chat = SimpleNamespace(completions=self.chat_completions)
+
+
 def test_openai_compatible_speech_recognizer_reads_segments(tmp_path: Path):
     audio_path = tmp_path / "sample.wav"
     audio_path.write_bytes(b"fake-audio")
@@ -78,6 +101,44 @@ def test_openai_compatible_visual_summarizer_reads_frames(monkeypatch, tmp_path:
     assert summaries[0].summary == "A slide shows a launch plan"
     assert summaries[0].tags == ["slide"]
     assert summaries[0].granularity == "clip"
+
+
+def test_openai_compatible_visual_summarizer_uses_pitome(monkeypatch, tmp_path: Path):
+    selected = [tmp_path / "selected_1.jpg", tmp_path / "selected_2.jpg"]
+    for path in selected:
+        path.write_bytes(b"fake-image")
+
+    class FakeSelection:
+        frame_paths = selected
+
+    calls = []
+
+    def fake_select_visual_frames_for_span(**kwargs):
+        calls.append(kwargs)
+        return FakeSelection()
+
+    monkeypatch.setattr(video_adapters, "select_visual_frames_for_span", fake_select_visual_frames_for_span)
+    client = RecordingClient()
+    summarizer = OpenAICompatibleVisualSummarizer(
+        model_name="qwen-vl",
+        client=client,
+        use_pitome=True,
+        frame_count=3,
+        pitome_dense_frame_rate=2.0,
+        pitome_min_frame_count=5,
+        pitome_max_selected_frames=1,
+        summary_granularity="clip",
+    )
+
+    summaries = summarizer.summarize("video.mp4", [TimeSpan(0.0, 60.0)])
+
+    assert len(summaries) == 1
+    assert summaries[0].granularity == "clip"
+    assert calls[0]["strategy"] == "pitome"
+    assert calls[0]["uniform_frame_count"] == 5
+    assert calls[0]["dense_frame_rate"] == 2.0
+    content = client.chat_completions.calls[0]["messages"][1]["content"]
+    assert sum(1 for item in content if item["type"] == "image_url") == 1
 
 
 def test_openai_compatible_embedding_provider_reads_embeddings():

@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--speech-model", default="Qwen3-ASR-0.6B")
     prepare.add_argument("--visual-model", default="Qwen3-VL-8B")
     prepare.add_argument("--ffmpeg-bin", default="ffmpeg")
+    _add_visual_preprocessing_args(prepare)
 
     build_memory = subparsers.add_parser(
         "build-memory",
@@ -43,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     build_memory.add_argument("--scene-duration-seconds", type=float, default=180.0)
     build_memory.add_argument("--segment-duration-seconds", type=float, default=45.0)
     build_memory.add_argument("--clip-duration-seconds", type=float, default=15.0)
+    build_memory.add_argument(
+        "--use-pitome",
+        action="store_true",
+        help="Build memory assuming clip-only PiToMe visual summaries.",
+    )
 
     ask = subparsers.add_parser(
         "ask",
@@ -92,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     longshot.add_argument("--clip-duration-seconds", type=float, default=15.0)
     longshot.add_argument("--ffmpeg-bin", default="ffmpeg")
     longshot.add_argument("--log-dir")
+    _add_visual_preprocessing_args(longshot)
     _add_shared_qwen_endpoint_args(longshot)
 
     download_local = subparsers.add_parser(
@@ -134,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     longshot_local.add_argument("--controller-device", default="cuda:0")
     longshot_local.add_argument("--visual-device", default="cuda:1")
     longshot_local.add_argument("--speech-device", default="cuda:2")
+    _add_visual_preprocessing_args(longshot_local)
     _add_local_qwen_args(longshot_local)
 
     official_eval = subparsers.add_parser(
@@ -195,6 +203,8 @@ def _cmd_build_memory(args: argparse.Namespace) -> int:
         scene_duration_seconds=args.scene_duration_seconds,
         segment_duration_seconds=args.segment_duration_seconds,
         clip_duration_seconds=args.clip_duration_seconds,
+        visual_span_mode="clip" if args.use_pitome else "scene_and_clip",
+        aggregate_child_visual_summaries=args.use_pitome,
     )
     artifacts = _load_artifacts(builder, args.artifacts)
     memory = builder.build_from_artifacts(artifacts)
@@ -358,9 +368,12 @@ def _build_qwen_bundle(args: argparse.Namespace, logger: VideoRLMLogger | None):
         embedding_model=getattr(args, "embedding_model", None),
     )
     stack.ffmpeg_bin = getattr(args, "ffmpeg_bin", "ffmpeg")
+    stack.frame_count = getattr(args, "frame_count", 3)
+    stack.frame_width = getattr(args, "frame_width", 768)
     stack.scene_duration_seconds = getattr(args, "scene_duration_seconds", 180.0)
     stack.segment_duration_seconds = getattr(args, "segment_duration_seconds", 45.0)
     stack.clip_duration_seconds = getattr(args, "clip_duration_seconds", 15.0)
+    _apply_visual_preprocessing_args(stack, args)
     return stack.build_bundle(
         logger=logger,
         max_steps=getattr(args, "max_steps", 8),
@@ -382,16 +395,45 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
         attn_implementation=args.attn_implementation,
     )
     config.ffmpeg_bin = getattr(args, "ffmpeg_bin", "ffmpeg")
+    config.frame_count = getattr(args, "frame_count", 3)
+    config.frame_width = getattr(args, "frame_width", 768)
     config.scene_duration_seconds = getattr(args, "scene_duration_seconds", 180.0)
     config.segment_duration_seconds = getattr(args, "segment_duration_seconds", 45.0)
     config.clip_duration_seconds = getattr(args, "clip_duration_seconds", 15.0)
     config.controller_enable_thinking = False
+    _apply_visual_preprocessing_args(config, args)
     return config
 
 
 def _add_shared_qwen_endpoint_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True, help="OpenAI-compatible endpoint base URL")
     parser.add_argument("--api-key", help="API key for the endpoint")
+
+
+def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--frame-count", type=int, default=3)
+    parser.add_argument("--frame-width", type=int, default=768)
+    parser.add_argument(
+        "--use-pitome",
+        action="store_true",
+        help="Use PiToMe frame selection and clip-only visual preprocessing.",
+    )
+    parser.add_argument("--pitome-dense-frame-rate", type=float, default=1.0)
+    parser.add_argument("--pitome-min-frame-count", type=int)
+    parser.add_argument("--pitome-protect-ratio", type=float, default=0.15)
+    parser.add_argument("--pitome-similarity-threshold", type=float, default=0.8)
+    parser.add_argument("--pitome-embedding-size", type=int, default=16)
+    parser.add_argument("--pitome-max-selected-frames", type=int)
+
+
+def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
+    config.use_pitome = getattr(args, "use_pitome", False)
+    config.pitome_dense_frame_rate = getattr(args, "pitome_dense_frame_rate", 1.0)
+    config.pitome_min_frame_count = getattr(args, "pitome_min_frame_count", None)
+    config.pitome_protect_ratio = getattr(args, "pitome_protect_ratio", 0.15)
+    config.pitome_similarity_threshold = getattr(args, "pitome_similarity_threshold", 0.8)
+    config.pitome_embedding_size = getattr(args, "pitome_embedding_size", 16)
+    config.pitome_max_selected_frames = getattr(args, "pitome_max_selected_frames", None)
 
 
 def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:

@@ -1,3 +1,4 @@
+import math
 import subprocess
 import tempfile
 from pathlib import Path
@@ -46,6 +47,22 @@ def sample_span_timestamps(span: TimeSpan, frame_count: int) -> list[float]:
 
     step = span.duration / (frame_count + 1)
     return [span.start + (step * (index + 1)) for index in range(frame_count)]
+
+
+def sample_span_timestamps_by_rate(
+    span: TimeSpan,
+    frame_rate: float,
+    min_frames: int = 1,
+) -> list[float]:
+    if frame_rate <= 0:
+        raise ValueError(f"frame_rate must be positive, got {frame_rate}")
+    if min_frames <= 0:
+        raise ValueError(f"min_frames must be positive, got {min_frames}")
+    if span.duration == 0:
+        return [span.start] * min_frames
+
+    frame_count = max(min_frames, math.ceil(span.duration * frame_rate))
+    return sample_span_timestamps(span, frame_count)
 
 
 def extract_audio_track(
@@ -171,6 +188,35 @@ def extract_frames_for_span(
     paths: list[Path] = []
     for index, timestamp in enumerate(timestamps, start=1):
         frame_path = temp_dir / f"frame_{index:03d}.jpg"
+        paths.append(
+            extract_frame(
+                media_path=media_path,
+                timestamp_seconds=timestamp,
+                output_path=frame_path,
+                ffmpeg_bin=ffmpeg_bin,
+                width=width,
+            )
+        )
+    return paths
+
+
+def extract_frames_for_timestamps(
+    media_path: str | Path,
+    timestamps: list[float],
+    ffmpeg_bin: str = "ffmpeg",
+    width: int | None = None,
+    output_dir: str | Path | None = None,
+    prefix: str = "frame",
+) -> list[Path]:
+    if output_dir is None:
+        temp_dir = make_videorlm_temp_dir("videorlm_frames_")
+    else:
+        temp_dir = Path(output_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+    paths: list[Path] = []
+    for index, timestamp in enumerate(timestamps, start=1):
+        frame_path = temp_dir / f"{prefix}_{index:03d}.jpg"
         paths.append(
             extract_frame(
                 media_path=media_path,

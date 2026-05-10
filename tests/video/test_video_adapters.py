@@ -54,3 +54,39 @@ def test_callable_adapters_work_with_memory_builder():
     assert scene.ocr_spans
     assert scene.audio_events
     assert "Visual summary" in scene.visual_summary
+
+
+def test_memory_builder_can_prepare_clip_only_visual_spans_and_aggregate_upward():
+    seen_spans = []
+
+    def summarize(path, spans):
+        seen_spans.extend(spans)
+        return [
+            VisualSummarySpan(
+                summary=f"clip {index}",
+                time_span=span,
+                granularity="clip",
+            )
+            for index, span in enumerate(spans, start=1)
+        ]
+
+    builder = VideoMemoryBuilder(
+        visual_summarizer=CallableVisualSummarizer(summarize),
+        scene_duration_seconds=10.0,
+        segment_duration_seconds=5.0,
+        clip_duration_seconds=5.0,
+        visual_span_mode="clip",
+        aggregate_child_visual_summaries=True,
+    )
+
+    memory = builder.build(video_path="sample.mp4", duration_seconds=10.0, video_id="sample")
+
+    assert [span.to_dict() for span in seen_spans] == [
+        {"start": 0.0, "end": 5.0},
+        {"start": 5.0, "end": 10.0},
+    ]
+    assert memory.metadata["visual_span_mode"] == "clip"
+    assert memory.metadata["aggregate_child_visual_summaries"] is True
+    assert "clip 1" in memory.get_node("sample_scene_001").visual_summary
+    assert "clip 2" in memory.get_node("sample_scene_001").visual_summary
+    assert "clip 1" in memory.get_node("sample_scene_001_seg_001").visual_summary

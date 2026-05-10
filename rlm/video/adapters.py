@@ -14,7 +14,15 @@ from rlm.video.media import (
     get_videorlm_output_root,
     is_audio_path,
 )
-from rlm.video.types import AudioEvent, OCRSpan, SpeechSpan, TimeSpan, VisualSummarySpan
+from rlm.video.pitome import select_visual_frames_for_span
+from rlm.video.types import (
+    AudioEvent,
+    OCRSpan,
+    SpeechSpan,
+    TimeSpan,
+    VideoNodeLevel,
+    VisualSummarySpan,
+)
 
 
 @runtime_checkable
@@ -176,6 +184,14 @@ class OpenAICompatibleVisualSummarizer:
     scene_threshold_seconds: float = 20.0
     timeout: float = 300.0
     client: Any | None = None
+    use_pitome: bool = False
+    pitome_dense_frame_rate: float = 1.0
+    pitome_min_frame_count: int | None = None
+    pitome_protect_ratio: float = 0.15
+    pitome_similarity_threshold: float = 0.8
+    pitome_embedding_size: int = 16
+    pitome_max_selected_frames: int | None = None
+    summary_granularity: VideoNodeLevel | None = None
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -195,14 +211,7 @@ class OpenAICompatibleVisualSummarizer:
         ) as temp_dir:
             for index, span in enumerate(spans, start=1):
                 frame_dir = Path(temp_dir) / f"span_{index:03d}"
-                frame_paths = extract_frames_for_span(
-                    media_path=video_path,
-                    span=span,
-                    frame_count=self.frame_count,
-                    ffmpeg_bin=self.ffmpeg_bin,
-                    width=self.frame_width,
-                    output_dir=frame_dir,
-                )
+                frame_paths = self._select_frame_paths(video_path, span, frame_dir)
                 content = [{"type": "text", "text": self._build_prompt(span)}]
                 for frame_path in frame_paths:
                     content.append(
@@ -232,6 +241,34 @@ class OpenAICompatibleVisualSummarizer:
                 )
         return outputs
 
+    def _select_frame_paths(self, video_path: str, span: TimeSpan, output_dir: Path) -> list[Path]:
+        if not self.use_pitome:
+            return extract_frames_for_span(
+                media_path=video_path,
+                span=span,
+                frame_count=self.frame_count,
+                ffmpeg_bin=self.ffmpeg_bin,
+                width=self.frame_width,
+                output_dir=output_dir,
+            )
+
+        selection = select_visual_frames_for_span(
+            media_path=video_path,
+            span=span,
+            strategy="pitome",
+            uniform_frame_count=self.pitome_min_frame_count or self.frame_count,
+            dense_frame_rate=self.pitome_dense_frame_rate,
+            ffmpeg_bin=self.ffmpeg_bin,
+            width=self.frame_width,
+            output_dir=output_dir,
+            protect_ratio=self.pitome_protect_ratio,
+            similarity_threshold=self.pitome_similarity_threshold,
+            embedding_size=self.pitome_embedding_size,
+        )
+        if self.pitome_max_selected_frames is None:
+            return selection.frame_paths
+        return selection.frame_paths[: self.pitome_max_selected_frames]
+
     def _build_prompt(self, span: TimeSpan) -> str:
         return (
             "Describe the scene for long-video reasoning. "
@@ -240,6 +277,8 @@ class OpenAICompatibleVisualSummarizer:
         )
 
     def _infer_granularity(self, span: TimeSpan) -> str:
+        if self.summary_granularity is not None:
+            return self.summary_granularity
         return "scene" if span.duration >= self.scene_threshold_seconds else "clip"
 
 

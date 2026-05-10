@@ -19,6 +19,9 @@ class FakeBatch(dict):
 
 
 class FakeProcessor:
+    def __init__(self):
+        self.messages = []
+
     def apply_chat_template(
         self,
         messages,
@@ -27,6 +30,7 @@ class FakeProcessor:
         return_dict=True,
         return_tensors="pt",
     ):
+        self.messages.append(messages)
         return FakeBatch(torch.tensor([[1, 2, 3]]))
 
     def batch_decode(self, generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False):
@@ -186,3 +190,42 @@ def test_local_qwen_visual_summarizer_reads_generated_json(monkeypatch, tmp_path
     assert summaries[0].summary == "A person points at a bracelet"
     assert summaries[0].tags == ["bracelet"]
     assert summaries[0].entities == ["Cartier"]
+
+
+def test_local_qwen_visual_summarizer_uses_pitome(monkeypatch, tmp_path: Path):
+    selected = [tmp_path / "selected_1.jpg", tmp_path / "selected_2.jpg"]
+    for path in selected:
+        Image.new("RGB", (8, 8), color="white").save(path)
+
+    class FakeSelection:
+        frame_paths = selected
+
+    calls = []
+
+    def fake_select_visual_frames_for_span(**kwargs):
+        calls.append(kwargs)
+        return FakeSelection()
+
+    monkeypatch.setattr(local_adapters, "select_visual_frames_for_span", fake_select_visual_frames_for_span)
+    processor = FakeProcessor()
+    summarizer = LocalQwenVisualSummarizer(
+        model_name="Qwen/Qwen3-VL-8B-Instruct",
+        model=FakeVisionModel(),
+        processor=processor,
+        use_pitome=True,
+        frame_count=3,
+        pitome_dense_frame_rate=2.0,
+        pitome_min_frame_count=5,
+        pitome_max_selected_frames=1,
+        summary_granularity="clip",
+    )
+
+    summaries = summarizer.summarize("video.mp4", [TimeSpan(0.0, 60.0)])
+
+    assert len(summaries) == 1
+    assert summaries[0].granularity == "clip"
+    assert calls[0]["strategy"] == "pitome"
+    assert calls[0]["uniform_frame_count"] == 5
+    assert calls[0]["dense_frame_rate"] == 2.0
+    content = processor.messages[0][0]["content"]
+    assert sum(1 for item in content if item["type"] == "image") == 1

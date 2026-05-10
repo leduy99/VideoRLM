@@ -17,7 +17,8 @@ from rlm.video.media import (
     is_audio_path,
     probe_media_duration,
 )
-from rlm.video.types import SpeechSpan, TimeSpan, VisualSummarySpan
+from rlm.video.pitome import select_visual_frames_for_span
+from rlm.video.types import SpeechSpan, TimeSpan, VideoNodeLevel, VisualSummarySpan
 
 
 @dataclass
@@ -190,6 +191,14 @@ class LocalQwenVisualSummarizer:
     max_new_tokens: int = 160
     model: Any | None = None
     processor: Any | None = None
+    use_pitome: bool = False
+    pitome_dense_frame_rate: float = 1.0
+    pitome_min_frame_count: int | None = None
+    pitome_protect_ratio: float = 0.15
+    pitome_similarity_threshold: float = 0.8
+    pitome_embedding_size: int = 16
+    pitome_max_selected_frames: int | None = None
+    summary_granularity: VideoNodeLevel | None = None
 
     def summarize(self, video_path: str, spans: list[TimeSpan]) -> list[VisualSummarySpan]:
         model, processor = self._ensure_loaded()
@@ -204,14 +213,7 @@ class LocalQwenVisualSummarizer:
             )
             for index, span in enumerate(spans, start=1):
                 frame_dir = temp_dir / f"span_{index:03d}"
-                frame_paths = extract_frames_for_span(
-                    media_path=video_path,
-                    span=span,
-                    frame_count=self.frame_count,
-                    ffmpeg_bin=self.ffmpeg_bin,
-                    width=self.frame_width,
-                    output_dir=frame_dir,
-                )
+                frame_paths = self._select_frame_paths(video_path, span, frame_dir)
                 messages = [
                     {
                         "role": "user",
@@ -255,6 +257,34 @@ class LocalQwenVisualSummarizer:
                 )
         return summaries
 
+    def _select_frame_paths(self, video_path: str, span: TimeSpan, output_dir: Path) -> list[Path]:
+        if not self.use_pitome:
+            return extract_frames_for_span(
+                media_path=video_path,
+                span=span,
+                frame_count=self.frame_count,
+                ffmpeg_bin=self.ffmpeg_bin,
+                width=self.frame_width,
+                output_dir=output_dir,
+            )
+
+        selection = select_visual_frames_for_span(
+            media_path=video_path,
+            span=span,
+            strategy="pitome",
+            uniform_frame_count=self.pitome_min_frame_count or self.frame_count,
+            dense_frame_rate=self.pitome_dense_frame_rate,
+            ffmpeg_bin=self.ffmpeg_bin,
+            width=self.frame_width,
+            output_dir=output_dir,
+            protect_ratio=self.pitome_protect_ratio,
+            similarity_threshold=self.pitome_similarity_threshold,
+            embedding_size=self.pitome_embedding_size,
+        )
+        if self.pitome_max_selected_frames is None:
+            return selection.frame_paths
+        return selection.frame_paths[: self.pitome_max_selected_frames]
+
     def _ensure_loaded(self):
         if self.model is not None and self.processor is not None:
             return self.model, self.processor
@@ -291,6 +321,8 @@ class LocalQwenVisualSummarizer:
         )
 
     def _infer_granularity(self, span: TimeSpan) -> str:
+        if self.summary_granularity is not None:
+            return self.summary_granularity
         return "scene" if span.duration >= self.scene_threshold_seconds else "clip"
 
 

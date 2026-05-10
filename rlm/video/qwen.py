@@ -82,6 +82,13 @@ class QwenVideoStackConfig:
     scene_duration_seconds: float = 180.0
     segment_duration_seconds: float = 45.0
     clip_duration_seconds: float = 15.0
+    use_pitome: bool = False
+    pitome_dense_frame_rate: float = 1.0
+    pitome_min_frame_count: int | None = None
+    pitome_protect_ratio: float = 0.15
+    pitome_similarity_threshold: float = 0.8
+    pitome_embedding_size: int = 16
+    pitome_max_selected_frames: int | None = None
 
     @classmethod
     def from_shared_endpoint(
@@ -153,6 +160,14 @@ class QwenVideoStackConfig:
             frame_count=self.frame_count,
             frame_width=self.frame_width,
             scene_threshold_seconds=self.scene_threshold_seconds,
+            use_pitome=self.use_pitome,
+            pitome_dense_frame_rate=self.pitome_dense_frame_rate,
+            pitome_min_frame_count=self.pitome_min_frame_count,
+            pitome_protect_ratio=self.pitome_protect_ratio,
+            pitome_similarity_threshold=self.pitome_similarity_threshold,
+            pitome_embedding_size=self.pitome_embedding_size,
+            pitome_max_selected_frames=self.pitome_max_selected_frames,
+            summary_granularity="clip" if self.use_pitome else None,
         )
         embedding_provider = None
         if self.embedding is not None:
@@ -169,6 +184,8 @@ class QwenVideoStackConfig:
             scene_duration_seconds=self.scene_duration_seconds,
             segment_duration_seconds=self.segment_duration_seconds,
             clip_duration_seconds=self.clip_duration_seconds,
+            visual_span_mode="clip" if self.use_pitome else "scene_and_clip",
+            aggregate_child_visual_summaries=self.use_pitome,
         )
         controller = VideoRLM(
             controller_backend="openai",
@@ -203,6 +220,13 @@ class QwenLocalVideoStackConfig:
     segment_duration_seconds: float = 45.0
     clip_duration_seconds: float = 15.0
     controller_enable_thinking: bool = False
+    use_pitome: bool = False
+    pitome_dense_frame_rate: float = 1.0
+    pitome_min_frame_count: int | None = None
+    pitome_protect_ratio: float = 0.15
+    pitome_similarity_threshold: float = 0.8
+    pitome_embedding_size: int = 16
+    pitome_max_selected_frames: int | None = None
 
     @classmethod
     def default(
@@ -318,6 +342,14 @@ class QwenLocalVideoStackConfig:
             frame_width=self.frame_width,
             scene_threshold_seconds=self.scene_threshold_seconds,
             max_new_tokens=self.visual.max_new_tokens,
+            use_pitome=self.use_pitome,
+            pitome_dense_frame_rate=self.pitome_dense_frame_rate,
+            pitome_min_frame_count=self.pitome_min_frame_count,
+            pitome_protect_ratio=self.pitome_protect_ratio,
+            pitome_similarity_threshold=self.pitome_similarity_threshold,
+            pitome_embedding_size=self.pitome_embedding_size,
+            pitome_max_selected_frames=self.pitome_max_selected_frames,
+            summary_granularity="clip" if self.use_pitome else None,
         )
         memory_builder = VideoMemoryBuilder(
             speech_recognizer=speech_recognizer,
@@ -325,6 +357,8 @@ class QwenLocalVideoStackConfig:
             scene_duration_seconds=self.scene_duration_seconds,
             segment_duration_seconds=self.segment_duration_seconds,
             clip_duration_seconds=self.clip_duration_seconds,
+            visual_span_mode="clip" if self.use_pitome else "scene_and_clip",
+            aggregate_child_visual_summaries=self.use_pitome,
         )
         controller = VideoRLM(
             controller_client=controller_client,

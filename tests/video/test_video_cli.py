@@ -153,6 +153,62 @@ def test_cli_run_longshot(monkeypatch, tmp_path: Path, capsys):
     assert "Saved 1 LongShOT prediction records" in capsys.readouterr().out
 
 
+def test_cli_build_qwen_bundle_applies_pitome_args(monkeypatch):
+    class FakeStack:
+        def __init__(self):
+            self.ffmpeg_bin = None
+            self.frame_count = None
+            self.frame_width = None
+            self.scene_duration_seconds = None
+            self.segment_duration_seconds = None
+            self.clip_duration_seconds = None
+
+        def build_bundle(self, **kwargs):
+            return self
+
+    fake_stack = FakeStack()
+    monkeypatch.setattr(
+        video_cli.QwenVideoStackConfig,
+        "from_shared_endpoint",
+        lambda **kwargs: fake_stack,
+    )
+    args = video_cli.build_parser().parse_args(
+        [
+            "run-longshot",
+            "--output",
+            "out.jsonl",
+            "--video-dir",
+            "videos",
+            "--base-url",
+            "http://127.0.0.1:8000/v1",
+            "--use-pitome",
+            "--frame-count",
+            "5",
+            "--frame-width",
+            "512",
+            "--clip-duration-seconds",
+            "60",
+            "--pitome-dense-frame-rate",
+            "2",
+            "--pitome-min-frame-count",
+            "8",
+            "--pitome-max-selected-frames",
+            "6",
+        ]
+    )
+
+    returned = video_cli._build_qwen_bundle(args, logger=None)
+
+    assert returned is fake_stack
+    assert fake_stack.use_pitome is True
+    assert fake_stack.frame_count == 5
+    assert fake_stack.frame_width == 512
+    assert fake_stack.clip_duration_seconds == 60
+    assert fake_stack.pitome_dense_frame_rate == 2
+    assert fake_stack.pitome_min_frame_count == 8
+    assert fake_stack.pitome_max_selected_frames == 6
+
+
 def test_cli_download_qwen_local_models(monkeypatch, capsys):
     class FakeConfig:
         def download_models(self):
