@@ -2,8 +2,16 @@ import json
 
 from rlm.video import VideoRLM
 from rlm.video.controller import _focus_evidence_detail
+from rlm.video.index import VideoMemoryIndex
 from rlm.video.memory import PreparedVideoArtifacts, VideoMemoryBuilder
-from rlm.video.types import SpeechSpan, TimeSpan, VisualSummarySpan
+from rlm.video.types import (
+    ControllerAction,
+    FrontierItem,
+    Observation,
+    SpeechSpan,
+    TimeSpan,
+    VisualSummarySpan,
+)
 from tests.mock_lm import MockLM
 
 
@@ -250,3 +258,57 @@ def test_focus_evidence_detail_prefers_early_window_for_first_question():
     assert "10 pounds" in focused
     if "pig head" in focused:
         assert focused.index("chicken head") < focused.index("pig head")
+
+
+def test_apply_observation_merges_refinement_frontier_after_open():
+    memory = build_memory()
+    model = MockLM(model_name="mock-controller", responses=[])
+    runner = VideoRLM(controller_client=model, max_steps=4, search_top_k=3, max_frontier_items=4)
+    index = VideoMemoryIndex(memory)
+    state = runner._build_initial_state(
+        question="When does the plan change?",
+        memory=memory,
+        index=index,
+        dialogue_context=[],
+        task_type="retrieval",
+    )
+    state.frontier = [
+        FrontierItem(
+            node_id="meeting_scene_001",
+            time_span=TimeSpan(0.0, 30.0),
+            level="scene",
+            score=0.8,
+            why_candidate="Initial frontier",
+            recommended_modalities=["speech"],
+        )
+    ]
+    observation = Observation(
+        kind="open",
+        summary="Background-only open with refinement frontier.",
+        node_id="meeting_scene_001",
+        frontier=[
+            FrontierItem(
+                node_id="meeting_scene_001_seg_001",
+                time_span=TimeSpan(0.0, 15.0),
+                level="segment",
+                score=0.7,
+                why_candidate="Refined child node",
+                recommended_modalities=["speech"],
+            )
+        ],
+        metadata={"progress_made": True},
+    )
+
+    next_state = runner._apply_observation(
+        state,
+        ControllerAction(
+            action_type="OPEN",
+            modality="speech",
+            node_id="meeting_scene_001",
+        ),
+        observation,
+    )
+
+    assert all(item.node_id != "meeting_scene_001" for item in next_state.frontier)
+    assert any(item.node_id == "meeting_scene_001_seg_001" for item in next_state.frontier)
+    assert next_state.no_progress_steps == 0

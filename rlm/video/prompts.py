@@ -32,6 +32,7 @@ Rules:
 - Use SPLIT when a node is still too broad.
 - Use MERGE when multiple evidence items already support one claim.
 - Do not OPEN the same node with the same modality and the same target_slot twice.
+- If a slot has query hints or refinement candidates after a background-only open, use them before STOP.
 - If required slots are already filled, prefer STOP.
 - If evidence is only background, do not answer from it.
 - Use STOP only when you can answer the user's question from core or support evidence and cite relevant evidence ids.
@@ -98,6 +99,16 @@ def _compact_evidence_board(state: ControllerState) -> dict | None:
         "question_type": state.evidence_board.question_type,
         "slots": slots,
         "missing_required_slots": list(state.evidence_board.missing_required_slots),
+        "query_hints_by_slot": {
+            slot_name: hints[:3]
+            for slot_name, hints in state.evidence_board.slot_query_hints.items()
+            if hints
+        },
+        "refinement_node_ids_by_slot": {
+            slot_name: node_ids[:4]
+            for slot_name, node_ids in state.evidence_board.slot_refinement_node_ids.items()
+            if node_ids
+        },
         "opened_summary": [
             {
                 "node_id": item.node_id,
