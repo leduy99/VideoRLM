@@ -392,6 +392,8 @@ class EvidenceBoard:
     slots: dict[str, EvidenceBoardSlot]
     opened_targets: list[OpenedTarget] = field(default_factory=list)
     missing_required_slots: list[str] = field(default_factory=list)
+    slot_query_hints: dict[str, list[str]] = field(default_factory=dict)
+    slot_refinement_node_ids: dict[str, list[str]] = field(default_factory=dict)
     core_evidence_ids: list[str] = field(default_factory=list)
     support_evidence_ids: list[str] = field(default_factory=list)
     background_evidence_ids: list[str] = field(default_factory=list)
@@ -406,6 +408,12 @@ class EvidenceBoard:
             "slots": {name: slot.to_dict() for name, slot in self.slots.items()},
             "opened_targets": [item.to_dict() for item in self.opened_targets],
             "missing_required_slots": list(self.missing_required_slots),
+            "slot_query_hints": {
+                name: list(queries) for name, queries in self.slot_query_hints.items()
+            },
+            "slot_refinement_node_ids": {
+                name: list(node_ids) for name, node_ids in self.slot_refinement_node_ids.items()
+            },
             "core_evidence_ids": list(self.core_evidence_ids),
             "support_evidence_ids": list(self.support_evidence_ids),
             "background_evidence_ids": list(self.background_evidence_ids),
@@ -427,6 +435,13 @@ class EvidenceBoard:
                 OpenedTarget.from_dict(item) for item in data.get("opened_targets", [])
             ],
             missing_required_slots=list(data.get("missing_required_slots", [])),
+            slot_query_hints={
+                name: list(queries) for name, queries in data.get("slot_query_hints", {}).items()
+            },
+            slot_refinement_node_ids={
+                name: list(node_ids)
+                for name, node_ids in data.get("slot_refinement_node_ids", {}).items()
+            },
             core_evidence_ids=list(data.get("core_evidence_ids", [])),
             support_evidence_ids=list(data.get("support_evidence_ids", [])),
             background_evidence_ids=list(data.get("background_evidence_ids", [])),

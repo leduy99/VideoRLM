@@ -938,3 +938,282 @@
 ### Follow-up note
 - Detailed comparison is documented in:
   - `docs/failure_analysis/qwen3_8b_vs_qwen3_5_9b_90run.md`
+
+## 2026-05-12: v2 fail-slice fix for modality routing and false-positive core evidence
+
+### Why this patch was needed
+- The first `Evidence-Aware Search & Open v2` fail-slice rerun showed the right high-level behavior but two concrete runtime bugs:
+  - `sample_6579`:
+    - `build_question_spec()` mapped a behavioral `why` question to `speech`,
+    - the system searched speech, opened junk ASR, and marked clearly irrelevant spans as `core`.
+  - `sample_6168`:
+    - `reason` slot matching was too permissive,
+    - jewelry-description spans with no causal content were still promoted to `core`,
+    - final answer drifted back into unsupported speculation.
+
+### Code changes applied
+- In `rlm/video/evidence_pipeline.py`:
+  - add `_infer_preferred_modality(question, task_type)`:
+    - behavioral / visual-event questions now prefer `visual`,
+    - e.g. `stop chasing`, `stare`, `doorway`, `moving`, `cat`, `mouse`.
+  - replace the old `reason` slot description that echoed almost the whole question:
+    - before: effectively reused the full question text,
+    - after: compact slot descriptions like:
+      - `The visible cause or cue explaining why the subject changed behavior`
+      - `The reason or cause explaining why she wore or avoided wearing the item`
+  - strengthen slot keyword priors:
+    - `reason` now includes causal cues such as `worried`, `lose`, `clasp`, `opening`, `fixed`, `repair`, `immediately`.
+    - `first_thing_tried` now includes cues such as `presented`, `brought out`, `bite`, `tasted`.
+  - tighten `_classify_slot_role(...)`:
+    - generic intros like `In this series...` or `But first...` are demoted out of `core`,
+    - `why_reason` requires real causal cues before a target-slot span can become `core`,
+    - `first_thing_tried` now requires actual first-item cues, not just broad topical overlap.
+
+### Validation
+- Targeted tests added/updated in `tests/video/test_video_evidence_pipeline.py`:
+  - visual-preferred behavioral `why` question
+  - demoting non-causal `reason` spans
+  - demoting generic intro text for `first_thing_tried`
+- Verification:
+  - `pytest tests/video/test_video_evidence_pipeline.py tests/video/test_video_tools.py tests/video/test_video_controller.py -q`
+    - `23 passed`
+  - `pytest tests/video -q`
+    - `73 passed`
+  - `ruff check rlm/video/evidence_pipeline.py tests/video/test_video_evidence_pipeline.py`
+    - pass
+
+### Rerun setup
+- Re-ran the same 4-sample fail slice on `GPU 0`:
+  - `sample_6009`
+  - `sample_6168`
+  - `sample_8563`
+  - `sample_6579`
+- New outputs:
+  - predictions: `output/longshot_v2_failslice_gpu0_fix2/predictions.jsonl`
+  - official-style eval: `output/longshot_v2_failslice_gpu0_fix2_official_eval/summary.json`
+
+### Observed runtime behavior changes
+- `sample_6579` turn 1:
+  - before this patch, the system searched `speech` and hallucinated from junk ASR.
+  - after this patch, the system searches `visual`, opens several candidate clips, and keeps them as `background_only` instead of fabricating a confident reason.
+- `sample_6168`:
+  - before this patch, non-causal jewelry-description spans were mis-labeled as `core reason`.
+  - after this patch, those same spans remain `background_only`, and the system abstains diagnostically instead of inventing a reason.
+- `sample_8563`:
+  - generic intro evidence is no longer promoted to a filled `first_thing_tried` slot,
+  - the system now explicitly reports that `first_thing_tried` and `why_different` are still missing.
+
+### Official-style fail-slice result
+- Previous v2 fail-slice run:
+  - `18.75%`
+  - `output/longshot_v2_failslice_gpu0_official_eval/summary.json`
+- New v2 fail-slice run after the fix:
+  - `61.41%`
+  - `output/longshot_v2_failslice_gpu0_fix2_official_eval/summary.json`
+
+### Important caveat
+- This jump is real in the sense that runtime behavior is cleaner:
+  - less wrong-modality retrieval,
+  - fewer false `core` promotions,
+  - more grounded diagnostic abstention.
+- But the local official-style judge is clearly rewarding diagnostic abstain answers quite generously on this slice.
+- Concrete examples:
+  - `sample_6168` moved from a fully wrong speculative answer to:
+    - `I found related background evidence, but the required answer-bearing slots are still missing: reason. Background-only slots: object.`
+  - That answer still scored very highly under the current local judge even though it does not actually solve the benchmark question.
+
+### Current interpretation
+- The patch successfully improves the runtime contract:
+  - modality routing is better,
+  - false-positive `core` evidence is lower,
+  - the system is safer and more faithful.
+- However, the local official-style eval on small slices should not be over-read as true task success when the answer is mostly abstention.
+- The next meaningful upgrade should focus on:
+  - turning the cleaner `background_only` state into better follow-up retrieval or span refinement,
+  - not merely stopping earlier with a cleaner abstain.
+
+## 2026-05-12: background-only query refinement and node/span refinement
+
+### Goal
+- The previous patch produced cleaner `background_only` states, but those states were still too passive:
+  - `OPEN` could discover that a node was only background,
+  - yet the controller had no persistent memory of *how to search next*,
+  - and no structured way to keep exploring *nearby narrower nodes*.
+- This patch turns `background_only` into actionable state:
+  - query refinement hints,
+  - refinement node candidates,
+  - and frontier updates from `OPEN`.
+
+### Code changes applied
+- In `rlm/video/types.py`:
+  - extended `EvidenceBoard` with:
+    - `slot_query_hints`
+    - `slot_refinement_node_ids`
+- In `rlm/video/evidence_pipeline.py`:
+  - `update_evidence_board(...)` now persists:
+    - slot-specific `suggested_queries`
+    - slot-specific `refinement_node_ids`
+  - `search_v2(...)` now prepends stored slot query hints before generic slot queries,
+  - `_adjust_search_score(...)` now boosts refinement node ids for the current target slot,
+  - `open_v2(...)` now treats `background_only + suggested_queries` as meaningful progress instead of pure no-progress.
+- In `rlm/video/tools.py`:
+  - `OPEN` now emits refinement frontier items when an open is:
+    - `background_only`, or
+    - `no_new_information`
+  - refinement candidates are built from:
+    - child nodes first,
+    - then siblings,
+    - then parent fallback.
+  - these refinement nodes preserve modality preference ordering, so a visual `background_only` open tends to keep the follow-up in `visual`.
+- In `rlm/video/controller.py`:
+  - `_apply_observation(...)` now merges `observation.frontier` for `OPEN`, not just for `SEARCH` and `SPLIT`.
+- In `rlm/video/prompts.py`:
+  - the compact controller prompt now surfaces:
+    - `query_hints_by_slot`
+    - `refinement_node_ids_by_slot`
+  - and explicitly tells the controller to use them before stopping.
+
+### Validation
+- New regression coverage:
+  - `tests/video/test_video_evidence_pipeline.py`
+    - board persists query hints and refinement nodes,
+    - `search_v2()` prefers stored query hints before generic question text.
+  - `tests/video/test_video_tools.py`
+    - background-only opens now produce refinement frontier and count as progress.
+  - `tests/video/test_video_controller.py`
+    - `OPEN` observation frontiers are merged back into controller state.
+- Verification:
+  - `pytest tests/video/test_video_evidence_pipeline.py tests/video/test_video_tools.py tests/video/test_video_controller.py -q`
+    - `27 passed`
+  - `pytest tests/video -q`
+    - `77 passed`
+  - `ruff check` on all modified files
+    - pass
+
+### Rerun setup
+- Re-ran the same 4-sample fail slice on `GPU 0`:
+  - `sample_6009`
+  - `sample_6168`
+  - `sample_8563`
+  - `sample_6579`
+- New outputs:
+  - predictions: `output/longshot_v2_failslice_gpu0_fix3/predictions.jsonl`
+  - official-style eval: `output/longshot_v2_failslice_gpu0_fix3_official_eval/summary.json`
+
+### Observed runtime behavior changes
+- `sample_6579` turn 1:
+  - before this patch:
+    - `SEARCH -> OPEN(background_only) -> OPEN(other broad clip) -> SEARCH`
+  - after this patch:
+    - `SEARCH -> OPEN(background_only) -> OPEN(refined sibling clip) -> OPEN(refined sibling clip)`
+  - the controller now follows refinement frontier produced by `OPEN`, instead of discarding the background signal.
+- `sample_6168`:
+  - before this patch:
+    - background-only opens bounced across broad scene/segment nodes,
+    - then a generic reason-search came back with little structure.
+  - after this patch:
+    - the controller drills into child clips of the same promising segment first,
+    - which is architecturally the right move even though the answer is still an abstain.
+
+### Official-style fail-slice result
+- Previous patch (`fix2`):
+  - `61.41%`
+  - `output/longshot_v2_failslice_gpu0_fix2_official_eval/summary.json`
+- This patch (`fix3`):
+  - `61.41%`
+  - `output/longshot_v2_failslice_gpu0_fix3_official_eval/summary.json`
+
+### Interpretation
+- This is a meaningful runtime improvement with **no score delta** on the current 4-sample slice.
+- What improved:
+  - the controller now converts `background_only` into structured follow-up actions,
+  - refinement stays local instead of jumping away too early,
+  - query hints persist across steps instead of being lost after one `OPEN`.
+- What did **not** improve yet:
+  - the final answers on this tiny slice are still mostly controlled by:
+    - diagnostic abstain behavior,
+    - or by whether the refined nodes actually expose answer-bearing evidence.
+- In short:
+  - this patch improves **control flow quality**,
+  - but it has not yet improved **benchmark answer quality** on the fail slice.
+
+### Next likely lever
+- The next meaningful step should not be another broad controller rewrite.
+- The stronger lever is probably:
+  - refining how `main_claim` vs `reason` slots are assigned for visual clips,
+  - and tightening answer synthesis so generic visual clips do not become overconfident `core` evidence just because they mention `cat` and `mouse`.
+
+### Remaining issues and recommended solutions
+
+#### 1. Visual `main_claim` is still too permissive
+- Remaining problem:
+  - generic visual clips that merely contain `cat` / `mouse` overlap can still be promoted to `core`,
+  - especially for open-ended information-retrieval questions whose fallback `QuestionSpec` is too generic.
+- Why this still matters:
+  - it explains why `sample_6579` now has cleaner follow-up behavior but still does not gain score,
+  - because the refined clips are still not forced to prove the actual causal or relational content of the question.
+- Recommended solution:
+  - add question-type-specific visual slot templates for:
+    - `reaction`,
+    - `cause_of_pause`,
+    - `shared_sensing`,
+    - `state_change`.
+  - require these slots to be filled before generic `main_claim` can become `core`.
+- Why this is the right lever:
+  - the runtime now reaches the right neighborhood,
+  - so the next bottleneck is not exploration anymore, but evidence typing inside the right neighborhood.
+
+#### 2. `why_reason` on speech still lacks answer-bearing extraction sharpness
+- Remaining problem:
+  - `sample_6168` still ends as a diagnostic abstain instead of recovering the known correct causal snippet.
+  - the system now explores locally better, but it still fails to convert the correct speech evidence into a filled `reason` slot reliably enough.
+- Recommended solution:
+  - add slot-specific speech extraction prompts or heuristics for:
+    - `problem`,
+    - `consequence/fear`,
+    - `repair/fix`,
+    - `post-fix behavior`.
+  - allow `reason` to be considered filled only when at least:
+    - one causal problem cue, and
+    - one consequence or repair cue
+    are both present.
+- Why this is the right lever:
+  - this directly matches the benchmark rubric for many `why` questions,
+  - and prevents both false positives and over-cautious abstains.
+
+#### 3. Final answer synthesis is still too loosely tied to slot structure
+- Remaining problem:
+  - after the controller collects evidence, final answer generation still uses a relatively generic answer prompt.
+  - this means the system can either:
+    - over-generalize from loose `core` evidence,
+    - or produce a clean abstain even when multiple partial slots together almost answer the question.
+- Recommended solution:
+  - move from generic evidence synthesis to slot-aware answer synthesis:
+    - explicitly pass filled slots,
+    - pass missing slots,
+    - and ask the answerer to compose the response slot by slot.
+  - for `answer_only_if_required_slots_filled`, require the answerer to cite which slot each claim comes from.
+- Why this is the right lever:
+  - the framework now has an actual `EvidenceBoard`,
+  - so the final answer stage should use that structure instead of flattening everything back into a generic list of evidence.
+
+#### 4. The local official-style judge is generous toward diagnostic abstain
+- Remaining problem:
+  - small-slice official-style gains can overstate real task progress,
+  - because “safe abstain” is currently rewarded more than it should be for internal debugging purposes.
+- Recommended solution:
+  - continue using official-style eval,
+  - but pair it with slice-level manual inspection and one additional internal metric:
+    - `slot_completion_without_abstain_rate`
+    - or `core_evidence_answer_rate`.
+- Why this is the right lever:
+  - it will separate:
+    - “the system became safer,”
+    - from
+    - “the system became more correct.”
+
+#### Recommended implementation order
+1. Tighten visual slot typing beyond generic `main_claim`.
+2. Tighten `why_reason` speech extraction into multi-cue causal filling.
+3. Make final answer synthesis consume the `EvidenceBoard` structurally.
+4. Add one internal metric that discounts abstain-heavy improvements.

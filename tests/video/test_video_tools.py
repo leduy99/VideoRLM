@@ -468,3 +468,35 @@ def test_open_speech_hybrid_refiner_skips_short_clear_span():
     assert observation.evidence[0].metadata["selection_mode"] == "heuristic"
     usage = refiner.get_usage_summary()
     assert usage.model_usage_summaries["mock-refiner"].total_calls == 0
+
+
+def test_open_background_only_adds_refinement_frontier():
+    memory = build_memory_for_tools(
+        [
+            SpeechSpan(
+                text="This beautiful diamond looks stunning with the other rings she owns.",
+                time_span=TimeSpan(0.0, 10.0),
+            ),
+            SpeechSpan(
+                text="She says it is special and rare, and that it matches the other rings she owns.",
+                time_span=TimeSpan(10.0, 20.0),
+            ),
+        ]
+    )
+    executor = VideoToolExecutor(memory)
+    question = "Why did she decide to wear the new diamond add-on right away instead of saving it?"
+    question_spec = build_question_spec(question, task_type="causal_reasoning")
+    state = ControllerState(
+        question=question,
+        task_type="causal_reasoning",
+        question_spec=question_spec,
+        evidence_board=build_evidence_board(question_spec),
+    )
+
+    observation = executor.open("tool_sample_scene_001", "speech", state, target_slot="reason")
+
+    assert observation.metadata["background_only"] is True
+    assert observation.metadata["refinement_node_ids"]
+    assert observation.frontier
+    assert observation.frontier[0].level in {"segment", "clip"}
+    assert observation.metadata["progress_made"] is True
