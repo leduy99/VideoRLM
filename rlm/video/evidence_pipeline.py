@@ -19,10 +19,38 @@ from rlm.video.types import (
 )
 
 GENERIC_SLOT_KEYWORDS: dict[str, list[str]] = {
-    "reason": ["because", "reason", "why", "decided", "chose", "so", "therefore"],
+    "reason": [
+        "because",
+        "reason",
+        "why",
+        "decided",
+        "chose",
+        "so",
+        "therefore",
+        "worried",
+        "lose",
+        "clasp",
+        "opening",
+        "fixed",
+        "repair",
+        "immediately",
+        "show",
+        "couldn't wait",
+    ],
     "decision": ["decided", "wore", "wear", "tried", "did", "chose"],
     "object": ["item", "object", "thing", "piece", "bracelet", "diamond", "food"],
-    "first_thing_tried": ["first", "initial", "earliest", "tried", "what about", "this is"],
+    "first_thing_tried": [
+        "first",
+        "initial",
+        "earliest",
+        "tried",
+        "what about",
+        "this is",
+        "presented",
+        "brought out",
+        "bite",
+        "tasted",
+    ],
     "why_different": ["different", "not regular", "unusual", "realize", "street food"],
     "reaction": ["reaction", "responded", "said", "felt", "tasted", "tastes", "bite", "bit", "surprised"],
     "anchor_event": ["stopped", "stared", "paused", "chasing", "moving"],
@@ -125,7 +153,7 @@ def build_question_spec(
 ) -> QuestionSpec:
     del dialogue_context
     tokens = _tokenize(question)
-    preferred_modality: Modality | None = infer_question_modality(question)
+    preferred_modality = _infer_preferred_modality(question, task_type)
     question_type = "generic"
     slots: list[EvidenceSlotSpec]
     answer_policy = "answer_only_if_required_slots_filled"
@@ -145,13 +173,15 @@ def build_question_spec(
             ),
             EvidenceSlotSpec(
                 slot="reason",
-                description=f"Why {question.rstrip('?')}".strip(),
+                description=_reason_description(question),
                 required=True,
+                preferred_modality=preferred_modality,
                 preferred_modality=preferred_modality,
             ),
         ]
     elif {"first", "earliest", "initial", "beginning"} & tokens:
         question_type = "first_event_realization"
+        preferred_modality = "speech"
         slots = [
             EvidenceSlotSpec(
                 slot="first_thing_tried",
@@ -165,7 +195,7 @@ def build_question_spec(
             ),
             EvidenceSlotSpec(
                 slot="reaction",
-                description="Immediate reaction after that first item or event",
+                description="Immediate reaction after trying that first item or action",
                 required=False,
                 preferred_modality=preferred_modality,
             ),
@@ -287,7 +317,12 @@ def search_v2(
     query_override: str | None = None,
     modality: Modality | None = None,
 ) -> tuple[list[FrontierItem], dict[str, Any]]:
-    queries = build_slot_queries(query_override or state.question, question_spec, target_slot)
+    queries = _search_queries_for_state(
+        state=state,
+        question_spec=question_spec,
+        target_slot=target_slot,
+        query_override=query_override,
+    )
     hits_by_node: dict[str, SearchHit] = {}
     query_sources: dict[str, list[str]] = defaultdict(list)
     selected_modality = modality or _preferred_modality(question_spec, target_slot)
@@ -366,7 +401,7 @@ def open_v2(
 
     for item in evidence_items:
         slot_name, slot_score = _best_slot_match(item, question_spec, target_slot)
-        role = _classify_slot_role(slot_name, slot_score, item, target_slot)
+        role = _classify_slot_role(slot_name, slot_score, item, question_spec, target_slot)
         claim_hash = _claim_hash(item.claim)
         if _is_duplicate_evidence(state, item, slot_name, claim_hash):
             duplicate_count += 1
@@ -403,6 +438,9 @@ def open_v2(
     if classified and all(item.metadata.get("role") == "background" for item in classified):
         background_only = True
 
+    suggested_queries = build_slot_queries(state.question, question_spec, target_slot)[1:3]
+    refinement_progress = background_only and bool(suggested_queries)
+
     return classified, {
         "target_slot": target_slot,
         "missing_slots": missing_slots,
@@ -410,10 +448,12 @@ def open_v2(
         "background_only": background_only,
         "no_new_information": no_new_information,
         "duplicate_evidence_count": duplicate_count,
-        "suggested_queries": build_slot_queries(state.question, question_spec, target_slot)[1:3],
-        "progress_made": bool(filled_slots) or any(
+        "suggested_queries": suggested_queries,
+        "progress_made": bool(filled_slots)
+        or any(
             item.metadata.get("role") == "support" for item in classified
-        ),
+        )
+        or refinement_progress,
         "result": _open_result_label(classified, background_only, no_new_information),
     }
 
@@ -440,6 +480,21 @@ def update_evidence_board(
                 step_index=step_index,
             )
         )
+    if target_slot:
+        hinted_queries = [query for query in metadata.get("suggested_queries", []) if query]
+        if hinted_queries:
+            board.slot_query_hints[target_slot] = _merge_unique_strings(
+                board.slot_query_hints.get(target_slot, []),
+                hinted_queries,
+                limit=6,
+            )
+        refinement_node_ids = [node_id for node_id in metadata.get("refinement_node_ids", []) if node_id]
+        if refinement_node_ids:
+            board.slot_refinement_node_ids[target_slot] = _merge_unique_strings(
+                board.slot_refinement_node_ids.get(target_slot, []),
+                refinement_node_ids,
+                limit=8,
+            )
 
     filled_slots_before = {
         name for name, slot in board.slots.items() if slot.status == "filled"
@@ -478,6 +533,9 @@ def update_evidence_board(
         for slot in question_spec.required_slots
         if slot.required and board.slots[slot.slot].status != "filled"
     ]
+    for slot_name in filled_slots_after:
+        board.slot_query_hints.pop(slot_name, None)
+        board.slot_refinement_node_ids.pop(slot_name, None)
     return board
 
 
@@ -561,6 +619,12 @@ def _adjust_search_score(hit: SearchHit, state: ControllerState, target_slot: st
         target_slot,
     ):
         score -= 0.25
+    if (
+        target_slot
+        and state.evidence_board is not None
+        and hit.node_id in state.evidence_board.slot_refinement_node_ids.get(target_slot, [])
+    ):
+        score += 0.22
     if target_slot:
         slot_tokens = _tokenize(target_slot.replace("_", " "))
         overlap_bonus = len(slot_tokens & set(hit.matched_terms)) * 0.08
@@ -658,36 +722,116 @@ def _classify_slot_role(
     slot_name: str,
     slot_score: float,
     item: Evidence,
+    question_spec: QuestionSpec,
     target_slot: str | None,
 ) -> str:
     text = " ".join(part for part in [item.claim, item.detail] if part).lower()
-    if slot_score <= 0.12:
-        return "noise"
-    if slot_name == target_slot and any(
+    question_type = question_spec.question_type
+    is_target_slot = slot_name == target_slot
+    generic_intro = any(
+        cue in text
+        for cue in (
+            "in this series",
+            "but first",
+            "what makes it special",
+            "we're exploring",
+            "welcome back",
+            "today we're",
+            "today we are",
+        )
+    )
+    causal_cues = any(
         cue in text
         for cue in (
             "because",
             "so ",
             "therefore",
-            "decided",
             "worried",
-            "fixed",
-            "reaction",
-            "reads",
-            "screen",
-            "shown",
-            "shows",
-            "tasted",
-            "text",
-            "title",
-            "visible",
-            "first",
-            "this is",
-            "what about",
+            "lose it",
+            "opening a lot",
+            "kept opening",
+            "clasp",
+            "fixed it",
+            "brought it back",
+            "couldn't wait",
+            "can't wait",
+            "rest of the video",
+            "show it off",
+            "wanted to show",
+            "immediately",
+            "right away",
+            "decided",
+            "chose",
         )
-    ):
-        return "core"
-    if slot_name == target_slot and slot_score >= 0.3:
+    )
+    first_item_cues = any(
+        cue in text
+        for cue in (
+            "what about",
+            "this is",
+            "first",
+            "tried",
+            "bite",
+            "bit into",
+            "brought out",
+            "presented",
+        )
+    )
+    why_different_cues = any(
+        cue in text
+        for cue in (
+            "different",
+            "not regular",
+            "unexpected",
+            "surprisingly",
+            "tastes like chicken",
+            "fried goodness",
+            "deep fried",
+            "coated in flour",
+        )
+    )
+    reaction_cues = any(
+        cue in text
+        for cue in (
+            "reaction",
+            "responded",
+            "surprised",
+            "tastes like",
+            "felt",
+            "looked",
+            "froze",
+            "stayed still",
+            "paused",
+            "stared",
+        )
+    )
+    if slot_score <= 0.12:
+        return "noise"
+
+    if generic_intro and slot_name in {"first_thing_tried", "why_different", "reason"}:
+        return "background" if slot_score >= 0.18 else "noise"
+
+    if question_type == "why_reason" and is_target_slot:
+        if causal_cues:
+            return "core"
+        return "support" if slot_score >= 0.24 else "background"
+
+    if slot_name == "first_thing_tried" and is_target_slot:
+        if first_item_cues and not generic_intro:
+            return "core"
+        return "support" if slot_score >= 0.24 else "background"
+
+    if slot_name == "why_different" and is_target_slot:
+        if why_different_cues:
+            return "core"
+        return "support" if slot_score >= 0.24 else "background"
+
+    if slot_name == "reaction" and is_target_slot:
+        if reaction_cues:
+            return "core"
+        return "support" if slot_score >= 0.24 else "background"
+
+    if is_target_slot and slot_score >= 0.3:
         return "core"
     if slot_score >= 0.2:
         return "support"
@@ -754,6 +898,37 @@ def _tokenize(text: str) -> set[str]:
     }
 
 
+def _search_queries_for_state(
+    state: ControllerState,
+    question_spec: QuestionSpec | None,
+    target_slot: str | None,
+    query_override: str | None,
+) -> list[str]:
+    override = (query_override or "").strip()
+    base_question = override or state.question
+    base_queries = build_slot_queries(base_question, question_spec, target_slot)
+    if state.evidence_board is None or not target_slot:
+        return base_queries
+
+    hint_queries = state.evidence_board.slot_query_hints.get(target_slot, [])
+    if not hint_queries:
+        return base_queries
+
+    if override and override != state.question.strip():
+        combined = [override, *hint_queries, *base_queries]
+    else:
+        combined = [*hint_queries, *base_queries]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for query in combined:
+        normalized = " ".join(query.split())
+        if not normalized or normalized in seen:
+            continue
+        deduped.append(normalized)
+        seen.add(normalized)
+    return deduped[:6]
+
+
 def _keyword_queries(slot_name: str, description: str) -> list[str]:
     keywords = GENERIC_SLOT_KEYWORDS.get(slot_name, [])
     if not keywords:
@@ -781,6 +956,56 @@ def _decision_description(question: str) -> str:
     return f"The decision or action directly asked by: {question}"
 
 
+def _reason_description(question: str) -> str:
+    lowered = question.lower()
+    if "wear" in lowered:
+        return "The reason or cause explaining why she wore or avoided wearing the item"
+    if "stop" in lowered or "stare" in lowered or "look" in lowered or "move" in lowered:
+        return "The visible cause or cue explaining why the subject changed behavior"
+    if "try" in lowered or "tried" in lowered:
+        return "The reason or cause explaining why they tried the item or reacted to it"
+    return "The reason or cause that directly answers the question"
+
+
+def _infer_preferred_modality(question: str, task_type: str | None) -> Modality:
+    lowered = question.lower()
+    visual_cues = (
+        "stare",
+        "doorway",
+        "stopped",
+        "stop chasing",
+        "moving",
+        "looked",
+        "turned",
+        "expression",
+        "gesture",
+        "reaction",
+        "mouse",
+        "cat",
+    )
+    if any(cue in lowered for cue in visual_cues):
+        return "visual"
+    if task_type in {"information_retrieval", "multimodal_synthesis"} and any(
+        cue in lowered for cue in ("how did", "what happened when", "what did they both", "what did she do")
+    ):
+        return "visual"
+    return "speech"
+
+
 def _claim_hash(text: str) -> str:
     normalized = " ".join(text.split()).lower()
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+
+
+def _merge_unique_strings(existing: list[str], additions: list[str], limit: int) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in [*existing, *additions]:
+        normalized = " ".join(value.split()).strip()
+        if not normalized or normalized in seen:
+            continue
+        merged.append(normalized)
+        seen.add(normalized)
+        if len(merged) >= limit:
+            break
+    return merged

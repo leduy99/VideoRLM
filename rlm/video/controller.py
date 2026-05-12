@@ -254,6 +254,8 @@ class VideoRLM:
             state.frontier = self._set_frontier_status(state.frontier, action.node_id, "opened")
             state.frontier = self._remove_frontier_node(state.frontier, action.node_id)
             state.evidence_ledger.extend(observation.evidence)
+            if observation.frontier:
+                state.frontier = self._merge_frontier(state.frontier, observation.frontier)
         elif action.action_type == "SPLIT":
             state.frontier = self._set_frontier_status(state.frontier, action.node_id, "expanded")
             state.frontier = self._merge_frontier(state.frontier, observation.frontier)

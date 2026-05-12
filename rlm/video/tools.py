@@ -178,6 +178,19 @@ class VideoToolExecutor:
             modality=selected_modality,
             evidence_items=raw_evidence,
         )
+        refinement_frontier: list[FrontierItem] = []
+        if open_metadata.get("background_only") or open_metadata.get("no_new_information"):
+            refinement_frontier = self._build_refinement_frontier(
+                node=node,
+                state=state,
+                modality=selected_modality,
+                target_slot=selected_slot,
+            )
+            open_metadata["refinement_node_ids"] = [item.node_id for item in refinement_frontier]
+            if refinement_frontier and not open_metadata.get("progress_made"):
+                open_metadata["progress_made"] = True
+        else:
+            open_metadata["refinement_node_ids"] = []
         if evidence:
             summary = (
                 f"OPEN v2 gathered {len(evidence)} {selected_modality} evidence items "
@@ -193,6 +206,7 @@ class VideoToolExecutor:
             kind="open",
             summary=summary,
             evidence=evidence,
+            frontier=refinement_frontier,
             node_id=node.node_id,
             metadata={
                 "modality": selected_modality,
@@ -305,6 +319,12 @@ class VideoToolExecutor:
             modalities.append("audio")
         return modalities or ["visual"]
 
+    def _prioritized_modalities(self, node, preferred: Modality) -> list[Modality]:
+        modalities = self._recommended_modalities(node)
+        if preferred in modalities:
+            return [preferred, *[item for item in modalities if item != preferred]]
+        return modalities
+
     def _child_priority(self, node) -> float:
         score = 0.2
         score += min(len(node.speech_spans) * 0.05, 0.3)
@@ -312,9 +332,69 @@ class VideoToolExecutor:
         score += 0.15 if node.visual_summary else 0.0
         return round(score, 4)
 
+    def _refinement_priority(self, node, candidate_kind: str, index: int) -> float:
+        base = {
+            "child": 0.72,
+            "sibling": 0.56,
+            "parent": 0.4,
+        }.get(candidate_kind, 0.4)
+        granularity_bonus = {
+            "clip": 0.12,
+            "segment": 0.09,
+            "scene": 0.04,
+            "video": 0.0,
+        }.get(node.level, 0.0)
+        score = base + granularity_bonus - min(index * 0.03, 0.09)
+        return round(score, 4)
+
     def _next_evidence_id(self) -> str:
         self._evidence_counter += 1
         return f"evidence_{self._evidence_counter:05d}"
+
+    def _build_refinement_frontier(
+        self,
+        *,
+        node,
+        state: ControllerState,
+        modality: Modality,
+        target_slot: str | None,
+        max_items: int = 4,
+    ) -> list[FrontierItem]:
+        candidates = self.memory.child_nodes(node.node_id)
+        candidate_kind = "child"
+        if not candidates and node.parent_id:
+            parent = self.memory.get_node(node.parent_id)
+            siblings = self.memory.child_nodes(parent.node_id)
+            candidates = [item for item in siblings if item.node_id != node.node_id]
+            candidate_kind = "sibling"
+        if not candidates and node.parent_id:
+            parent = self.memory.get_node(node.parent_id)
+            candidates = [parent]
+            candidate_kind = "parent"
+
+        frontier: list[FrontierItem] = []
+        for index, candidate in enumerate(candidates):
+            recommended = self._prioritized_modalities(candidate, modality)
+            preferred_modality = recommended[0] if recommended else modality
+            if is_reopen_blocked(state.evidence_board, candidate.node_id, preferred_modality, target_slot):
+                continue
+            frontier.append(
+                FrontierItem(
+                    node_id=candidate.node_id,
+                    time_span=candidate.time_span,
+                    level=candidate.level,
+                    score=self._refinement_priority(candidate, candidate_kind, index),
+                    why_candidate=(
+                        f"Refine {candidate_kind} node after background-only "
+                        f"{modality} open for slot '{target_slot or 'generic'}'"
+                    ),
+                    recommended_modalities=recommended or [modality],
+                    status="unopened",
+                )
+            )
+            if len(frontier) >= max_items:
+                break
+        return frontier
 
     def _build_speech_evidence(self, node, state: ControllerState) -> list[Evidence]:
         selected_spans = self._select_relevant_speech_spans(node.speech_spans, state)
