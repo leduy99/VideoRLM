@@ -158,6 +158,7 @@ class LongShOTBenchmarkRunner:
         memory_cache_dir: str | Path | None = None,
         trace_dir: str | Path | None = None,
         history_mode: LongShOTHistoryMode = "gold",
+        verbose: bool = False,
     ):
         if history_mode not in {"gold", "candidate"}:
             raise ValueError(f"Unsupported LongShOT history mode: {history_mode}")
@@ -169,6 +170,7 @@ class LongShOTBenchmarkRunner:
         self.memory_cache_dir = Path(memory_cache_dir) if memory_cache_dir else None
         self.trace_dir = Path(trace_dir) if trace_dir else None
         self.history_mode = history_mode
+        self.verbose = verbose
         self._memory_cache: dict[str, tuple[VideoMemory, Path | None]] = {}
 
         for directory in (self.artifact_cache_dir, self.memory_cache_dir, self.trace_dir):
@@ -186,25 +188,37 @@ class LongShOTBenchmarkRunner:
             output_file.parent.mkdir(parents=True, exist_ok=True)
         completed_ids = self._load_completed_ids(output_file) if output_file else set()
         results: list[dict[str, Any]] = []
+        self._log(
+            f"run_samples start total={len(samples)} completed={len(completed_ids)} "
+            f"output={output_file}"
+        )
 
-        for sample in samples:
+        for sample_index, sample in enumerate(samples, start=1):
             sample_id = sample.get("sample_id")
             if sample_id in completed_ids:
+                self._log(f"sample {sample_index}/{len(samples)} skip completed sample_id={sample_id}")
                 continue
+            self._log(f"sample {sample_index}/{len(samples)} start sample_id={sample_id}")
             result = self.run_sample(sample)
             results.append(result)
             if output_file is not None:
                 with output_file.open("a", encoding="utf-8") as handle:
                     json.dump(result, handle, ensure_ascii=False)
                     handle.write("\n")
+                self._log(f"sample {sample_id} appended output={output_file}")
+            self._log(f"sample {sample_id} done")
+        self._log(f"run_samples done new_results={len(results)}")
         return results
 
     def run_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
         payload = copy.deepcopy(sample)
         video_id = str(payload["video_id"])
         sample_id = str(payload.get("sample_id", video_id))
+        self._log(f"resolve video start video_id={video_id}")
         video_path = self.video_resolver.resolve(video_id)
+        self._log(f"resolve video done path={video_path}")
         memory, memory_path = self._load_or_build_memory(payload, video_path)
+        self._log(f"memory ready video_id={video_id} memory_path={memory_path}")
 
         dialogue_context: list[dict[str, str]] = []
         turn_results: list[dict[str, Any]] = []
@@ -213,10 +227,12 @@ class LongShOTBenchmarkRunner:
         for index, turn in enumerate(payload.get("conversations", [])):
             role = turn.get("role")
             content = str(turn.get("content", ""))
+            self._log(f"turn index={index} role={role}")
 
             if role == "user":
                 pending_question = content
                 dialogue_context.append({"role": "user", "content": content})
+                self._log(f"user question queued={_truncate_for_log(content)}")
                 continue
 
             if role != "assistant":
@@ -229,14 +245,23 @@ class LongShOTBenchmarkRunner:
                     "does not have a preceding user question"
                 )
 
+            self._log(f"VideoRLM run start sample_id={sample_id} turn={index}")
             result = self.video_rlm.run(
                 pending_question,
                 memory,
                 dialogue_context=list(dialogue_context),
                 task_type=payload.get("task"),
             )
+            self._log(
+                f"VideoRLM run done sample_id={sample_id} turn={index} "
+                f"steps={result.state.budget.steps_used} "
+                f"tool_calls={result.state.budget.tool_calls_used} "
+                f"answer={_truncate_for_log(result.answer)}"
+            )
             turn["candidate_response"] = result.answer
             trace_path = self._write_trace(sample_id, index, result)
+            if trace_path is not None:
+                self._log(f"trace written path={trace_path}")
             turn_results.append(
                 {
                     "turn_index": index,
@@ -268,10 +293,12 @@ class LongShOTBenchmarkRunner:
     ) -> tuple[VideoMemory, Path | None]:
         video_id = str(sample["video_id"])
         if video_id in self._memory_cache:
+            self._log(f"memory cache hit video_id={video_id}")
             return self._memory_cache[video_id]
 
         memory_path = self.memory_cache_dir / f"{video_id}.json" if self.memory_cache_dir else None
         if memory_path is not None and memory_path.exists():
+            self._log(f"loading memory cache path={memory_path}")
             memory = self.memory_builder.load_memory(memory_path)
             self._memory_cache[video_id] = (memory, memory_path)
             return memory, memory_path
@@ -279,8 +306,10 @@ class LongShOTBenchmarkRunner:
         artifacts = None
         artifact_dir = self.artifact_cache_dir / video_id if self.artifact_cache_dir else None
         if artifact_dir is not None and artifact_dir.exists():
+            self._log(f"loading artifacts cache dir={artifact_dir}")
             artifacts = self.memory_builder.load_artifacts_dir(artifact_dir)
         if artifacts is None:
+            self._log(f"preparing artifacts video_id={video_id}")
             artifacts = self.memory_builder.prepare_artifacts(
                 video_path=str(video_path),
                 duration_seconds=self._resolve_duration_seconds(sample),
@@ -292,10 +321,13 @@ class LongShOTBenchmarkRunner:
             )
             if artifact_dir is not None:
                 self.memory_builder.save_artifacts_dir(artifacts, artifact_dir)
+                self._log(f"artifacts saved dir={artifact_dir}")
 
+        self._log(f"building memory video_id={video_id}")
         memory = self.memory_builder.build_from_artifacts(artifacts)
         if memory_path is not None:
             self.memory_builder.save_memory(memory, memory_path)
+            self._log(f"memory saved path={memory_path}")
 
         self._memory_cache[video_id] = (memory, memory_path)
         return memory, memory_path
@@ -330,3 +362,14 @@ class LongShOTBenchmarkRunner:
                     continue
                 completed.add(json.loads(line)["sample_id"])
         return completed
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[LongShOT] {message}", flush=True)
+
+
+def _truncate_for_log(text: str, max_length: int = 180) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[: max_length - 3] + "..."

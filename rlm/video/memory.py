@@ -77,6 +77,7 @@ class VideoMemoryBuilder:
         clip_duration_seconds: float = 15.0,
         visual_span_mode: Literal["scene_and_clip", "clip"] = "scene_and_clip",
         aggregate_child_visual_summaries: bool = False,
+        verbose: bool = False,
     ):
         self.speech_recognizer = speech_recognizer
         self.visual_summarizer = visual_summarizer
@@ -87,6 +88,7 @@ class VideoMemoryBuilder:
         self.clip_duration_seconds = clip_duration_seconds
         self.visual_span_mode = visual_span_mode
         self.aggregate_child_visual_summaries = aggregate_child_visual_summaries
+        self.verbose = verbose
 
     def prepare_artifacts(
         self,
@@ -98,18 +100,31 @@ class VideoMemoryBuilder:
         if not video_id:
             video_id = Path(video_path).stem
 
+        self._log(
+            f"prepare_artifacts start video_id={video_id} "
+            f"duration={duration_seconds:.2f}s path={video_path}"
+        )
         visual_spans = self._visual_spans(TimeSpan(0.0, duration_seconds))
+        self._log(f"visual spans planned count={len(visual_spans)} mode={self.visual_span_mode}")
 
+        self._log("speech recognition start")
         speech_spans = (
             self.speech_recognizer.recognize(video_path) if self.speech_recognizer else []
         )
+        self._log(f"speech recognition done spans={len(speech_spans)}")
+        self._log("visual summarization start")
         visual_summaries = (
             self.visual_summarizer.summarize(video_path, visual_spans)
             if self.visual_summarizer
             else []
         )
+        self._log(f"visual summarization done summaries={len(visual_summaries)}")
+        self._log("ocr extraction start")
         ocr_spans = self.ocr_extractor.extract(video_path) if self.ocr_extractor else []
+        self._log(f"ocr extraction done spans={len(ocr_spans)}")
+        self._log("audio event extraction start")
         audio_events = self.audio_extractor.extract(video_path) if self.audio_extractor else []
+        self._log(f"audio event extraction done events={len(audio_events)}")
 
         payload = dict(metadata or {})
         payload.setdefault("source_video_path", video_path)
@@ -119,7 +134,7 @@ class VideoMemoryBuilder:
             "aggregate_child_visual_summaries",
             self.aggregate_child_visual_summaries,
         )
-        return PreparedVideoArtifacts(
+        artifacts = PreparedVideoArtifacts(
             video_id=video_id,
             duration_seconds=duration_seconds,
             speech_spans=speech_spans,
@@ -128,6 +143,8 @@ class VideoMemoryBuilder:
             audio_events=audio_events,
             metadata=payload,
         )
+        self._log(f"prepare_artifacts done video_id={video_id}")
+        return artifacts
 
     def build(
         self,
@@ -145,6 +162,13 @@ class VideoMemoryBuilder:
         return self.build_from_artifacts(artifacts)
 
     def build_from_artifacts(self, artifacts: PreparedVideoArtifacts) -> VideoMemory:
+        self._log(
+            f"build_memory start video_id={artifacts.video_id} "
+            f"speech={len(artifacts.speech_spans)} "
+            f"visual={len(artifacts.visual_summaries)} "
+            f"ocr={len(artifacts.ocr_spans)} "
+            f"audio={len(artifacts.audio_events)}"
+        )
         root_span = TimeSpan(0.0, artifacts.duration_seconds)
         root_id = f"{artifacts.video_id}_video"
         nodes: dict[str, VideoNode] = {}
@@ -208,12 +232,14 @@ class VideoMemoryBuilder:
             self.aggregate_child_visual_summaries,
         )
         metadata.setdefault("node_count", len(nodes))
-        return VideoMemory(
+        memory = VideoMemory(
             video_id=artifacts.video_id,
             root_id=root_id,
             nodes=nodes,
             metadata=metadata,
         )
+        self._log(f"build_memory done video_id={artifacts.video_id} nodes={len(nodes)}")
+        return memory
 
     def save_memory(self, memory: VideoMemory, path: str | Path) -> None:
         output_path = Path(path)
@@ -287,6 +313,10 @@ class VideoMemoryBuilder:
             spans.append(TimeSpan(cursor, next_end))
             cursor = next_end
         return spans
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[VideoMemory] {message}", flush=True)
 
     def _visual_spans(self, root_span: TimeSpan) -> list[TimeSpan]:
         clip_spans = self._subdivide(root_span, self.clip_duration_seconds)

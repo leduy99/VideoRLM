@@ -192,6 +192,10 @@ def test_cli_build_qwen_bundle_applies_pitome_args(monkeypatch):
             "2",
             "--pitome-min-frame-count",
             "8",
+            "--pitome-embedding-backend",
+            "hybrid",
+            "--pitome-embedding-size",
+            "32",
             "--pitome-max-selected-frames",
             "6",
         ]
@@ -206,6 +210,8 @@ def test_cli_build_qwen_bundle_applies_pitome_args(monkeypatch):
     assert fake_stack.clip_duration_seconds == 60
     assert fake_stack.pitome_dense_frame_rate == 2
     assert fake_stack.pitome_min_frame_count == 8
+    assert fake_stack.pitome_embedding_backend == "hybrid"
+    assert fake_stack.pitome_embedding_size == 32
     assert fake_stack.pitome_max_selected_frames == 6
 
 

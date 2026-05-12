@@ -35,8 +35,10 @@ class LocalQwenASRSpeechRecognizer:
     max_inference_batch_size: int = 8
     max_new_tokens: int = 512
     model: Any | None = None
+    verbose: bool = False
 
     def recognize(self, video_path: str) -> list[SpeechSpan]:
+        self._log(f"recognize start path={video_path}")
         model = self._ensure_loaded()
         media_path = Path(video_path)
         temp_root = get_videorlm_output_root() / "tmp"
@@ -44,26 +46,34 @@ class LocalQwenASRSpeechRecognizer:
         with contextlib.ExitStack() as stack:
             if is_audio_path(media_path):
                 audio_path = media_path
+                self._log(f"using audio input path={audio_path}")
             else:
                 temp_dir = Path(
                     stack.enter_context(
                         _temporary_directory(prefix="videorlm_local_asr_", dir_path=temp_root)
                     )
                 )
+                self._log("extracting audio track")
                 audio_path = extract_audio_track(
                     media_path=media_path,
                     output_path=temp_dir / f"{media_path.stem}.wav",
                     ffmpeg_bin=self.ffmpeg_bin,
                 )
+                self._log(f"audio track ready path={audio_path}")
 
             if self.forced_aligner_name or self.forced_aligner_path:
+                self._log("forced aligner transcription start")
                 results = model.transcribe(
                     audio=str(audio_path),
                     language=None,
                     return_time_stamps=True,
                 )
-                return self._parse_results(results)
-            return self._recognize_in_chunks(model=model, audio_path=audio_path, stack=stack)
+                spans = self._parse_results(results)
+                self._log(f"forced aligner transcription done spans={len(spans)}")
+                return spans
+            spans = self._recognize_in_chunks(model=model, audio_path=audio_path, stack=stack)
+            self._log(f"recognize done spans={len(spans)}")
+            return spans
 
     def _recognize_in_chunks(self, model, audio_path: Path, stack: contextlib.ExitStack) -> list[SpeechSpan]:
         temp_root = get_videorlm_output_root() / "tmp"
@@ -72,12 +82,15 @@ class LocalQwenASRSpeechRecognizer:
             stack.enter_context(_temporary_directory(prefix="videorlm_local_asr_chunks_", dir_path=temp_root))
         )
         duration_seconds = probe_media_duration(audio_path, ffprobe_bin=self.ffprobe_bin)
+        chunks = _chunk_time_spans(duration_seconds, self.chunk_duration_seconds)
+        self._log(
+            f"chunked ASR duration={duration_seconds:.2f}s chunks={len(chunks)} "
+            f"chunk_seconds={self.chunk_duration_seconds:.2f}"
+        )
         spans: list[SpeechSpan] = []
 
-        for index, chunk_span in enumerate(
-            _chunk_time_spans(duration_seconds, self.chunk_duration_seconds),
-            start=1,
-        ):
+        for index, chunk_span in enumerate(chunks, start=1):
+            self._log(f"ASR chunk {index}/{len(chunks)} span={chunk_span.to_display()}")
             chunk_path = extract_audio_segment(
                 media_path=audio_path,
                 span=chunk_span,
@@ -89,7 +102,9 @@ class LocalQwenASRSpeechRecognizer:
                 language=None,
                 return_time_stamps=False,
             )
-            for item in self._parse_results(chunk_results):
+            parsed = self._parse_results(chunk_results)
+            self._log(f"ASR chunk {index}/{len(chunks)} parsed_spans={len(parsed)}")
+            for item in parsed:
                 spans.append(_offset_speech_span(item, chunk_span))
         return spans
 
@@ -100,6 +115,10 @@ class LocalQwenASRSpeechRecognizer:
         import torch
         from qwen_asr import Qwen3ASRModel
 
+        self._log(
+            f"loading ASR model={self.model_path or self.model_name} "
+            f"device_map={self.device_map} dtype={self.torch_dtype}"
+        )
         kwargs: dict[str, Any] = {
             "dtype": _resolve_torch_dtype(torch, self.torch_dtype),
             "device_map": self.device_map,
@@ -114,6 +133,7 @@ class LocalQwenASRSpeechRecognizer:
                 "device_map": self.device_map,
             }
         self.model = Qwen3ASRModel.from_pretrained(self.model_path or self.model_name, **kwargs)
+        self._log("ASR model loaded")
         return self.model
 
     def _parse_results(self, results: Any) -> list[SpeechSpan]:
@@ -175,6 +195,10 @@ class LocalQwenASRSpeechRecognizer:
             return _group_word_level_spans(raw_spans)
         return raw_spans
 
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[LocalQwenASR] {message}", flush=True)
+
 
 @dataclass
 class LocalQwenVisualSummarizer:
@@ -197,10 +221,13 @@ class LocalQwenVisualSummarizer:
     pitome_protect_ratio: float = 0.15
     pitome_similarity_threshold: float = 0.8
     pitome_embedding_size: int = 16
+    pitome_embedding_backend: str = "pixel"
     pitome_max_selected_frames: int | None = None
     summary_granularity: VideoNodeLevel | None = None
+    verbose: bool = False
 
     def summarize(self, video_path: str, spans: list[TimeSpan]) -> list[VisualSummarySpan]:
+        self._log(f"summarize start path={video_path} spans={len(spans)}")
         model, processor = self._ensure_loaded()
         output_root = get_videorlm_output_root() / "tmp"
         output_root.mkdir(parents=True, exist_ok=True)
@@ -212,8 +239,10 @@ class LocalQwenVisualSummarizer:
                 )
             )
             for index, span in enumerate(spans, start=1):
+                self._log(f"visual span {index}/{len(spans)} span={span.to_display()}")
                 frame_dir = temp_dir / f"span_{index:03d}"
                 frame_paths = self._select_frame_paths(video_path, span, frame_dir)
+                self._log(f"visual span {index}/{len(spans)} selected_frames={len(frame_paths)}")
                 messages = [
                     {
                         "role": "user",
@@ -246,15 +275,20 @@ class LocalQwenVisualSummarizer:
                     clean_up_tokenization_spaces=False,
                 )[0]
                 payload = _parse_json_object(output_text)
+                summary_text = str(payload.get("summary", output_text)).strip()
+                self._log(
+                    f"visual span {index}/{len(spans)} summary={_truncate_for_log(summary_text)}"
+                )
                 summaries.append(
                     VisualSummarySpan(
-                        summary=str(payload.get("summary", output_text)).strip(),
+                        summary=summary_text,
                         time_span=span,
                         granularity=self._infer_granularity(span),
                         tags=[str(item) for item in payload.get("tags", [])],
                         entities=[str(item) for item in payload.get("entities", [])],
                     )
                 )
+        self._log(f"summarize done summaries={len(summaries)}")
         return summaries
 
     def _select_frame_paths(self, video_path: str, span: TimeSpan, output_dir: Path) -> list[Path]:
@@ -280,6 +314,7 @@ class LocalQwenVisualSummarizer:
             protect_ratio=self.pitome_protect_ratio,
             similarity_threshold=self.pitome_similarity_threshold,
             embedding_size=self.pitome_embedding_size,
+            embedding_backend=self.pitome_embedding_backend,
         )
         if self.pitome_max_selected_frames is None:
             return selection.frame_paths
@@ -292,6 +327,10 @@ class LocalQwenVisualSummarizer:
         import torch
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+        self._log(
+            f"loading VL model={self.model_path or self.model_name} "
+            f"device_map={self.device_map or self.device} dtype={self.torch_dtype}"
+        )
         model_kwargs: dict[str, Any] = {
             "dtype": _resolve_torch_dtype(torch, self.torch_dtype),
             "device_map": self.device_map or self.device,
@@ -304,6 +343,7 @@ class LocalQwenVisualSummarizer:
             **model_kwargs,
         )
         self.processor = AutoProcessor.from_pretrained(self.model_path or self.model_name)
+        self._log("VL model loaded")
         return self.model, self.processor
 
     def _resolve_input_device(self, model):
@@ -324,6 +364,17 @@ class LocalQwenVisualSummarizer:
         if self.summary_granularity is not None:
             return self.summary_granularity
         return "scene" if span.duration >= self.scene_threshold_seconds else "clip"
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[LocalQwenVL] {message}", flush=True)
+
+
+def _truncate_for_log(text: str, max_length: int = 180) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[: max_length - 3] + "..."
 
 
 def _resolve_torch_dtype(torch_module, value: str | Any):

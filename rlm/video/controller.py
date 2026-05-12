@@ -10,6 +10,7 @@ from rlm.core.types import ClientBackend
 from rlm.video.evidence_pipeline import (
     build_evidence_board,
     build_question_spec,
+    build_slot_queries,
     search_v2,
     select_target_slot,
     update_evidence_board,
@@ -105,7 +106,7 @@ class VideoRLM:
                 max_frontier_items=self.max_frontier_items,
             )
             raw_response = self.controller_client.completion(prompt)
-            action = self._parse_action(raw_response)
+            action = self._parse_action(raw_response, state)
             if action.target_slot is None:
                 action.target_slot = select_target_slot(state.question_spec, state.evidence_board)
             previous_state = copy.deepcopy(state.to_dict())
@@ -317,13 +318,52 @@ class VideoRLM:
             return frontier
         return [item for item in frontier if item.node_id != node_id]
 
-    def _parse_action(self, raw_response: str) -> ControllerAction:
+    def _parse_action(self, raw_response: str, state: ControllerState | None = None) -> ControllerAction:
         candidate = raw_response.strip()
         try:
-            return ControllerAction.from_dict(json.loads(candidate))
+            payload = json.loads(candidate)
         except json.JSONDecodeError:
             extracted = self._extract_first_json_object(candidate)
-            return ControllerAction.from_dict(json.loads(extracted))
+            payload = json.loads(extracted)
+        if state is not None:
+            payload = self._repair_action_payload(payload, state)
+        return ControllerAction.from_dict(payload)
+
+    def _repair_action_payload(
+        self,
+        payload: dict[str, Any],
+        state: ControllerState,
+    ) -> dict[str, Any]:
+        if payload.get("action_type") != "SEARCH":
+            return payload
+
+        target_slot = payload.get("target_slot") or select_target_slot(
+            state.question_spec,
+            state.evidence_board,
+        )
+        if not payload.get("query"):
+            payload["query"] = build_slot_queries(
+                state.question,
+                state.question_spec,
+                target_slot,
+            )[0]
+        if not payload.get("modality"):
+            payload["modality"] = self._preferred_search_modality(state, target_slot)
+        payload["target_slot"] = target_slot
+        return payload
+
+    def _preferred_search_modality(
+        self,
+        state: ControllerState,
+        target_slot: str | None,
+    ) -> str:
+        if state.question_spec is None:
+            return "speech"
+        if target_slot is not None:
+            slot = state.question_spec.get_slot(target_slot)
+            if slot is not None and slot.preferred_modality is not None:
+                return slot.preferred_modality
+        return state.question_spec.preferred_modality or "speech"
 
     def _extract_first_json_object(self, text: str) -> str:
         decoder = json.JSONDecoder()

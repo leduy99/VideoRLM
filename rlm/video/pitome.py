@@ -14,6 +14,7 @@ from rlm.video.media import (
 from rlm.video.types import TimeSpan
 
 FrameSelectionStrategy = Literal["uniform", "pitome"]
+FrameEmbeddingBackend = Literal["pixel", "hybrid"]
 
 
 @dataclass
@@ -54,6 +55,7 @@ def select_visual_frames_for_span(
     protect_ratio: float = 0.15,
     similarity_threshold: float = 0.8,
     embedding_size: int = 16,
+    embedding_backend: FrameEmbeddingBackend = "pixel",
 ) -> FrameSelectionResult:
     if strategy == "uniform":
         timestamps = sample_span_timestamps(span, uniform_frame_count)
@@ -85,7 +87,11 @@ def select_visual_frames_for_span(
         output_dir=output_dir,
         prefix="dense",
     )
-    embeddings = load_frame_embeddings(dense_frame_paths, embedding_size=embedding_size)
+    embeddings = load_frame_embeddings(
+        dense_frame_paths,
+        embedding_size=embedding_size,
+        backend=embedding_backend,
+    )
     selection = select_frame_indices_from_embeddings(
         embeddings,
         protect_ratio=protect_ratio,
@@ -223,6 +229,7 @@ def load_frame_embeddings(
     frame_paths: list[Path],
     *,
     embedding_size: int = 16,
+    backend: FrameEmbeddingBackend = "pixel",
 ) -> list[list[float]]:
     try:
         from PIL import Image
@@ -233,16 +240,64 @@ def load_frame_embeddings(
 
     if embedding_size <= 0:
         raise ValueError(f"embedding_size must be positive, got {embedding_size}")
+    if backend not in {"pixel", "hybrid"}:
+        raise ValueError(f"Unsupported PiToMe embedding backend: {backend}")
 
     embeddings: list[list[float]] = []
     for frame_path in frame_paths:
         with Image.open(frame_path) as image:
-            resized = image.convert("RGB").resize((embedding_size, embedding_size))
-            values: list[float] = []
-            for pixel in resized.getdata():
-                values.extend(channel / 255.0 for channel in pixel)
-            embeddings.append(values)
+            if backend == "pixel":
+                embeddings.append(_pixel_embedding(image, embedding_size))
+            else:
+                embeddings.append(_hybrid_embedding(image, embedding_size))
     return embeddings
+
+
+def _pixel_embedding(image: Any, embedding_size: int) -> list[float]:
+    resized = image.convert("RGB").resize((embedding_size, embedding_size))
+    values: list[float] = []
+    for pixel in resized.getdata():
+        values.extend(channel / 255.0 for channel in pixel)
+    return values
+
+
+def _hybrid_embedding(image: Any, embedding_size: int) -> list[float]:
+    rgb = image.convert("RGB")
+    values = [value * 0.75 for value in _pixel_embedding(rgb, embedding_size)]
+    values.extend(value * 2.0 for value in _color_histogram_embedding(rgb))
+    values.extend(_edge_embedding(rgb, embedding_size))
+    return values
+
+
+def _color_histogram_embedding(image: Any, bins: int = 16) -> list[float]:
+    small = image.resize((128, 128))
+    channel_counts = [[0.0 for _ in range(bins)] for _ in range(3)]
+    pixel_count = 0
+    for pixel in small.getdata():
+        pixel_count += 1
+        for channel_index, channel in enumerate(pixel):
+            bucket = min(bins - 1, int(channel * bins / 256))
+            channel_counts[channel_index][bucket] += 1.0
+    scale = 1.0 / max(pixel_count, 1)
+    return [count * scale for channel in channel_counts for count in channel]
+
+
+def _edge_embedding(image: Any, embedding_size: int) -> list[float]:
+    edge_size = max(4, min(16, embedding_size))
+    grayscale = image.convert("L").resize((edge_size + 1, edge_size + 1))
+    pixels = list(grayscale.getdata())
+
+    def value_at(x: int, y: int) -> int:
+        return pixels[y * (edge_size + 1) + x]
+
+    values: list[float] = []
+    for y in range(edge_size):
+        for x in range(edge_size):
+            current = value_at(x, y)
+            right = value_at(x + 1, y)
+            down = value_at(x, y + 1)
+            values.append((abs(current - right) + abs(current - down)) / 510.0)
+    return values
 
 
 def _normalize_embedding(embedding: list[float]) -> list[float]:

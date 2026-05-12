@@ -101,6 +101,32 @@ def test_videorlm_controller_synthesizes_fallback_answer_from_evidence():
     assert result.answer == "The plan changes early in the meeting after reviewing the numbers."
 
 
+def test_videorlm_controller_repairs_incomplete_search_action():
+    memory = build_memory()
+    responses = [
+        json.dumps(
+            {
+                "action_type": "SEARCH",
+                "node_id": None,
+                "modality": None,
+                "evidence_ids": [],
+                "query": None,
+                "answer": None,
+                "rationale": None,
+            }
+        ),
+    ]
+    model = MockLM(model_name="mock-controller", responses=responses)
+    runner = VideoRLM(controller_client=model, max_steps=1, search_top_k=3, max_frontier_items=4)
+
+    result = runner.run("When does the plan change?", memory, task_type="retrieval")
+
+    action = result.trace[0]["action"]
+    assert action["action_type"] == "SEARCH"
+    assert action["query"] == "When does the plan change?"
+    assert action["modality"] == "speech"
+
+
 def test_videorlm_controller_can_use_hybrid_speech_refinement():
     memory = build_memory()
     controller_responses = [

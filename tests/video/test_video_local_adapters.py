@@ -216,6 +216,7 @@ def test_local_qwen_visual_summarizer_uses_pitome(monkeypatch, tmp_path: Path):
         frame_count=3,
         pitome_dense_frame_rate=2.0,
         pitome_min_frame_count=5,
+        pitome_embedding_backend="hybrid",
         pitome_max_selected_frames=1,
         summary_granularity="clip",
     )
@@ -227,5 +228,6 @@ def test_local_qwen_visual_summarizer_uses_pitome(monkeypatch, tmp_path: Path):
     assert calls[0]["strategy"] == "pitome"
     assert calls[0]["uniform_frame_count"] == 5
     assert calls[0]["dense_frame_rate"] == 2.0
+    assert calls[0]["embedding_backend"] == "hybrid"
     content = processor.messages[0][0]["content"]
     assert sum(1 for item in content if item["type"] == "image") == 1

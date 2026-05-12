@@ -190,6 +190,7 @@ class OpenAICompatibleVisualSummarizer:
     pitome_protect_ratio: float = 0.15
     pitome_similarity_threshold: float = 0.8
     pitome_embedding_size: int = 16
+    pitome_embedding_backend: str = "pixel"
     pitome_max_selected_frames: int | None = None
     summary_granularity: VideoNodeLevel | None = None
 
@@ -264,6 +265,7 @@ class OpenAICompatibleVisualSummarizer:
             protect_ratio=self.pitome_protect_ratio,
             similarity_threshold=self.pitome_similarity_threshold,
             embedding_size=self.pitome_embedding_size,
+            embedding_backend=self.pitome_embedding_backend,
         )
         if self.pitome_max_selected_frames is None:
             return selection.frame_paths

@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--speech-model", default="Qwen3-ASR-0.6B")
     prepare.add_argument("--visual-model", default="Qwen3-VL-8B")
     prepare.add_argument("--ffmpeg-bin", default="ffmpeg")
+    prepare.add_argument("--verbose", action="store_true", help="Print live progress to stdout")
     _add_visual_preprocessing_args(prepare)
 
     build_memory = subparsers.add_parser(
@@ -49,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Build memory assuming clip-only PiToMe visual summaries.",
     )
+    build_memory.add_argument("--verbose", action="store_true", help="Print live progress to stdout")
 
     ask = subparsers.add_parser(
         "ask",
@@ -65,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--controller-model", default="Qwen3-8B")
     ask.add_argument("--controller-base-url", required=True)
     ask.add_argument("--controller-api-key")
+    ask.add_argument("--verbose", action="store_true", help="Print live progress to stdout")
 
     longshot = subparsers.add_parser(
         "run-longshot",
@@ -98,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     longshot.add_argument("--clip-duration-seconds", type=float, default=15.0)
     longshot.add_argument("--ffmpeg-bin", default="ffmpeg")
     longshot.add_argument("--log-dir")
+    longshot.add_argument("--verbose", action="store_true", help="Print live progress to stdout")
     _add_visual_preprocessing_args(longshot)
     _add_shared_qwen_endpoint_args(longshot)
 
@@ -138,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     longshot_local.add_argument("--clip-duration-seconds", type=float, default=15.0)
     longshot_local.add_argument("--ffmpeg-bin", default="ffmpeg")
     longshot_local.add_argument("--log-dir")
+    longshot_local.add_argument("--verbose", action="store_true", help="Print live progress to stdout")
     longshot_local.add_argument("--controller-device", default="cuda:0")
     longshot_local.add_argument("--visual-device", default="cuda:1")
     longshot_local.add_argument("--speech-device", default="cuda:2")
@@ -205,6 +210,7 @@ def _cmd_build_memory(args: argparse.Namespace) -> int:
         clip_duration_seconds=args.clip_duration_seconds,
         visual_span_mode="clip" if args.use_pitome else "scene_and_clip",
         aggregate_child_visual_summaries=args.use_pitome,
+        verbose=args.verbose,
     )
     artifacts = _load_artifacts(builder, args.artifacts)
     memory = builder.build_from_artifacts(artifacts)
@@ -216,7 +222,7 @@ def _cmd_build_memory(args: argparse.Namespace) -> int:
 def _cmd_ask(args: argparse.Namespace) -> int:
     builder = VideoMemoryBuilder()
     memory = builder.load_memory(args.memory)
-    logger = VideoRLMLogger(log_dir=args.log_dir) if args.log_dir else None
+    logger = _build_logger(args)
     runner = _build_runner(args, logger=logger)
     result = runner.run(args.question, memory, task_type=args.task_type)
 
@@ -229,7 +235,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
 
 
 def _cmd_run_longshot(args: argparse.Namespace) -> int:
-    logger = VideoRLMLogger(log_dir=args.log_dir) if args.log_dir else None
+    logger = _build_logger(args)
     bundle = _build_qwen_bundle(args, logger=logger)
     output_path = Path(args.output)
     artifact_dir = Path(args.artifacts_dir) if args.artifacts_dir else output_path.parent / "artifacts"
@@ -249,6 +255,7 @@ def _cmd_run_longshot(args: argparse.Namespace) -> int:
         memory_cache_dir=memory_dir,
         trace_dir=trace_dir,
         history_mode=args.history_mode,
+        verbose=args.verbose,
     )
     samples = load_longshot_samples(
         dataset_path=args.dataset_path,
@@ -273,7 +280,7 @@ def _cmd_download_qwen_local_models(args: argparse.Namespace) -> int:
 
 
 def _cmd_run_longshot_local(args: argparse.Namespace) -> int:
-    logger = VideoRLMLogger(log_dir=args.log_dir) if args.log_dir else None
+    logger = _build_logger(args)
     config = _build_local_qwen_config(args)
     bundle = config.build_bundle(
         logger=logger,
@@ -299,6 +306,7 @@ def _cmd_run_longshot_local(args: argparse.Namespace) -> int:
         memory_cache_dir=memory_dir,
         trace_dir=trace_dir,
         history_mode=args.history_mode,
+        verbose=args.verbose,
     )
     samples = load_longshot_samples(
         dataset_path=args.dataset_path,
@@ -373,6 +381,7 @@ def _build_qwen_bundle(args: argparse.Namespace, logger: VideoRLMLogger | None):
     stack.scene_duration_seconds = getattr(args, "scene_duration_seconds", 180.0)
     stack.segment_duration_seconds = getattr(args, "segment_duration_seconds", 45.0)
     stack.clip_duration_seconds = getattr(args, "clip_duration_seconds", 15.0)
+    stack.verbose = getattr(args, "verbose", False)
     _apply_visual_preprocessing_args(stack, args)
     return stack.build_bundle(
         logger=logger,
@@ -401,8 +410,17 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     config.segment_duration_seconds = getattr(args, "segment_duration_seconds", 45.0)
     config.clip_duration_seconds = getattr(args, "clip_duration_seconds", 15.0)
     config.controller_enable_thinking = False
+    config.verbose = getattr(args, "verbose", False)
     _apply_visual_preprocessing_args(config, args)
     return config
+
+
+def _build_logger(args: argparse.Namespace) -> VideoRLMLogger | None:
+    verbose = getattr(args, "verbose", False)
+    log_dir = getattr(args, "log_dir", None)
+    if not verbose and not log_dir:
+        return None
+    return VideoRLMLogger(log_dir=log_dir, console=verbose)
 
 
 def _add_shared_qwen_endpoint_args(parser: argparse.ArgumentParser) -> None:
@@ -423,6 +441,7 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pitome-protect-ratio", type=float, default=0.15)
     parser.add_argument("--pitome-similarity-threshold", type=float, default=0.8)
     parser.add_argument("--pitome-embedding-size", type=int, default=16)
+    parser.add_argument("--pitome-embedding-backend", choices=["pixel", "hybrid"], default="pixel")
     parser.add_argument("--pitome-max-selected-frames", type=int)
 
 
@@ -433,6 +452,7 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
     config.pitome_protect_ratio = getattr(args, "pitome_protect_ratio", 0.15)
     config.pitome_similarity_threshold = getattr(args, "pitome_similarity_threshold", 0.8)
     config.pitome_embedding_size = getattr(args, "pitome_embedding_size", 16)
+    config.pitome_embedding_backend = getattr(args, "pitome_embedding_backend", "pixel")
     config.pitome_max_selected_frames = getattr(args, "pitome_max_selected_frames", None)
 
 
