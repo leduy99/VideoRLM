@@ -89,6 +89,7 @@ class QwenVideoStackConfig:
     pitome_similarity_threshold: float = 0.8
     pitome_embedding_size: int = 16
     pitome_embedding_backend: str = "pixel"
+    pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
     verbose: bool = False
 
@@ -169,6 +170,7 @@ class QwenVideoStackConfig:
             pitome_similarity_threshold=self.pitome_similarity_threshold,
             pitome_embedding_size=self.pitome_embedding_size,
             pitome_embedding_backend=self.pitome_embedding_backend,
+            pitome_anchor_frame_count=self.pitome_anchor_frame_count,
             pitome_max_selected_frames=self.pitome_max_selected_frames,
             summary_granularity="clip" if self.use_pitome else None,
         )
@@ -231,6 +233,7 @@ class QwenLocalVideoStackConfig:
     pitome_similarity_threshold: float = 0.8
     pitome_embedding_size: int = 16
     pitome_embedding_backend: str = "pixel"
+    pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
     verbose: bool = False
 
@@ -356,6 +359,7 @@ class QwenLocalVideoStackConfig:
             pitome_similarity_threshold=self.pitome_similarity_threshold,
             pitome_embedding_size=self.pitome_embedding_size,
             pitome_embedding_backend=self.pitome_embedding_backend,
+            pitome_anchor_frame_count=self.pitome_anchor_frame_count,
             pitome_max_selected_frames=self.pitome_max_selected_frames,
             summary_granularity="clip" if self.use_pitome else None,
             verbose=self.verbose,

@@ -56,6 +56,7 @@ def select_visual_frames_for_span(
     similarity_threshold: float = 0.8,
     embedding_size: int = 16,
     embedding_backend: FrameEmbeddingBackend = "pixel",
+    anchor_frame_count: int = 0,
 ) -> FrameSelectionResult:
     if strategy == "uniform":
         timestamps = sample_span_timestamps(span, uniform_frame_count)
@@ -96,6 +97,7 @@ def select_visual_frames_for_span(
         embeddings,
         protect_ratio=protect_ratio,
         similarity_threshold=similarity_threshold,
+        anchor_count=anchor_frame_count,
     )
 
     selected_indices = selection["selected_indices"]
@@ -127,6 +129,7 @@ def select_frame_indices_from_embeddings(
     *,
     protect_ratio: float = 0.15,
     similarity_threshold: float = 0.8,
+    anchor_count: int = 0,
 ) -> dict[str, Any]:
     if not embeddings:
         return {
@@ -138,6 +141,8 @@ def select_frame_indices_from_embeddings(
         }
 
     _validate_ratio(protect_ratio, name="protect_ratio")
+    if anchor_count < 0:
+        raise ValueError(f"anchor_count must be non-negative, got {anchor_count}")
 
     if len(embeddings) == 1:
         return {
@@ -152,7 +157,8 @@ def select_frame_indices_from_embeddings(
     energy_scores = compute_energy_scores(similarity_matrix)
     protected_count = max(1, math.ceil(len(embeddings) * protect_ratio))
     energy_order = sorted(range(len(embeddings)), key=lambda index: energy_scores[index])
-    protected_indices = sorted(energy_order[:protected_count])
+    anchor_indices = _uniform_anchor_indices(len(embeddings), anchor_count)
+    protected_indices = sorted(set(energy_order[:protected_count]) | set(anchor_indices))
 
     protected_set = set(protected_indices)
     mergeable_indices = [index for index in range(len(embeddings)) if index not in protected_set]
@@ -308,6 +314,21 @@ def _normalize_embedding(embedding: list[float]) -> list[float]:
         scale = 1.0 / math.sqrt(len(embedding))
         return [scale] * len(embedding)
     return [value / norm for value in embedding]
+
+
+def _uniform_anchor_indices(item_count: int, anchor_count: int) -> list[int]:
+    if item_count <= 0 or anchor_count <= 0:
+        return []
+    if anchor_count >= item_count:
+        return list(range(item_count))
+    if anchor_count == 1:
+        return [item_count // 2]
+    return sorted(
+        {
+            round(position * (item_count - 1) / (anchor_count - 1))
+            for position in range(anchor_count)
+        }
+    )
 
 
 def _validate_ratio(value: float, *, name: str) -> None:

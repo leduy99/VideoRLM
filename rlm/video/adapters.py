@@ -191,6 +191,7 @@ class OpenAICompatibleVisualSummarizer:
     pitome_similarity_threshold: float = 0.8
     pitome_embedding_size: int = 16
     pitome_embedding_backend: str = "pixel"
+    pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
     summary_granularity: VideoNodeLevel | None = None
 
@@ -266,10 +267,14 @@ class OpenAICompatibleVisualSummarizer:
             similarity_threshold=self.pitome_similarity_threshold,
             embedding_size=self.pitome_embedding_size,
             embedding_backend=self.pitome_embedding_backend,
+            anchor_frame_count=self.pitome_anchor_frame_count,
         )
         if self.pitome_max_selected_frames is None:
             return selection.frame_paths
-        return selection.frame_paths[: self.pitome_max_selected_frames]
+        return _limit_paths_by_temporal_coverage(
+            selection.frame_paths,
+            self.pitome_max_selected_frames,
+        )
 
     def _build_prompt(self, span: TimeSpan) -> str:
         return (
@@ -338,6 +343,22 @@ def _parse_json_object(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
     return {"summary": candidate, "tags": [], "entities": []}
+
+
+def _limit_paths_by_temporal_coverage(paths: list[Path], max_count: int) -> list[Path]:
+    if max_count <= 0:
+        raise ValueError(f"max_count must be positive, got {max_count}")
+    if len(paths) <= max_count:
+        return paths
+    if max_count == 1:
+        return [paths[len(paths) // 2]]
+    indices = sorted(
+        {
+            round(position * (len(paths) - 1) / (max_count - 1))
+            for position in range(max_count)
+        }
+    )
+    return [paths[index] for index in indices]
 
 
 def _image_to_data_url(image_path: str | Path) -> str:

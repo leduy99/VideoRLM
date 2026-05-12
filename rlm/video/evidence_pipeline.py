@@ -29,10 +29,93 @@ GENERIC_SLOT_KEYWORDS: dict[str, list[str]] = {
     "mouse_reaction": ["mouse", "reaction", "responded", "paused", "looked"],
     "shared_sensing": ["both", "seemed", "sensed", "noticed", "realized"],
     "main_claim": ["main", "claim", "answer", "point"],
-    "supporting_detail": ["detail", "support", "evidence", "specific", "example"],
+    "supporting_detail": ["detail", "support", "specific", "example"],
     "missing_context": ["context", "missing", "unclear", "not enough"],
 }
 CONTROL_QUERY_TOKENS = {"why", "first", "last", "earliest", "initial", "beginning", "final"}
+VISUAL_ROUTE_TERMS = {
+    "appear",
+    "appears",
+    "display",
+    "displayed",
+    "door",
+    "expression",
+    "expressions",
+    "graph",
+    "image",
+    "look",
+    "looks",
+    "read",
+    "screen",
+    "see",
+    "seen",
+    "show",
+    "showing",
+    "shown",
+    "sign",
+    "slide",
+    "slides",
+    "text",
+    "title",
+    "visible",
+    "visual",
+    "written",
+}
+VISUAL_ROUTE_PHRASES = {
+    "on screen",
+    "on-screen",
+    "what is written",
+    "what's written",
+    "what does the sign",
+    "what does it show",
+    "what do you see",
+}
+AUDIO_ROUTE_TERMS = {
+    "audio",
+    "background",
+    "beep",
+    "beeping",
+    "hear",
+    "heard",
+    "mechanical",
+    "music",
+    "noise",
+    "noises",
+    "sound",
+    "sounds",
+    "tick",
+    "ticking",
+}
+AUDIO_ROUTE_PHRASES = {
+    "what kind of sound",
+    "what kind of sounds",
+    "mechanical sounds",
+    "background noise",
+    "audio field",
+}
+SPEECH_ROUTE_TERMS = {
+    "explain",
+    "explained",
+    "explains",
+    "mention",
+    "mentioned",
+    "narrator",
+    "say",
+    "says",
+    "said",
+    "speaker",
+    "spoken",
+    "talk",
+    "talks",
+    "tell",
+    "tells",
+}
+SPEECH_ROUTE_PHRASES = {
+    "what did",
+    "what does the speaker",
+    "what does she say",
+    "what does he say",
+}
 
 
 def build_question_spec(
@@ -42,7 +125,7 @@ def build_question_spec(
 ) -> QuestionSpec:
     del dialogue_context
     tokens = _tokenize(question)
-    preferred_modality: Modality | None = "speech"
+    preferred_modality: Modality | None = infer_question_modality(question)
     question_type = "generic"
     slots: list[EvidenceSlotSpec]
     answer_policy = "answer_only_if_required_slots_filled"
@@ -64,7 +147,7 @@ def build_question_spec(
                 slot="reason",
                 description=f"Why {question.rstrip('?')}".strip(),
                 required=True,
-                preferred_modality="speech",
+                preferred_modality=preferred_modality,
             ),
         ]
     elif {"first", "earliest", "initial", "beginning"} & tokens:
@@ -73,15 +156,18 @@ def build_question_spec(
             EvidenceSlotSpec(
                 slot="first_thing_tried",
                 description="The earliest item, action, or event directly asked by the question",
+                preferred_modality=preferred_modality,
             ),
             EvidenceSlotSpec(
                 slot="why_different",
                 description="Why that first item or event felt different or revealing",
+                preferred_modality=preferred_modality,
             ),
             EvidenceSlotSpec(
                 slot="reaction",
                 description="Immediate reaction after that first item or event",
                 required=False,
+                preferred_modality=preferred_modality,
             ),
         ]
     elif "reaction" in tokens and ("sense" in tokens or "seemed" in tokens):
@@ -108,20 +194,30 @@ def build_question_spec(
         question_type = "summarization"
         preferred_modality = "cross_modal"
         slots = [
-            EvidenceSlotSpec(slot="main_claim", description="Main answer or summary claim"),
+            EvidenceSlotSpec(
+                slot="main_claim",
+                description="Main answer or summary claim",
+                preferred_modality=preferred_modality,
+            ),
             EvidenceSlotSpec(
                 slot="supporting_detail",
                 description="Specific supporting detail needed for the summary",
                 required=False,
+                preferred_modality=preferred_modality,
             ),
         ]
     else:
         slots = [
-            EvidenceSlotSpec(slot="main_claim", description=f"Main answer to: {question}"),
+            EvidenceSlotSpec(
+                slot="main_claim",
+                description=f"Main answer to: {question}",
+                preferred_modality=preferred_modality,
+            ),
             EvidenceSlotSpec(
                 slot="supporting_detail",
                 description="Most important supporting detail for the main answer",
                 required=False,
+                preferred_modality=preferred_modality,
             ),
         ]
 
@@ -132,6 +228,18 @@ def build_question_spec(
         answer_policy=answer_policy,
         metadata={"question": question, "task_type": task_type},
     )
+
+
+def infer_question_modality(question: str) -> Modality:
+    lowered = question.lower()
+    tokens = _tokenize(question)
+    if _has_route_signal(lowered, tokens, AUDIO_ROUTE_TERMS, AUDIO_ROUTE_PHRASES):
+        return "audio"
+    if _has_route_signal(lowered, tokens, VISUAL_ROUTE_TERMS, VISUAL_ROUTE_PHRASES):
+        return "visual"
+    if _has_route_signal(lowered, tokens, SPEECH_ROUTE_TERMS, SPEECH_ROUTE_PHRASES):
+        return "speech"
+    return "speech"
 
 
 def build_evidence_board(question_spec: QuestionSpec) -> EvidenceBoard:
@@ -183,24 +291,31 @@ def search_v2(
     hits_by_node: dict[str, SearchHit] = {}
     query_sources: dict[str, list[str]] = defaultdict(list)
     selected_modality = modality or _preferred_modality(question_spec, target_slot)
+    selected_modality = _resolve_available_modality(selected_modality, state)
+    search_modalities = _search_modalities(selected_modality, state.question)
 
     for query in queries:
-        hits = index.search(query=query, modality=selected_modality, top_k=max(top_k * 2, 8))
-        for hit in hits:
-            candidate = SearchHit(
-                node_id=hit.node_id,
-                time_span=hit.time_span,
-                level=hit.level,
-                score=_adjust_search_score(hit, state, target_slot),
-                reason=hit.reason,
-                modality=hit.modality,
-                matched_terms=hit.matched_terms,
-                score_breakdown=dict(hit.score_breakdown),
+        for current_modality in search_modalities:
+            hits = index.search(
+                query=query,
+                modality=current_modality,
+                top_k=max(top_k * 2, 8),
             )
-            current = hits_by_node.get(candidate.node_id)
-            if current is None or candidate.score > current.score:
-                hits_by_node[candidate.node_id] = candidate
-            query_sources[candidate.node_id].append(query)
+            for hit in hits:
+                candidate = SearchHit(
+                    node_id=hit.node_id,
+                    time_span=hit.time_span,
+                    level=hit.level,
+                    score=_adjust_search_score(hit, state, target_slot),
+                    reason=hit.reason,
+                    modality=hit.modality,
+                    matched_terms=hit.matched_terms,
+                    score_breakdown=dict(hit.score_breakdown),
+                )
+                current = hits_by_node.get(candidate.node_id)
+                if current is None or candidate.score > current.score:
+                    hits_by_node[candidate.node_id] = candidate
+                query_sources[candidate.node_id].append(query)
 
     ranked_hits = sorted(
         hits_by_node.values(),
@@ -217,6 +332,7 @@ def search_v2(
         "target_slot": target_slot,
         "queries": queries,
         "modality": selected_modality,
+        "searched_modalities": search_modalities,
         "hit_count": len(frontier),
         "query_sources": dict(query_sources),
     }
@@ -398,6 +514,7 @@ def build_slot_queries(
     queries = [question.strip()]
     if question_spec is None:
         return queries
+    queries.extend(_modality_queries(question_spec, target_slot))
     slot = question_spec.get_slot(target_slot) if target_slot else None
     if slot is not None:
         queries.append(slot.description)
@@ -461,6 +578,60 @@ def _preferred_modality(question_spec: QuestionSpec | None, target_slot: str | N
     return question_spec.preferred_modality or "speech"
 
 
+def _resolve_available_modality(modality: Modality, state: ControllerState) -> Modality:
+    available = state.global_context.get("available_modalities", {})
+    if not available:
+        return modality
+    if modality == "ocr" and not available.get("ocr") and available.get("visual"):
+        return "visual"
+    if modality == "audio" and not available.get("audio") and available.get("speech"):
+        return "speech"
+    return modality
+
+
+def _search_modalities(modality: Modality, question: str) -> list[Modality]:
+    if modality == "cross_modal":
+        return ["speech", "visual", "ocr", "audio"]
+    if modality == "visual":
+        if _has_route_signal(question.lower(), _tokenize(question), VISUAL_ROUTE_TERMS, VISUAL_ROUTE_PHRASES):
+            return ["visual", "ocr"]
+        return ["visual"]
+    if modality == "ocr":
+        return ["ocr", "visual"]
+    if modality == "audio":
+        return ["audio", "speech"]
+    return [modality]
+
+
+def _has_route_signal(
+    lowered: str,
+    tokens: set[str],
+    terms: set[str],
+    phrases: set[str],
+) -> bool:
+    return bool(tokens & terms) or any(phrase in lowered for phrase in phrases)
+
+
+def _modality_queries(question_spec: QuestionSpec, target_slot: str | None) -> list[str]:
+    modality = _preferred_modality(question_spec, target_slot)
+    if modality == "visual":
+        return [
+            "visible text title slide screen shown displayed",
+            "on screen text title slide",
+        ]
+    if modality == "audio":
+        return [
+            "sound noise audio background ticking mechanical",
+            "heard subtle sound background noise",
+        ]
+    if modality == "ocr":
+        return [
+            "read visible text on screen",
+            "written title label sign",
+        ]
+    return []
+
+
 def _best_slot_match(
     item: Evidence,
     question_spec: QuestionSpec,
@@ -476,7 +647,7 @@ def _best_slot_match(
         keyword_overlap = len(text_tokens & keyword_tokens)
         score = overlap * 0.18 + keyword_overlap * 0.22
         if slot.slot == target_slot:
-            score += 0.12
+            score += 0.26
         if score > best_score:
             best_slot = slot.slot
             best_score = score
@@ -502,7 +673,14 @@ def _classify_slot_role(
             "worried",
             "fixed",
             "reaction",
+            "reads",
+            "screen",
+            "shown",
+            "shows",
             "tasted",
+            "text",
+            "title",
+            "visible",
             "first",
             "this is",
             "what about",

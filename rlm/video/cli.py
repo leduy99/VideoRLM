@@ -442,6 +442,7 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pitome-similarity-threshold", type=float, default=0.8)
     parser.add_argument("--pitome-embedding-size", type=int, default=16)
     parser.add_argument("--pitome-embedding-backend", choices=["pixel", "hybrid"], default="pixel")
+    parser.add_argument("--pitome-anchor-frame-count", type=int, default=0)
     parser.add_argument("--pitome-max-selected-frames", type=int)
 
 
@@ -453,6 +454,7 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
     config.pitome_similarity_threshold = getattr(args, "pitome_similarity_threshold", 0.8)
     config.pitome_embedding_size = getattr(args, "pitome_embedding_size", 16)
     config.pitome_embedding_backend = getattr(args, "pitome_embedding_backend", "pixel")
+    config.pitome_anchor_frame_count = getattr(args, "pitome_anchor_frame_count", 0)
     config.pitome_max_selected_frames = getattr(args, "pitome_max_selected_frames", None)
 
 

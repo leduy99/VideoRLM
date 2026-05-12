@@ -184,6 +184,7 @@ class VideoRLM:
             "video_id": memory.video_id,
             "video_length_seconds": memory.metadata.get("duration_seconds"),
             "node_count": len(memory.nodes),
+            "available_modalities": self._available_modalities(memory),
             "topical_index": scene_summaries,
             "evidence_metrics": {
                 "slot_fill_rate": 0.0,
@@ -334,21 +335,42 @@ class VideoRLM:
         payload: dict[str, Any],
         state: ControllerState,
     ) -> dict[str, Any]:
-        if payload.get("action_type") != "SEARCH":
+        action_type = payload.get("action_type")
+        if action_type not in {"SEARCH", "OPEN"}:
             return payload
 
         target_slot = payload.get("target_slot") or select_target_slot(
             state.question_spec,
             state.evidence_board,
         )
-        if not payload.get("query"):
-            payload["query"] = build_slot_queries(
-                state.question,
-                state.question_spec,
-                target_slot,
-            )[0]
-        if not payload.get("modality"):
-            payload["modality"] = self._preferred_search_modality(state, target_slot)
+        preferred_modality = self._preferred_search_modality(state, target_slot)
+        current_modality = payload.get("modality")
+        resolved_modality = (
+            self._resolve_available_modality(current_modality, state)
+            if current_modality
+            else None
+        )
+        if action_type == "SEARCH":
+            if not payload.get("query"):
+                payload["query"] = build_slot_queries(
+                    state.question,
+                    state.question_spec,
+                    target_slot,
+                )[0]
+            if resolved_modality is None or self._should_override_open_modality(
+                current_modality=resolved_modality,
+                preferred_modality=preferred_modality,
+            ):
+                payload["modality"] = preferred_modality
+            else:
+                payload["modality"] = resolved_modality
+        elif resolved_modality is None or self._should_override_open_modality(
+            current_modality=resolved_modality,
+            preferred_modality=preferred_modality,
+        ):
+            payload["modality"] = preferred_modality
+        else:
+            payload["modality"] = resolved_modality
         payload["target_slot"] = target_slot
         return payload
 
@@ -362,8 +384,38 @@ class VideoRLM:
         if target_slot is not None:
             slot = state.question_spec.get_slot(target_slot)
             if slot is not None and slot.preferred_modality is not None:
-                return slot.preferred_modality
-        return state.question_spec.preferred_modality or "speech"
+                return self._resolve_available_modality(slot.preferred_modality, state)
+        return self._resolve_available_modality(state.question_spec.preferred_modality or "speech", state)
+
+    def _resolve_available_modality(self, modality: str, state: ControllerState) -> str:
+        available = state.global_context.get("available_modalities", {})
+        if modality == "ocr" and not available.get("ocr") and available.get("visual"):
+            return "visual"
+        if modality == "audio" and not available.get("audio") and available.get("speech"):
+            return "speech"
+        return modality
+
+    def _should_override_open_modality(
+        self,
+        current_modality: str | None,
+        preferred_modality: str,
+    ) -> bool:
+        if current_modality == preferred_modality:
+            return False
+        if current_modality == "speech" and preferred_modality in {"visual", "ocr", "audio"}:
+            return True
+        if current_modality == "visual" and preferred_modality in {"ocr", "audio"}:
+            return True
+        return False
+
+    def _available_modalities(self, memory: VideoMemory) -> dict[str, bool]:
+        nodes = [node for node in memory.nodes.values() if node.level != "video"]
+        return {
+            "speech": any(node.speech_spans for node in nodes),
+            "visual": any(node.visual_summary.strip() for node in nodes),
+            "ocr": any(node.ocr_spans for node in nodes),
+            "audio": any(node.audio_events for node in nodes),
+        }
 
     def _extract_first_json_object(self, text: str) -> str:
         decoder = json.JSONDecoder()

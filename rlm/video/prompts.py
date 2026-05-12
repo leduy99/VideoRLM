@@ -29,6 +29,7 @@ Return exactly one JSON object with this schema:
 Rules:
 - Prefer SEARCH when frontier is weak or empty, or when a required slot is still missing.
 - Prefer OPEN when a frontier node already looks promising for the current target slot.
+- Respect question_spec preferred_modality: use visual for screen/sign/visible text, audio for sound/noise, and speech for spoken explanations.
 - Use SPLIT when a node is still too broad.
 - Use MERGE when multiple evidence items already support one claim.
 - Do not OPEN the same node with the same modality and the same target_slot twice.

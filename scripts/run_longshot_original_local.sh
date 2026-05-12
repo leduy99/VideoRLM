@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-output/longshot_small_original_local}"
-SAMPLE_LIMIT="${SAMPLE_LIMIT:-20}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-output/longshot_small_original_local_4B}"
+SAMPLE_LIMIT="${SAMPLE_LIMIT:-10}"
 FRAME_COUNT="${FRAME_COUNT:-3}"
 FRAME_WIDTH="${FRAME_WIDTH:-768}"
 CONTROLLER_DEVICE="${CONTROLLER_DEVICE:-mps}"
@@ -20,7 +20,7 @@ PYTHONUNBUFFERED=1 PYTORCH_ENABLE_MPS_FALLBACK=1 conda run --no-capture-output -
   --memory-dir "${OUTPUT_ROOT}/memories" \
   --trace-dir "${OUTPUT_ROOT}/traces" \
   --sample-limit "${SAMPLE_LIMIT}" \
-  --controller-repo Qwen/Qwen3-0.6B \
+  --controller-repo Qwen/Qwen3-4B-Instruct-2507 \
   --visual-repo Qwen/Qwen3-VL-2B-Instruct \
   --speech-repo Qwen/Qwen3-ASR-0.6B \
   --no-forced-aligner \
