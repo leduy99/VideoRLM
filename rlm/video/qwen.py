@@ -1,9 +1,10 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from rlm.clients.transformers_local import TransformersClient
 from rlm.video.adapters import (
     EmbeddingProvider,
+    ImageTextEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
     OpenAICompatibleSpeechRecognizer,
     OpenAICompatibleVisualSummarizer,
@@ -15,6 +16,7 @@ from rlm.video.huggingface import default_local_model_dir, download_snapshot
 from rlm.video.local_adapters import LocalQwenASRSpeechRecognizer, LocalQwenVisualSummarizer
 from rlm.video.logger import VideoRLMLogger
 from rlm.video.memory import VideoMemoryBuilder
+from rlm.video.semantic_embeddings import LocalImageTextEmbeddingProvider
 
 
 @dataclass
@@ -67,6 +69,7 @@ class QwenVideoRuntimeBundle:
     speech_recognizer: SpeechRecognizer
     visual_summarizer: VisualSummarizer
     embedding_provider: EmbeddingProvider | None = None
+    image_text_embedding_provider: ImageTextEmbeddingProvider | None = None
 
 
 @dataclass
@@ -91,6 +94,8 @@ class QwenVideoStackConfig:
     pitome_embedding_backend: str = "pixel"
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
+    parent_visual_summary_mode: Literal["full", "compact"] | None = None
+    search_mode: Literal["lexical", "graph"] | None = None
     verbose: bool = False
 
     @classmethod
@@ -191,6 +196,8 @@ class QwenVideoStackConfig:
             clip_duration_seconds=self.clip_duration_seconds,
             visual_span_mode="clip" if self.use_pitome else "scene_and_clip",
             aggregate_child_visual_summaries=self.use_pitome,
+            parent_visual_summary_mode=self.parent_visual_summary_mode
+            or ("compact" if self.use_pitome else "full"),
             verbose=self.verbose,
         )
         controller = VideoRLM(
@@ -202,6 +209,8 @@ class QwenVideoStackConfig:
             max_frontier_items=max_frontier_items,
             enable_hybrid_speech_refinement=enable_hybrid_speech_refinement,
             speech_refine_candidate_count=speech_refine_candidate_count,
+            search_mode=self.search_mode or ("graph" if self.use_pitome else "lexical"),
+            embedding_provider=embedding_provider,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
@@ -209,6 +218,7 @@ class QwenVideoStackConfig:
             speech_recognizer=speech_recognizer,
             visual_summarizer=visual_summarizer,
             embedding_provider=embedding_provider,
+            image_text_embedding_provider=None,
         )
 
 
@@ -218,6 +228,7 @@ class QwenLocalVideoStackConfig:
     visual: LocalModelConfig
     speech: LocalModelConfig
     forced_aligner: LocalModelConfig | None = None
+    semantic_frame_embedding: LocalModelConfig | None = None
     ffmpeg_bin: str = "ffmpeg"
     frame_count: int = 3
     frame_width: int | None = 768
@@ -235,6 +246,9 @@ class QwenLocalVideoStackConfig:
     pitome_embedding_backend: str = "pixel"
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
+    parent_visual_summary_mode: Literal["full", "compact"] | None = None
+    search_mode: Literal["lexical", "graph"] | None = None
+    semantic_frame_embedding_batch_size: int = 8
     verbose: bool = False
 
     @classmethod
@@ -248,6 +262,9 @@ class QwenLocalVideoStackConfig:
         visual_model: str = "Qwen/Qwen3-VL-8B-Instruct",
         speech_model: str = "Qwen/Qwen3-ASR-0.6B",
         forced_aligner_model: str | None = "Qwen/Qwen3-ForcedAligner-0.6B",
+        semantic_frame_embedding_model: str | None = None,
+        semantic_frame_embedding_device: str = "cpu",
+        semantic_frame_embedding_torch_dtype: str = "float32",
         torch_dtype: str = "bfloat16",
         attn_implementation: str | None = None,
     ) -> "QwenLocalVideoStackConfig":
@@ -286,11 +303,20 @@ class QwenLocalVideoStackConfig:
                 device_map=speech_device,
                 torch_dtype=torch_dtype,
             )
+        semantic_frame_embedding = None
+        if semantic_frame_embedding_model is not None:
+            semantic_frame_embedding = LocalModelConfig(
+                model_name=semantic_frame_embedding_model,
+                model_path=None,
+                device=semantic_frame_embedding_device,
+                torch_dtype=semantic_frame_embedding_torch_dtype,
+            )
         return cls(
             controller=controller,
             visual=visual,
             speech=speech,
             forced_aligner=forced_aligner,
+            semantic_frame_embedding=semantic_frame_embedding,
         )
 
     def download_models(self) -> dict[str, str]:
@@ -301,6 +327,8 @@ class QwenLocalVideoStackConfig:
         }
         if self.forced_aligner is not None:
             downloads["forced_aligner"] = self.forced_aligner.download()
+        if self.semantic_frame_embedding is not None:
+            downloads["semantic_frame_embedding"] = self.semantic_frame_embedding.download()
         return downloads
 
     def build_bundle(
@@ -361,9 +389,11 @@ class QwenLocalVideoStackConfig:
             pitome_embedding_backend=self.pitome_embedding_backend,
             pitome_anchor_frame_count=self.pitome_anchor_frame_count,
             pitome_max_selected_frames=self.pitome_max_selected_frames,
+            frame_embedding_provider=self._build_semantic_frame_embedding_provider(),
             summary_granularity="clip" if self.use_pitome else None,
             verbose=self.verbose,
         )
+        image_text_embedding_provider = visual_summarizer.frame_embedding_provider
         memory_builder = VideoMemoryBuilder(
             speech_recognizer=speech_recognizer,
             visual_summarizer=visual_summarizer,
@@ -372,6 +402,8 @@ class QwenLocalVideoStackConfig:
             clip_duration_seconds=self.clip_duration_seconds,
             visual_span_mode="clip" if self.use_pitome else "scene_and_clip",
             aggregate_child_visual_summaries=self.use_pitome,
+            parent_visual_summary_mode=self.parent_visual_summary_mode
+            or ("compact" if self.use_pitome else "full"),
             verbose=self.verbose,
         )
         controller = VideoRLM(
@@ -382,6 +414,8 @@ class QwenLocalVideoStackConfig:
             max_frontier_items=max_frontier_items,
             enable_hybrid_speech_refinement=enable_hybrid_speech_refinement,
             speech_refine_candidate_count=speech_refine_candidate_count,
+            search_mode=self.search_mode or ("graph" if self.use_pitome else "lexical"),
+            image_text_embedding_provider=image_text_embedding_provider,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
@@ -389,4 +423,19 @@ class QwenLocalVideoStackConfig:
             speech_recognizer=speech_recognizer,
             visual_summarizer=visual_summarizer,
             embedding_provider=None,
+            image_text_embedding_provider=image_text_embedding_provider,
+        )
+
+    def _build_semantic_frame_embedding_provider(
+        self,
+    ) -> ImageTextEmbeddingProvider | None:
+        if self.semantic_frame_embedding is None:
+            return None
+        return LocalImageTextEmbeddingProvider(
+            model_name=self.semantic_frame_embedding.model_name,
+            model_path=self.semantic_frame_embedding.resolved_model_path(),
+            device=self.semantic_frame_embedding.device,
+            torch_dtype=self.semantic_frame_embedding.torch_dtype,
+            batch_size=self.semantic_frame_embedding_batch_size,
+            trust_remote_code=self.semantic_frame_embedding.trust_remote_code,
         )

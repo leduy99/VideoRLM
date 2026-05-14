@@ -8,7 +8,7 @@ from typing import Any
 
 from PIL import Image
 
-from rlm.video.adapters import _parse_json_object, _to_dict
+from rlm.video.adapters import ImageTextEmbeddingProvider, _parse_json_object, _to_dict
 from rlm.video.media import (
     extract_audio_segment,
     extract_audio_track,
@@ -17,7 +17,10 @@ from rlm.video.media import (
     is_audio_path,
     probe_media_duration,
 )
-from rlm.video.pitome import select_visual_frames_for_span
+from rlm.video.pitome import (
+    limit_frame_selection_by_temporal_coverage,
+    select_visual_frames_for_span,
+)
 from rlm.video.types import SpeechSpan, TimeSpan, VideoNodeLevel, VisualSummarySpan
 
 
@@ -75,11 +78,15 @@ class LocalQwenASRSpeechRecognizer:
             self._log(f"recognize done spans={len(spans)}")
             return spans
 
-    def _recognize_in_chunks(self, model, audio_path: Path, stack: contextlib.ExitStack) -> list[SpeechSpan]:
+    def _recognize_in_chunks(
+        self, model, audio_path: Path, stack: contextlib.ExitStack
+    ) -> list[SpeechSpan]:
         temp_root = get_videorlm_output_root() / "tmp"
         temp_root.mkdir(parents=True, exist_ok=True)
         temp_dir = Path(
-            stack.enter_context(_temporary_directory(prefix="videorlm_local_asr_chunks_", dir_path=temp_root))
+            stack.enter_context(
+                _temporary_directory(prefix="videorlm_local_asr_chunks_", dir_path=temp_root)
+            )
         )
         duration_seconds = probe_media_duration(audio_path, ffprobe_bin=self.ffprobe_bin)
         chunks = _chunk_time_spans(duration_seconds, self.chunk_duration_seconds)
@@ -224,6 +231,7 @@ class LocalQwenVisualSummarizer:
     pitome_embedding_backend: str = "pixel"
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
+    frame_embedding_provider: ImageTextEmbeddingProvider | None = None
     summary_granularity: VideoNodeLevel | None = None
     verbose: bool = False
 
@@ -242,7 +250,7 @@ class LocalQwenVisualSummarizer:
             for index, span in enumerate(spans, start=1):
                 self._log(f"visual span {index}/{len(spans)} span={span.to_display()}")
                 frame_dir = temp_dir / f"span_{index:03d}"
-                frame_paths = self._select_frame_paths(video_path, span, frame_dir)
+                frame_paths, frame_metadata = self._select_frames(video_path, span, frame_dir)
                 self._log(f"visual span {index}/{len(spans)} selected_frames={len(frame_paths)}")
                 messages = [
                     {
@@ -287,14 +295,24 @@ class LocalQwenVisualSummarizer:
                         granularity=self._infer_granularity(span),
                         tags=[str(item) for item in payload.get("tags", [])],
                         entities=[str(item) for item in payload.get("entities", [])],
+                        metadata=frame_metadata,
                     )
                 )
         self._log(f"summarize done summaries={len(summaries)}")
         return summaries
 
     def _select_frame_paths(self, video_path: str, span: TimeSpan, output_dir: Path) -> list[Path]:
+        frame_paths, _ = self._select_frames(video_path, span, output_dir)
+        return frame_paths
+
+    def _select_frames(
+        self,
+        video_path: str,
+        span: TimeSpan,
+        output_dir: Path,
+    ) -> tuple[list[Path], dict[str, Any]]:
         if not self.use_pitome:
-            return extract_frames_for_span(
+            frame_paths = extract_frames_for_span(
                 media_path=video_path,
                 span=span,
                 frame_count=self.frame_count,
@@ -302,6 +320,7 @@ class LocalQwenVisualSummarizer:
                 width=self.frame_width,
                 output_dir=output_dir,
             )
+            return frame_paths, {}
 
         selection = select_visual_frames_for_span(
             media_path=video_path,
@@ -318,12 +337,30 @@ class LocalQwenVisualSummarizer:
             embedding_backend=self.pitome_embedding_backend,
             anchor_frame_count=self.pitome_anchor_frame_count,
         )
-        if self.pitome_max_selected_frames is None:
-            return selection.frame_paths
-        return _limit_paths_by_temporal_coverage(
-            selection.frame_paths,
-            self.pitome_max_selected_frames,
-        )
+        if self.pitome_max_selected_frames is not None:
+            selection = limit_frame_selection_by_temporal_coverage(
+                selection,
+                self.pitome_max_selected_frames,
+            )
+        metadata = selection.to_metadata()
+        metadata.update(self._semantic_frame_metadata(selection.frame_paths))
+        return selection.frame_paths, metadata
+
+    def _semantic_frame_metadata(self, frame_paths: list[Path]) -> dict[str, Any]:
+        if self.frame_embedding_provider is None or not frame_paths:
+            return {}
+        embeddings = self.frame_embedding_provider.embed_images(frame_paths)
+        if not embeddings:
+            return {}
+        return {
+            "semantic_frame_embeddings": embeddings,
+            "semantic_frame_embedding_model": getattr(
+                self.frame_embedding_provider,
+                "model_name",
+                None,
+            ),
+            "semantic_frame_embedding_dim": len(embeddings[0]),
+        }
 
     def _ensure_loaded(self):
         if self.model is not None and self.processor is not None:
@@ -390,10 +427,7 @@ def _limit_paths_by_temporal_coverage(paths: list[Path], max_count: int) -> list
     if max_count == 1:
         return [paths[len(paths) // 2]]
     indices = sorted(
-        {
-            round(position * (len(paths) - 1) / (max_count - 1))
-            for position in range(max_count)
-        }
+        {round(position * (len(paths) - 1) / (max_count - 1)) for position in range(max_count)}
     )
     return [paths[index] for index in indices]
 
@@ -421,11 +455,7 @@ def _object_payload(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     if hasattr(value, "__dict__"):
-        return {
-            key: item
-            for key, item in vars(value).items()
-            if not key.startswith("_")
-        }
+        return {key: item for key, item in vars(value).items() if not key.startswith("_")}
     try:
         return _to_dict(value)
     except TypeError:
@@ -516,9 +546,7 @@ def _chunk_time_spans(duration_seconds: float, chunk_duration_seconds: float) ->
     if duration_seconds <= 0:
         return []
     if chunk_duration_seconds <= 0:
-        raise ValueError(
-            f"chunk_duration_seconds must be positive, got {chunk_duration_seconds}"
-        )
+        raise ValueError(f"chunk_duration_seconds must be positive, got {chunk_duration_seconds}")
 
     spans: list[TimeSpan] = []
     cursor = 0.0

@@ -73,6 +73,7 @@ class VisualSummarySpan:
     granularity: VideoNodeLevel = "clip"
     tags: list[str] = field(default_factory=list)
     entities: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +82,7 @@ class VisualSummarySpan:
             "granularity": self.granularity,
             "tags": list(self.tags),
             "entities": list(self.entities),
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -91,6 +93,7 @@ class VisualSummarySpan:
             granularity=data.get("granularity", "clip"),
             tags=list(data.get("tags", [])),
             entities=list(data.get("entities", [])),
+            metadata=dict(data.get("metadata", {})),
         )
 
 
@@ -641,9 +644,7 @@ class ControllerState:
             ),
             subquestion=data.get("subquestion"),
             frontier=[FrontierItem.from_dict(item) for item in data.get("frontier", [])],
-            evidence_ledger=[
-                Evidence.from_dict(item) for item in data.get("evidence_ledger", [])
-            ],
+            evidence_ledger=[Evidence.from_dict(item) for item in data.get("evidence_ledger", [])],
             evidence_board=(
                 EvidenceBoard.from_dict(data["evidence_board"])
                 if data.get("evidence_board") is not None

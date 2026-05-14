@@ -4,6 +4,9 @@
 # Logs
 logs/
 
+#data
+data
+
 # Local runtime outputs
 /output/
 

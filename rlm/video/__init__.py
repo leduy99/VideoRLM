@@ -4,6 +4,7 @@ from rlm.video.adapters import (
     CallableOCRExtractor,
     CallableSpeechRecognizer,
     CallableVisualSummarizer,
+    ImageTextEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
     OpenAICompatibleSpeechRecognizer,
     OpenAICompatibleVisualSummarizer,
@@ -35,6 +36,7 @@ from rlm.video.qwen import (
     QwenVideoRuntimeBundle,
     QwenVideoStackConfig,
 )
+from rlm.video.semantic_embeddings import LocalImageTextEmbeddingProvider
 from rlm.video.traces import result_to_training_examples, save_training_examples
 from rlm.video.types import (
     ActionType,
@@ -49,12 +51,12 @@ from rlm.video.types import (
     FrontierItem,
     Modality,
     Observation,
-    OpenedTarget,
     OCRSpan,
+    OpenedTarget,
     QuestionSpec,
-    SpeechSpan,
     SlotRole,
     SlotStatus,
+    SpeechSpan,
     TimeSpan,
     TraceStep,
     VideoMemory,
@@ -72,6 +74,7 @@ __all__ = [
     "LONGSHOT_DATASET_PATH",
     "LONGSHOT_DATASET_SPLIT",
     "LocalModelConfig",
+    "LocalImageTextEmbeddingProvider",
     "LocalQwenASRSpeechRecognizer",
     "LocalQwenVisualSummarizer",
     "CallableAudioEventExtractor",
@@ -92,6 +95,7 @@ __all__ = [
     "OCRSpan",
     "Observation",
     "OpenedTarget",
+    "ImageTextEmbeddingProvider",
     "OpenAICompatibleEmbeddingProvider",
     "OpenAICompatibleModelConfig",
     "OpenAICompatibleSpeechRecognizer",

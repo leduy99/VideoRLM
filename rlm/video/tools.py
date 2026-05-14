@@ -99,7 +99,7 @@ class VideoToolExecutor:
             modality=modality,
         )
         summary = (
-            f"SEARCH v2 found {len(frontier)} candidate nodes for "
+            f"SEARCH {metadata.get('search_mode', 'lexical')} found {len(frontier)} candidate nodes for "
             f"slot '{selected_slot or 'generic'}'."
         )
         return Observation(
@@ -109,6 +109,7 @@ class VideoToolExecutor:
             metadata={
                 "query": query,
                 "modality": metadata["modality"],
+                "search_mode": metadata.get("search_mode", "lexical"),
                 "hit_count": len(frontier),
                 "target_slot": selected_slot,
                 "queries": metadata["queries"],
@@ -153,7 +154,11 @@ class VideoToolExecutor:
         if selected_modality == "speech":
             raw_evidence = self._build_speech_evidence(node, state)
         else:
-            detail = self._build_detail(node, selected_modality)
+            detail, detail_metadata = self._build_detail_with_metadata(
+                node,
+                selected_modality,
+                state,
+            )
             if detail:
                 raw_evidence = [
                     Evidence(
@@ -164,7 +169,7 @@ class VideoToolExecutor:
                         source_node_id=node.node_id,
                         confidence=self._confidence_from_detail(detail),
                         detail=detail,
-                        metadata={"clip_path": node.clip_path},
+                        metadata={"clip_path": node.clip_path, **detail_metadata},
                     )
                 ]
             else:
@@ -278,16 +283,92 @@ class VideoToolExecutor:
         )
 
     def _build_detail(self, node, modality: Modality) -> str:
+        detail, _ = self._build_detail_with_metadata(node, modality, state=None)
+        return detail
+
+    def _build_detail_with_metadata(
+        self,
+        node,
+        modality: Modality,
+        state: ControllerState | None,
+    ) -> tuple[str, dict[str, object]]:
         if modality == "speech":
-            return " ".join(item.text.strip() for item in node.speech_spans if item.text).strip()
+            detail = " ".join(item.text.strip() for item in node.speech_spans if item.text).strip()
+            return detail, {}
         if modality == "visual":
-            return node.visual_summary.strip()
+            return self._build_visual_detail(node, state)
         if modality == "ocr":
-            return " ".join(item.text.strip() for item in node.ocr_spans if item.text).strip()
+            detail = " ".join(item.text.strip() for item in node.ocr_spans if item.text).strip()
+            return detail, {}
         if modality == "audio":
             labels = [item.label.strip() for item in node.audio_events if item.label]
-            return ", ".join(labels).strip()
-        return ""
+            return ", ".join(labels).strip(), {}
+        return "", {}
+
+    def _build_visual_detail(
+        self,
+        node,
+        state: ControllerState | None,
+        *,
+        max_child_details: int = 2,
+        max_child_chars: int = 900,
+    ) -> tuple[str, dict[str, object]]:
+        detail = node.visual_summary.strip()
+        if node.metadata.get("visual_summary_mode") != "compact_parent_rollup":
+            return detail, {}
+
+        detail_node_ids = [
+            str(node_id)
+            for node_id in node.metadata.get("visual_detail_node_ids", [])
+            if node_id in self.memory.nodes
+        ]
+        selected_children = self._select_visual_detail_children(
+            detail_node_ids,
+            state,
+            max_child_details,
+        )
+        if not selected_children:
+            return detail, {"visual_summary_mode": "compact_parent_rollup"}
+
+        parts = [detail, "Selected child visual details:"]
+        selected_ids = []
+        for child in selected_children:
+            selected_ids.append(child.node_id)
+            child_detail = " ".join(child.visual_summary.split())
+            if len(child_detail) > max_child_chars:
+                child_detail = child_detail[: max_child_chars - 3] + "..."
+            parts.append(f"[{child.node_id} {child.time_span.to_display()}] {child_detail}")
+        return "\n".join(parts), {
+            "visual_summary_mode": "compact_parent_rollup",
+            "selected_child_node_ids": selected_ids,
+        }
+
+    def _select_visual_detail_children(
+        self,
+        detail_node_ids: list[str],
+        state: ControllerState | None,
+        max_child_details: int,
+    ):
+        if not detail_node_ids:
+            return []
+        query_text = ""
+        if state is not None:
+            query_text = " ".join(
+                part for part in [state.question, self._latest_search_query(state)] if part
+            )
+        query_tokens = self._tokenize(query_text)
+        scored = []
+        for position, node_id in enumerate(detail_node_ids):
+            child = self.memory.get_node(node_id)
+            child_tokens = self._tokenize(child.visual_summary)
+            overlap = len(query_tokens & child_tokens) if query_tokens else 0
+            scored.append((overlap, position, child.time_span.start, child))
+        scored.sort(key=lambda item: (-item[0], item[1], item[2], item[3].node_id))
+        if any(score > 0 for score, *_ in scored):
+            selected = [child for score, *_rest, child in scored if score > 0]
+        else:
+            selected = [child for *_rest, child in scored]
+        return selected[:max_child_details]
 
     def _to_claim(self, detail: str, modality: Modality) -> str:
         cleaned = " ".join(detail.split())
@@ -376,7 +457,9 @@ class VideoToolExecutor:
         for index, candidate in enumerate(candidates):
             recommended = self._prioritized_modalities(candidate, modality)
             preferred_modality = recommended[0] if recommended else modality
-            if is_reopen_blocked(state.evidence_board, candidate.node_id, preferred_modality, target_slot):
+            if is_reopen_blocked(
+                state.evidence_board, candidate.node_id, preferred_modality, target_slot
+            ):
                 continue
             frontier.append(
                 FrontierItem(
@@ -404,7 +487,9 @@ class VideoToolExecutor:
         evidence: list[Evidence] = []
         query_hint = self._latest_search_query(state)
         question_tokens = self._tokenize(state.question)
-        query_tokens = self._tokenize(" ".join(part for part in [state.question, query_hint] if part))
+        query_tokens = self._tokenize(
+            " ".join(part for part in [state.question, query_hint] if part)
+        )
         is_first_query = bool({"first", "beginning", "earliest", "initial"} & question_tokens)
         is_last_query = bool({"last", "final", "ending", "end"} & question_tokens)
         for position, (span, score) in enumerate(selected_spans):
@@ -462,7 +547,9 @@ class VideoToolExecutor:
             return []
 
         query_hint = self._latest_search_query(state)
-        query_tokens = self._tokenize(" ".join(part for part in [state.question, query_hint] if part))
+        query_tokens = self._tokenize(
+            " ".join(part for part in [state.question, query_hint] if part)
+        )
         question_tokens = self._tokenize(state.question)
         scored = [
             (
@@ -501,8 +588,10 @@ class VideoToolExecutor:
             neighbor_has_why_signal = is_why_query and self._span_has_why_signal(
                 cleaned_spans[neighbor_index]
             )
-            if neighbor_score >= max(best_score * 0.35, 0.15) or neighbor_has_why_signal or (
-                (is_first_query or is_last_query) and neighbor_score >= 0.05
+            if (
+                neighbor_score >= max(best_score * 0.35, 0.15)
+                or neighbor_has_why_signal
+                or ((is_first_query or is_last_query) and neighbor_score >= 0.05)
             ):
                 selected_indices.add(neighbor_index)
             if len(selected_indices) >= max_items:
@@ -520,8 +609,12 @@ class VideoToolExecutor:
                 if len(selected_indices) >= max_items:
                     break
 
-        ordered_indices = sorted(selected_indices, key=lambda index: cleaned_spans[index].time_span.start)
-        return [(cleaned_spans[index], score_by_index[index]) for index in ordered_indices[:max_items]]
+        ordered_indices = sorted(
+            selected_indices, key=lambda index: cleaned_spans[index].time_span.start
+        )
+        return [
+            (cleaned_spans[index], score_by_index[index]) for index in ordered_indices[:max_items]
+        ]
 
     def _score_speech_span(
         self,
@@ -554,7 +647,12 @@ class VideoToolExecutor:
         )
         topic_shift_hits = sum(
             1
-            for marker in ("other bracelet", "another bracelet", "last but not the least", "last but not least")
+            for marker in (
+                "other bracelet",
+                "another bracelet",
+                "last but not the least",
+                "last but not least",
+            )
             if marker in lower_text
         )
 
@@ -673,7 +771,16 @@ class VideoToolExecutor:
 
         if is_why_query and any(
             keyword in lower_sentence
-            for keyword in ("because", "worried", "lose", "lost", "fixed", "repair", "opening", "clasp")
+            for keyword in (
+                "because",
+                "worried",
+                "lose",
+                "lost",
+                "fixed",
+                "repair",
+                "opening",
+                "clasp",
+            )
         ):
             score += 8
             sentence_anchor_kind = "causal"
@@ -989,10 +1096,25 @@ class VideoToolExecutor:
                 "another bracelet",
             )
         )
-        return bool(
-            {"why", "first", "beginning", "earliest", "initial", "last", "final", "ending", "end"}
-            & question_tokens
-        ) or len(normalized) > 320 or len(sentences) > 4 or topic_shift
+        return (
+            bool(
+                {
+                    "why",
+                    "first",
+                    "beginning",
+                    "earliest",
+                    "initial",
+                    "last",
+                    "final",
+                    "ending",
+                    "end",
+                }
+                & question_tokens
+            )
+            or len(normalized) > 320
+            or len(sentences) > 4
+            or topic_shift
+        )
 
     def _build_speech_refinement_prompt(
         self,
@@ -1003,9 +1125,7 @@ class VideoToolExecutor:
     ) -> str:
         candidate_lines = []
         for candidate in candidates:
-            candidate_lines.append(
-                f"{candidate['candidate_id']}: {candidate['detail']}"
-            )
+            candidate_lines.append(f"{candidate['candidate_id']}: {candidate['detail']}")
         candidate_block = "\n".join(candidate_lines)
         return (
             "You are selecting grounded transcript snippets for a long-video QA tool.\n"
@@ -1037,14 +1157,18 @@ class VideoToolExecutor:
             if match:
                 parsed = json.loads(match.group(0))
         if parsed is not None:
-            raw_ids = parsed.get("selected_candidate_ids") or parsed.get("selected_candidates") or []
+            raw_ids = (
+                parsed.get("selected_candidate_ids") or parsed.get("selected_candidates") or []
+            )
             if isinstance(raw_ids, list):
                 candidate_ids = [str(item) for item in raw_ids if str(item) in valid_ids]
             raw_reason = parsed.get("reason")
             if raw_reason is not None:
                 reason = str(raw_reason).strip()
         if not candidate_ids:
-            candidate_ids = [match for match in re.findall(r"c\d+", payload.lower()) if match in valid_ids]
+            candidate_ids = [
+                match for match in re.findall(r"c\d+", payload.lower()) if match in valid_ids
+            ]
         deduped_ids: list[str] = []
         seen_ids: set[str] = set()
         for candidate_id in candidate_ids:
@@ -1088,7 +1212,9 @@ class VideoToolExecutor:
     ) -> str:
         selected = [anchor_index]
         backward_indices = list(range(max(0, anchor_index - before), anchor_index))
-        forward_indices = list(range(anchor_index + 1, min(len(sentences), anchor_index + after + 1)))
+        forward_indices = list(
+            range(anchor_index + 1, min(len(sentences), anchor_index + after + 1))
+        )
 
         if prefer == "backward":
             candidate_indices = list(reversed(backward_indices)) + forward_indices

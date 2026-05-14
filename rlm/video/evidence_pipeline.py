@@ -52,7 +52,17 @@ GENERIC_SLOT_KEYWORDS: dict[str, list[str]] = {
         "tasted",
     ],
     "why_different": ["different", "not regular", "unusual", "realize", "street food"],
-    "reaction": ["reaction", "responded", "said", "felt", "tasted", "tastes", "bite", "bit", "surprised"],
+    "reaction": [
+        "reaction",
+        "responded",
+        "said",
+        "felt",
+        "tasted",
+        "tastes",
+        "bite",
+        "bit",
+        "surprised",
+    ],
     "anchor_event": ["stopped", "stared", "paused", "chasing", "moving"],
     "mouse_reaction": ["mouse", "reaction", "responded", "paused", "looked"],
     "shared_sensing": ["both", "seemed", "sensed", "noticed", "realized"],
@@ -176,7 +186,6 @@ def build_question_spec(
                 description=_reason_description(question),
                 required=True,
                 preferred_modality=preferred_modality,
-                preferred_modality=preferred_modality,
             ),
         ]
     elif {"first", "earliest", "initial", "beginning"} & tokens:
@@ -284,7 +293,9 @@ def build_evidence_board(question_spec: QuestionSpec) -> EvidenceBoard:
     return EvidenceBoard(
         question_type=question_spec.question_type,
         slots=slots,
-        missing_required_slots=[slot.slot for slot in question_spec.required_slots if slot.required],
+        missing_required_slots=[
+            slot.slot for slot in question_spec.required_slots if slot.required
+        ],
     )
 
 
@@ -367,6 +378,7 @@ def search_v2(
         "target_slot": target_slot,
         "queries": queries,
         "modality": selected_modality,
+        "search_mode": getattr(index, "search_mode", "lexical"),
         "searched_modalities": search_modalities,
         "hit_count": len(frontier),
         "query_sources": dict(query_sources),
@@ -432,7 +444,9 @@ def open_v2(
     missing_slots = [
         slot.slot
         for slot in question_spec.required_slots
-        if slot.required and slot.slot not in filled_slots and not _slot_already_filled(state, slot.slot)
+        if slot.required
+        and slot.slot not in filled_slots
+        and not _slot_already_filled(state, slot.slot)
     ]
     no_new_information = not classified
     if classified and all(item.metadata.get("role") == "background" for item in classified):
@@ -450,9 +464,7 @@ def open_v2(
         "duplicate_evidence_count": duplicate_count,
         "suggested_queries": suggested_queries,
         "progress_made": bool(filled_slots)
-        or any(
-            item.metadata.get("role") == "support" for item in classified
-        )
+        or any(item.metadata.get("role") == "support" for item in classified)
         or refinement_progress,
         "result": _open_result_label(classified, background_only, no_new_information),
     }
@@ -488,7 +500,9 @@ def update_evidence_board(
                 hinted_queries,
                 limit=6,
             )
-        refinement_node_ids = [node_id for node_id in metadata.get("refinement_node_ids", []) if node_id]
+        refinement_node_ids = [
+            node_id for node_id in metadata.get("refinement_node_ids", []) if node_id
+        ]
         if refinement_node_ids:
             board.slot_refinement_node_ids[target_slot] = _merge_unique_strings(
                 board.slot_refinement_node_ids.get(target_slot, []),
@@ -496,9 +510,7 @@ def update_evidence_board(
                 limit=8,
             )
 
-    filled_slots_before = {
-        name for name, slot in board.slots.items() if slot.status == "filled"
-    }
+    filled_slots_before = {name for name, slot in board.slots.items() if slot.status == "filled"}
     for item in observation.evidence:
         slot_name = item.metadata.get("slot")
         role = item.metadata.get("role")
@@ -524,9 +536,7 @@ def update_evidence_board(
     if metadata.get("background_only"):
         board.background_only_open_count += 1
 
-    filled_slots_after = {
-        name for name, slot in board.slots.items() if slot.status == "filled"
-    }
+    filled_slots_after = {name for name, slot in board.slots.items() if slot.status == "filled"}
     board.slot_fill_count += max(0, len(filled_slots_after - filled_slots_before))
     board.missing_required_slots = [
         slot.slot
@@ -657,7 +667,9 @@ def _search_modalities(modality: Modality, question: str) -> list[Modality]:
     if modality == "cross_modal":
         return ["speech", "visual", "ocr", "audio"]
     if modality == "visual":
-        if _has_route_signal(question.lower(), _tokenize(question), VISUAL_ROUTE_TERMS, VISUAL_ROUTE_PHRASES):
+        if _has_route_signal(
+            question.lower(), _tokenize(question), VISUAL_ROUTE_TERMS, VISUAL_ROUTE_PHRASES
+        ):
             return ["visual", "ocr"]
         return ["visual"]
     if modality == "ocr":
@@ -986,7 +998,8 @@ def _infer_preferred_modality(question: str, task_type: str | None) -> Modality:
     if any(cue in lowered for cue in visual_cues):
         return "visual"
     if task_type in {"information_retrieval", "multimodal_synthesis"} and any(
-        cue in lowered for cue in ("how did", "what happened when", "what did they both", "what did she do")
+        cue in lowered
+        for cue in ("how did", "what happened when", "what did they both", "what did she do")
     ):
         return "visual"
     return "speech"

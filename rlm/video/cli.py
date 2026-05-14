@@ -50,7 +50,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Build memory assuming clip-only PiToMe visual summaries.",
     )
-    build_memory.add_argument("--verbose", action="store_true", help="Print live progress to stdout")
+    build_memory.add_argument(
+        "--parent-visual-summary-mode",
+        choices=["auto", "full", "compact"],
+        default="auto",
+        help=(
+            "How scene/segment nodes store child visual summaries. "
+            "auto uses compact parent rollups for PiToMe and full summaries otherwise."
+        ),
+    )
+    build_memory.add_argument(
+        "--verbose", action="store_true", help="Print live progress to stdout"
+    )
 
     ask = subparsers.add_parser(
         "ask",
@@ -63,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--log-dir")
     ask.add_argument("--max-steps", type=int, default=8)
     ask.add_argument("--search-top-k", type=int, default=5)
+    ask.add_argument("--search-mode", choices=["lexical", "graph"], default="lexical")
     ask.add_argument("--max-frontier-items", type=int, default=8)
     ask.add_argument("--controller-model", default="Qwen3-8B")
     ask.add_argument("--controller-base-url", required=True)
@@ -74,7 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run VideoRLM on LongShOTBench samples and emit LongShOT-compatible predictions.",
     )
     longshot.add_argument("--output", required=True, help="Output JSONL file")
-    longshot.add_argument("--video-dir", required=True, help="Directory containing benchmark videos")
+    longshot.add_argument(
+        "--video-dir", required=True, help="Directory containing benchmark videos"
+    )
     longshot.add_argument("--dataset-path", default="MBZUAI/longshot-bench")
     longshot.add_argument("--dataset-name", default="postvalid_v1")
     longshot.add_argument("--split", default="test")
@@ -119,7 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run VideoRLM on LongShOTBench using local Hugging Face Qwen checkpoints.",
     )
     longshot_local.add_argument("--output", required=True, help="Output JSONL file")
-    longshot_local.add_argument("--video-dir", required=True, help="Directory containing benchmark videos")
+    longshot_local.add_argument(
+        "--video-dir", required=True, help="Directory containing benchmark videos"
+    )
     longshot_local.add_argument("--dataset-path", default="MBZUAI/longshot-bench")
     longshot_local.add_argument("--dataset-name", default="postvalid_v1")
     longshot_local.add_argument("--split", default="test")
@@ -142,7 +158,9 @@ def build_parser() -> argparse.ArgumentParser:
     longshot_local.add_argument("--clip-duration-seconds", type=float, default=15.0)
     longshot_local.add_argument("--ffmpeg-bin", default="ffmpeg")
     longshot_local.add_argument("--log-dir")
-    longshot_local.add_argument("--verbose", action="store_true", help="Print live progress to stdout")
+    longshot_local.add_argument(
+        "--verbose", action="store_true", help="Print live progress to stdout"
+    )
     longshot_local.add_argument("--controller-device", default="cuda:0")
     longshot_local.add_argument("--visual-device", default="cuda:1")
     longshot_local.add_argument("--speech-device", default="cuda:2")
@@ -156,7 +174,9 @@ def build_parser() -> argparse.ArgumentParser:
     official_eval.add_argument("--predictions", required=True, help="Input predictions JSONL file")
     official_eval.add_argument("--eval-output", required=True, help="Output evaluated JSONL file")
     official_eval.add_argument("--score-output", required=True, help="Human-readable score report")
-    official_eval.add_argument("--summary-output", required=True, help="Machine-readable score summary")
+    official_eval.add_argument(
+        "--summary-output", required=True, help="Machine-readable score summary"
+    )
     official_eval.add_argument("--judge-repo", default="Qwen/Qwen3-14B")
     official_eval.add_argument("--judge-model-path")
     official_eval.add_argument("--judge-device", default="cuda:0")
@@ -210,6 +230,7 @@ def _cmd_build_memory(args: argparse.Namespace) -> int:
         clip_duration_seconds=args.clip_duration_seconds,
         visual_span_mode="clip" if args.use_pitome else "scene_and_clip",
         aggregate_child_visual_summaries=args.use_pitome,
+        parent_visual_summary_mode=_resolve_parent_visual_summary_mode(args),
         verbose=args.verbose,
     )
     artifacts = _load_artifacts(builder, args.artifacts)
@@ -238,7 +259,9 @@ def _cmd_run_longshot(args: argparse.Namespace) -> int:
     logger = _build_logger(args)
     bundle = _build_qwen_bundle(args, logger=logger)
     output_path = Path(args.output)
-    artifact_dir = Path(args.artifacts_dir) if args.artifacts_dir else output_path.parent / "artifacts"
+    artifact_dir = (
+        Path(args.artifacts_dir) if args.artifacts_dir else output_path.parent / "artifacts"
+    )
     memory_dir = Path(args.memory_dir) if args.memory_dir else output_path.parent / "memories"
     trace_dir = Path(args.trace_dir) if args.trace_dir else None
 
@@ -289,7 +312,9 @@ def _cmd_run_longshot_local(args: argparse.Namespace) -> int:
         max_frontier_items=args.max_frontier_items,
     )
     output_path = Path(args.output)
-    artifact_dir = Path(args.artifacts_dir) if args.artifacts_dir else output_path.parent / "artifacts"
+    artifact_dir = (
+        Path(args.artifacts_dir) if args.artifacts_dir else output_path.parent / "artifacts"
+    )
     memory_dir = Path(args.memory_dir) if args.memory_dir else output_path.parent / "memories"
     trace_dir = Path(args.trace_dir) if args.trace_dir else None
 
@@ -356,6 +381,7 @@ def _build_runner(args: argparse.Namespace, logger: VideoRLMLogger | None = None
         max_steps=args.max_steps,
         search_top_k=args.search_top_k,
         max_frontier_items=args.max_frontier_items,
+        search_mode=args.search_mode,
     )
 
 
@@ -400,8 +426,27 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
         visual_model=args.visual_repo,
         speech_model=args.speech_repo,
         forced_aligner_model=None if args.no_forced_aligner else args.forced_aligner_repo,
+        semantic_frame_embedding_model=getattr(args, "semantic_frame_embedding_repo", None),
+        semantic_frame_embedding_device=getattr(
+            args,
+            "semantic_frame_embedding_device",
+            "cpu",
+        ),
+        semantic_frame_embedding_torch_dtype=getattr(
+            args,
+            "semantic_frame_embedding_torch_dtype",
+            "float32",
+        ),
         torch_dtype=args.torch_dtype,
         attn_implementation=args.attn_implementation,
+    )
+    semantic_model_path = getattr(args, "semantic_frame_embedding_model_path", None)
+    if config.semantic_frame_embedding is not None and semantic_model_path:
+        config.semantic_frame_embedding.model_path = semantic_model_path
+    config.semantic_frame_embedding_batch_size = getattr(
+        args,
+        "semantic_frame_embedding_batch_size",
+        8,
     )
     config.ffmpeg_bin = getattr(args, "ffmpeg_bin", "ffmpeg")
     config.frame_count = getattr(args, "frame_count", 3)
@@ -444,6 +489,21 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pitome-embedding-backend", choices=["pixel", "hybrid"], default="pixel")
     parser.add_argument("--pitome-anchor-frame-count", type=int, default=0)
     parser.add_argument("--pitome-max-selected-frames", type=int)
+    parser.add_argument(
+        "--parent-visual-summary-mode",
+        choices=["auto", "full", "compact"],
+        default="auto",
+        help=(
+            "How scene/segment nodes store child visual summaries. "
+            "auto uses compact parent rollups for PiToMe and full summaries otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--search-mode",
+        choices=["auto", "lexical", "graph"],
+        default="auto",
+        help="Search backend. auto uses graph search for PiToMe and lexical search otherwise.",
+    )
 
 
 def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
@@ -456,6 +516,17 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
     config.pitome_embedding_backend = getattr(args, "pitome_embedding_backend", "pixel")
     config.pitome_anchor_frame_count = getattr(args, "pitome_anchor_frame_count", 0)
     config.pitome_max_selected_frames = getattr(args, "pitome_max_selected_frames", None)
+    parent_mode = getattr(args, "parent_visual_summary_mode", "auto")
+    config.parent_visual_summary_mode = None if parent_mode == "auto" else parent_mode
+    search_mode = getattr(args, "search_mode", "auto")
+    config.search_mode = None if search_mode == "auto" else search_mode
+
+
+def _resolve_parent_visual_summary_mode(args: argparse.Namespace) -> str:
+    parent_mode = getattr(args, "parent_visual_summary_mode", "auto")
+    if parent_mode != "auto":
+        return parent_mode
+    return "compact" if getattr(args, "use_pitome", False) else "full"
 
 
 def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
@@ -466,6 +537,17 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-forced-aligner", action="store_true")
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--attn-implementation")
+    parser.add_argument(
+        "--semantic-frame-embedding-repo",
+        help=(
+            "Optional local image-text embedding model for PiToMe selected frames, "
+            "for example openai/clip-vit-base-patch32."
+        ),
+    )
+    parser.add_argument("--semantic-frame-embedding-model-path")
+    parser.add_argument("--semantic-frame-embedding-device", default="cpu")
+    parser.add_argument("--semantic-frame-embedding-torch-dtype", default="float32")
+    parser.add_argument("--semantic-frame-embedding-batch-size", type=int, default=8)
 
 
 if __name__ == "__main__":

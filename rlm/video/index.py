@@ -1,11 +1,19 @@
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Literal
 
-from rlm.video.adapters import EmbeddingProvider
+from rlm.video.adapters import EmbeddingProvider, ImageTextEmbeddingProvider
 from rlm.video.types import FrontierItem, Modality, TimeSpan, VideoMemory, VideoNodeLevel
 
 TOKEN_PATTERN = re.compile(r"\b\w+\b")
+SearchMode = Literal["lexical", "graph"]
+GRAPH_MODALITIES = {"visual", "ocr"}
+FRAME_SIMILARITY_THRESHOLD = 0.88
+SEMANTIC_FRAME_SIMILARITY_THRESHOLD = 0.16
+SEMANTIC_FRAME_EDGE_THRESHOLD = 0.78
+MAX_FRAME_SIMILARITY_NEIGHBORS = 3
+MAX_SEMANTIC_FRAME_SIMILARITY_NEIGHBORS = 3
 STOPWORDS = {
     "a",
     "an",
@@ -111,16 +119,39 @@ class VideoMemoryIndex:
         self,
         memory: VideoMemory,
         embedding_provider: EmbeddingProvider | None = None,
+        image_text_embedding_provider: ImageTextEmbeddingProvider | None = None,
         lexical_weight: float = 0.7,
         semantic_weight: float = 0.3,
+        search_mode: SearchMode = "lexical",
     ):
+        if search_mode not in {"lexical", "graph"}:
+            raise ValueError(f"Unsupported search mode: {search_mode}")
         self.memory = memory
         self.embedding_provider = embedding_provider
+        self.image_text_embedding_provider = image_text_embedding_provider
         self.lexical_weight = lexical_weight
         self.semantic_weight = semantic_weight
+        self.search_mode = search_mode
         self._embedding_cache: dict[tuple[str, str], list[float]] = {}
+        self._image_text_embedding_cache: dict[str, list[float]] = {}
 
     def search(
+        self,
+        query: str,
+        modality: Modality | None = None,
+        top_k: int = 5,
+        levels: Iterable[VideoNodeLevel] | None = None,
+    ) -> list[SearchHit]:
+        if self.search_mode == "graph" and (modality in GRAPH_MODALITIES or modality is None):
+            return self.graph_search(
+                query=query,
+                modality=modality,
+                top_k=top_k,
+                levels=levels,
+            )
+        return self.lexical_search(query=query, modality=modality, top_k=top_k, levels=levels)
+
+    def lexical_search(
         self,
         query: str,
         modality: Modality | None = None,
@@ -147,6 +178,597 @@ class VideoMemoryIndex:
 
         hits.sort(key=lambda item: (-item.score, item.time_span.start, item.node_id))
         return hits[:top_k]
+
+    def graph_search(
+        self,
+        query: str,
+        modality: Modality | None = None,
+        top_k: int = 5,
+        levels: Iterable[VideoNodeLevel] | None = None,
+    ) -> list[SearchHit]:
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+
+        allowed_levels = set(levels) if levels else None
+        seed_hits = self.lexical_search(
+            query=query,
+            modality=modality,
+            top_k=max(top_k * 4, 12),
+            levels=levels,
+        )
+
+        candidates: dict[str, SearchHit] = {}
+        score_sources: dict[str, list[float]] = {}
+        source_terms: dict[str, set[str]] = {}
+        source_reasons: dict[str, list[str]] = {}
+        query_lower = query.lower()
+
+        for seed in seed_hits:
+            self._add_graph_candidate(
+                candidates=candidates,
+                score_sources=score_sources,
+                source_terms=source_terms,
+                source_reasons=source_reasons,
+                node_id=seed.node_id,
+                modality=seed.modality,
+                score=seed.score + self._graph_level_bias(seed.level, seed.modality),
+                matched_terms=seed.matched_terms,
+                reason="seed",
+            )
+            for neighbor_id, edge_weight, edge_reason in self._graph_neighbors(seed.node_id):
+                neighbor = self.memory.get_node(neighbor_id)
+                if neighbor.level == "video":
+                    continue
+                if allowed_levels and neighbor.level not in allowed_levels:
+                    continue
+                neighbor_text = self._node_text(neighbor, seed.modality)
+                direct_score, direct_overlap = self._lexical_score(
+                    query_lower,
+                    query_tokens,
+                    neighbor_text,
+                )
+                graph_score = (seed.score * edge_weight) + (direct_score * 0.45)
+                graph_score += self._temporal_score(query_tokens, neighbor.time_span)
+                graph_score += self._graph_level_bias(neighbor.level, seed.modality)
+                if graph_score <= 0:
+                    continue
+                self._add_graph_candidate(
+                    candidates=candidates,
+                    score_sources=score_sources,
+                    source_terms=source_terms,
+                    source_reasons=source_reasons,
+                    node_id=neighbor.node_id,
+                    modality=seed.modality,
+                    score=round(graph_score, 4),
+                    matched_terms=sorted(set(seed.matched_terms) | set(direct_overlap)),
+                    reason=edge_reason,
+                )
+
+        if seed_hits:
+            self._add_frame_similarity_candidates(
+                seed_hits=seed_hits,
+                query_lower=query_lower,
+                query_tokens=query_tokens,
+                allowed_levels=allowed_levels,
+                candidates=candidates,
+                score_sources=score_sources,
+                source_terms=source_terms,
+                source_reasons=source_reasons,
+            )
+        self._add_semantic_frame_candidates(
+            query=query,
+            query_lower=query_lower,
+            query_tokens=query_tokens,
+            modality=modality,
+            top_k=top_k,
+            allowed_levels=allowed_levels,
+            candidates=candidates,
+            score_sources=score_sources,
+            source_terms=source_terms,
+            source_reasons=source_reasons,
+        )
+
+        if not candidates:
+            return []
+
+        for node_id, hit in candidates.items():
+            scores = score_sources[node_id]
+            hit.score = round(max(scores), 4)
+            hit.matched_terms = sorted(source_terms[node_id])
+            hit.reason = self._build_graph_reason(
+                modality=hit.modality,
+                node_id=node_id,
+                source_reasons=source_reasons[node_id],
+                matched_terms=hit.matched_terms,
+            )
+            hit.score_breakdown = {
+                "graph": hit.score,
+                "sources": float(len(scores)),
+                "mode": 1.0,
+            }
+
+        hits = list(candidates.values())
+        hits.sort(
+            key=lambda item: (
+                -item.score,
+                self._graph_level_rank(item.level),
+                item.time_span.start,
+                item.node_id,
+            )
+        )
+        return hits[:top_k]
+
+    def _add_graph_candidate(
+        self,
+        *,
+        candidates: dict[str, SearchHit],
+        score_sources: dict[str, list[float]],
+        source_terms: dict[str, set[str]],
+        source_reasons: dict[str, list[str]],
+        node_id: str,
+        modality: Modality,
+        score: float,
+        matched_terms: list[str],
+        reason: str,
+    ) -> None:
+        node = self.memory.get_node(node_id)
+        if node_id not in candidates:
+            candidates[node_id] = SearchHit(
+                node_id=node.node_id,
+                time_span=node.time_span,
+                level=node.level,
+                score=score,
+                reason=reason,
+                modality=modality,
+                matched_terms=list(matched_terms),
+            )
+            score_sources[node_id] = []
+            source_terms[node_id] = set()
+            source_reasons[node_id] = []
+        score_sources[node_id].append(score)
+        source_terms[node_id].update(matched_terms)
+        if reason not in source_reasons[node_id]:
+            source_reasons[node_id].append(reason)
+
+    def _graph_neighbors(self, node_id: str) -> list[tuple[str, float, str]]:
+        node = self.memory.get_node(node_id)
+        neighbors: list[tuple[str, float, str]] = []
+
+        for detail_node_id in node.metadata.get("visual_detail_node_ids", []):
+            if detail_node_id in self.memory.nodes:
+                neighbors.append((str(detail_node_id), 0.95, "visual-detail"))
+
+        child_weight = (
+            0.78 if node.metadata.get("visual_summary_mode") == "compact_parent_rollup" else 0.62
+        )
+        for child_id in node.children:
+            neighbors.append((child_id, child_weight, "child"))
+
+        if node.parent_id:
+            neighbors.append((node.parent_id, 0.28, "parent"))
+            parent = self.memory.get_node(node.parent_id)
+            siblings = parent.children
+            if node_id in siblings:
+                index = siblings.index(node_id)
+                for sibling_index in (index - 1, index + 1):
+                    if 0 <= sibling_index < len(siblings):
+                        neighbors.append((siblings[sibling_index], 0.36, "temporal-sibling"))
+
+        for neighbor_id, similarity in self._frame_similarity_neighbors(node_id):
+            edge_weight = 0.22 + (similarity * 0.18)
+            neighbors.append((neighbor_id, edge_weight, f"frame-similarity:{similarity:.2f}"))
+
+        for neighbor_id, similarity in self._semantic_frame_similarity_neighbors(node_id):
+            edge_weight = 0.3 + (similarity * 0.2)
+            neighbors.append(
+                (neighbor_id, edge_weight, f"semantic-frame-edge:{similarity:.2f}")
+            )
+
+        return self._dedupe_graph_neighbors(neighbors, node_id)
+
+    def _add_frame_similarity_candidates(
+        self,
+        *,
+        seed_hits: list[SearchHit],
+        query_lower: str,
+        query_tokens: set[str],
+        allowed_levels: set[VideoNodeLevel] | None,
+        candidates: dict[str, SearchHit],
+        score_sources: dict[str, list[float]],
+        source_terms: dict[str, set[str]],
+        source_reasons: dict[str, list[str]],
+    ) -> None:
+        seed_groups: list[tuple[SearchHit, str, list[list[float]]]] = []
+        for seed in seed_hits:
+            if seed.modality not in GRAPH_MODALITIES:
+                continue
+            for seed_node_id in self._frame_seed_node_ids(seed.node_id):
+                seed_embeddings = self._node_frame_embeddings(seed_node_id)
+                if seed_embeddings:
+                    seed_groups.append((seed, seed_node_id, seed_embeddings))
+
+        if not seed_groups:
+            return
+
+        for node in self.memory.nodes.values():
+            if node.level == "video":
+                continue
+            if allowed_levels and node.level not in allowed_levels:
+                continue
+            embeddings = self._node_frame_embeddings(node.node_id)
+            if not embeddings:
+                continue
+
+            best_score = 0.0
+            best_terms: set[str] = set()
+            best_modality: Modality | None = None
+            best_reason = ""
+            for seed, seed_node_id, seed_embeddings in seed_groups:
+                if node.node_id == seed_node_id:
+                    continue
+                similarity = self._max_frame_similarity(seed_embeddings, embeddings)
+                if similarity < FRAME_SIMILARITY_THRESHOLD:
+                    continue
+                direct_text = self._node_text(node, seed.modality)
+                direct_score, direct_overlap = self._lexical_score(
+                    query_lower,
+                    query_tokens,
+                    direct_text,
+                )
+                frame_score = min(
+                    1.0,
+                    max(
+                        0.0,
+                        (similarity - FRAME_SIMILARITY_THRESHOLD)
+                        / (1.0 - FRAME_SIMILARITY_THRESHOLD),
+                    ),
+                )
+                graph_score = (seed.score * 0.22) + (frame_score * 0.62)
+                graph_score += direct_score * 0.25
+                graph_score += self._temporal_score(query_tokens, node.time_span)
+                graph_score += self._graph_level_bias(node.level, seed.modality)
+                if graph_score <= best_score:
+                    continue
+                best_score = graph_score
+                best_terms = set(seed.matched_terms) | set(direct_overlap)
+                best_modality = seed.modality
+                best_reason = f"frame-similarity:{similarity:.2f}"
+
+            if best_modality is None:
+                continue
+            self._add_graph_candidate(
+                candidates=candidates,
+                score_sources=score_sources,
+                source_terms=source_terms,
+                source_reasons=source_reasons,
+                node_id=node.node_id,
+                modality=best_modality,
+                score=round(best_score, 4),
+                matched_terms=sorted(best_terms),
+                reason=best_reason,
+            )
+
+    def _add_semantic_frame_candidates(
+        self,
+        *,
+        query: str,
+        query_lower: str,
+        query_tokens: set[str],
+        modality: Modality | None,
+        top_k: int,
+        allowed_levels: set[VideoNodeLevel] | None,
+        candidates: dict[str, SearchHit],
+        score_sources: dict[str, list[float]],
+        source_terms: dict[str, set[str]],
+        source_reasons: dict[str, list[str]],
+    ) -> None:
+        if self.image_text_embedding_provider is None:
+            return
+        if modality not in GRAPH_MODALITIES and modality is not None:
+            return
+
+        query_embedding = self._image_text_embed_cached(query)
+        if not query_embedding:
+            return
+
+        matches: list[tuple[float, str, Modality, list[str], str]] = []
+        for node in self.memory.nodes.values():
+            if node.level == "video":
+                continue
+            if allowed_levels and node.level not in allowed_levels:
+                continue
+
+            frame_embeddings = self._node_semantic_frame_embeddings(node.node_id)
+            if not frame_embeddings:
+                continue
+            semantic_score = self._max_frame_similarity([query_embedding], frame_embeddings)
+            if semantic_score < SEMANTIC_FRAME_SIMILARITY_THRESHOLD:
+                continue
+
+            visual_text = self._node_text(node, "visual")
+            lexical_score, lexical_overlap = self._lexical_score(
+                query_lower,
+                query_tokens,
+                visual_text,
+            )
+            atom_score, atom_overlap = self._ocr_atom_score(
+                query_lower,
+                query_tokens,
+                node.node_id,
+            )
+            audio_score, audio_overlap = self._nearby_audio_score(
+                query_lower,
+                query_tokens,
+                node.node_id,
+            )
+            temporal_score = self._temporal_score(query_tokens, node.time_span)
+            score = (
+                (semantic_score * 0.55)
+                + (lexical_score * 0.2)
+                + (atom_score * 0.15)
+                + (audio_score * 0.15)
+                + temporal_score
+                + self._graph_level_bias(node.level, "visual")
+            )
+            reason_parts = [f"semantic-frame:{semantic_score:.2f}"]
+            if atom_score > 0:
+                reason_parts.append("ocr-atoms")
+            if audio_score > 0:
+                reason_parts.append("audio-nearby")
+            matches.append(
+                (
+                    round(score, 4),
+                    node.node_id,
+                    "visual",
+                    sorted(set(lexical_overlap) | set(atom_overlap) | set(audio_overlap)),
+                    ", ".join(reason_parts),
+                )
+            )
+
+        matches.sort(
+            key=lambda item: (-item[0], self.memory.get_node(item[1]).time_span.start, item[1])
+        )
+        for score, node_id, hit_modality, matched_terms, reason in matches[: max(top_k * 4, 12)]:
+            if score <= 0:
+                continue
+            self._add_graph_candidate(
+                candidates=candidates,
+                score_sources=score_sources,
+                source_terms=source_terms,
+                source_reasons=source_reasons,
+                node_id=node_id,
+                modality=hit_modality,
+                score=score,
+                matched_terms=matched_terms,
+                reason=reason,
+            )
+
+    def _frame_seed_node_ids(self, node_id: str) -> list[str]:
+        seed_ids: list[str] = []
+        node = self.memory.get_node(node_id)
+        if self._node_frame_embeddings(node_id):
+            seed_ids.append(node_id)
+        for detail_node_id in node.metadata.get("visual_detail_node_ids", []):
+            detail_id = str(detail_node_id)
+            if detail_id in self.memory.nodes and self._node_frame_embeddings(detail_id):
+                seed_ids.append(detail_id)
+        if not seed_ids:
+            for descendant_id in self._descendant_clip_ids(node_id):
+                if self._node_frame_embeddings(descendant_id):
+                    seed_ids.append(descendant_id)
+        return list(dict.fromkeys(seed_ids))
+
+    def _semantic_frame_seed_node_ids(self, node_id: str) -> list[str]:
+        seed_ids: list[str] = []
+        node = self.memory.get_node(node_id)
+        if self._node_semantic_frame_embeddings(node_id):
+            seed_ids.append(node_id)
+        for detail_node_id in node.metadata.get("visual_detail_node_ids", []):
+            detail_id = str(detail_node_id)
+            if detail_id in self.memory.nodes and self._node_semantic_frame_embeddings(detail_id):
+                seed_ids.append(detail_id)
+        if not seed_ids:
+            for descendant_id in self._descendant_clip_ids(node_id):
+                if self._node_semantic_frame_embeddings(descendant_id):
+                    seed_ids.append(descendant_id)
+        return list(dict.fromkeys(seed_ids))
+
+    def _descendant_clip_ids(self, node_id: str) -> list[str]:
+        descendants: list[str] = []
+        stack = list(self.memory.get_node(node_id).children)
+        while stack:
+            current_id = stack.pop(0)
+            current = self.memory.get_node(current_id)
+            if current.level == "clip":
+                descendants.append(current_id)
+            stack.extend(current.children)
+        return descendants
+
+    def _frame_similarity_neighbors(
+        self,
+        node_id: str,
+        *,
+        limit: int = MAX_FRAME_SIMILARITY_NEIGHBORS,
+    ) -> list[tuple[str, float]]:
+        source_embeddings = self._node_frame_embeddings(node_id)
+        if not source_embeddings:
+            return []
+        matches: list[tuple[str, float]] = []
+        for candidate in self.memory.nodes.values():
+            if candidate.node_id == node_id or candidate.level == "video":
+                continue
+            candidate_embeddings = self._node_frame_embeddings(candidate.node_id)
+            if not candidate_embeddings:
+                continue
+            similarity = self._max_frame_similarity(source_embeddings, candidate_embeddings)
+            if similarity >= FRAME_SIMILARITY_THRESHOLD:
+                matches.append((candidate.node_id, similarity))
+        matches.sort(
+            key=lambda item: (-item[1], self.memory.get_node(item[0]).time_span.start, item[0])
+        )
+        return matches[:limit]
+
+    def _semantic_frame_similarity_neighbors(
+        self,
+        node_id: str,
+        *,
+        limit: int = MAX_SEMANTIC_FRAME_SIMILARITY_NEIGHBORS,
+    ) -> list[tuple[str, float]]:
+        source_embeddings: list[list[float]] = []
+        for seed_node_id in self._semantic_frame_seed_node_ids(node_id):
+            source_embeddings.extend(self._node_semantic_frame_embeddings(seed_node_id))
+        if not source_embeddings:
+            return []
+
+        source_node_ids = set(self._semantic_frame_seed_node_ids(node_id))
+        matches: list[tuple[str, float]] = []
+        for candidate in self.memory.nodes.values():
+            if candidate.node_id == node_id or candidate.node_id in source_node_ids:
+                continue
+            if candidate.level == "video":
+                continue
+            candidate_embeddings = self._node_semantic_frame_embeddings(candidate.node_id)
+            if not candidate_embeddings:
+                continue
+            similarity = self._max_frame_similarity(source_embeddings, candidate_embeddings)
+            if similarity >= SEMANTIC_FRAME_EDGE_THRESHOLD:
+                matches.append((candidate.node_id, similarity))
+        matches.sort(
+            key=lambda item: (-item[1], self.memory.get_node(item[0]).time_span.start, item[0])
+        )
+        return matches[:limit]
+
+    def _node_frame_embeddings(self, node_id: str) -> list[list[float]]:
+        node = self.memory.get_node(node_id)
+        raw_embeddings = node.metadata.get("pitome_frame_embeddings", [])
+        if not isinstance(raw_embeddings, list):
+            return []
+        embeddings: list[list[float]] = []
+        for raw_embedding in raw_embeddings:
+            if not isinstance(raw_embedding, (list, tuple)):
+                continue
+            embeddings.append([float(value) for value in raw_embedding])
+        return embeddings
+
+    def _node_semantic_frame_embeddings(self, node_id: str) -> list[list[float]]:
+        node = self.memory.get_node(node_id)
+        raw_embeddings = node.metadata.get("semantic_frame_embeddings", [])
+        if not isinstance(raw_embeddings, list):
+            return []
+        embeddings: list[list[float]] = []
+        for raw_embedding in raw_embeddings:
+            if not isinstance(raw_embedding, (list, tuple)):
+                continue
+            embeddings.append([float(value) for value in raw_embedding])
+        return embeddings
+
+    def _max_frame_similarity(
+        self,
+        left_embeddings: list[list[float]],
+        right_embeddings: list[list[float]],
+    ) -> float:
+        best = 0.0
+        for left in left_embeddings:
+            for right in right_embeddings:
+                if len(left) != len(right):
+                    continue
+                best = max(best, self._cosine_similarity(left, right))
+        return round(best, 4)
+
+    def _ocr_atom_score(
+        self,
+        query_lower: str,
+        query_tokens: set[str],
+        node_id: str,
+    ) -> tuple[float, list[str]]:
+        node = self.memory.get_node(node_id)
+        text = " ".join(
+            [
+                " ".join(item.text for item in node.ocr_spans),
+                " ".join(str(item) for item in node.metadata.get("visual_atoms", [])),
+                " ".join(str(item) for item in node.metadata.get("visual_keywords", [])),
+            ]
+        )
+        return self._lexical_score(query_lower, query_tokens, text)
+
+    def _nearby_audio_score(
+        self,
+        query_lower: str,
+        query_tokens: set[str],
+        node_id: str,
+    ) -> tuple[float, list[str]]:
+        return self._lexical_score(query_lower, query_tokens, self._nearby_speech_text(node_id))
+
+    def _nearby_speech_text(self, node_id: str) -> str:
+        node = self.memory.get_node(node_id)
+        clip_duration = float(self.memory.metadata.get("clip_duration_seconds") or 0.0)
+        window_seconds = max(8.0, clip_duration)
+        start = node.time_span.start - window_seconds
+        end = node.time_span.end + window_seconds
+        texts: list[str] = []
+        seen: set[tuple[float, float, str]] = set()
+        for candidate in self.memory.nodes.values():
+            for span in candidate.speech_spans:
+                if span.time_span.end < start or span.time_span.start > end:
+                    continue
+                key = (
+                    round(span.time_span.start, 3),
+                    round(span.time_span.end, 3),
+                    span.text,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                texts.append(span.text)
+        return " ".join(texts)
+
+    def _dedupe_graph_neighbors(
+        self,
+        neighbors: list[tuple[str, float, str]],
+        node_id: str,
+    ) -> list[tuple[str, float, str]]:
+        best: dict[str, tuple[float, str]] = {}
+        for neighbor_id, weight, reason in neighbors:
+            if neighbor_id == node_id:
+                continue
+            current = best.get(neighbor_id)
+            if current is None or weight > current[0]:
+                best[neighbor_id] = (weight, reason)
+        return [(neighbor_id, weight, reason) for neighbor_id, (weight, reason) in best.items()]
+
+    def _graph_level_bias(self, level: VideoNodeLevel, modality: Modality) -> float:
+        if modality in GRAPH_MODALITIES:
+            return {
+                "clip": 0.18,
+                "segment": 0.06,
+                "scene": -0.04,
+                "video": -0.1,
+            }.get(level, 0.0)
+        return 0.0
+
+    def _graph_level_rank(self, level: VideoNodeLevel) -> int:
+        return {
+            "clip": 0,
+            "segment": 1,
+            "scene": 2,
+            "video": 3,
+        }.get(level, 4)
+
+    def _build_graph_reason(
+        self,
+        *,
+        modality: Modality,
+        node_id: str,
+        source_reasons: list[str],
+        matched_terms: list[str],
+    ) -> str:
+        parts = [f"Graph {modality} search"]
+        if matched_terms:
+            parts.append(f"matched terms {', '.join(matched_terms[:4])}")
+        if source_reasons:
+            parts.append(f"edges {', '.join(source_reasons[:3])}")
+        return f"{'; '.join(parts)} in node {node_id}"
 
     def _score_node(
         self,
@@ -209,7 +831,13 @@ class VideoMemoryIndex:
         if modality == "speech":
             return " ".join(item.text for item in node.speech_spans)
         if modality == "visual":
-            parts = [node.visual_summary, " ".join(node.tags), " ".join(node.entities)]
+            parts = [
+                node.visual_summary,
+                " ".join(node.tags),
+                " ".join(node.entities),
+                " ".join(str(item) for item in node.metadata.get("visual_keywords", [])),
+                " ".join(str(item) for item in node.metadata.get("visual_atoms", [])),
+            ]
             return " ".join(part for part in parts if part)
         if modality == "ocr":
             return " ".join(item.text for item in node.ocr_spans)
@@ -297,16 +925,25 @@ class VideoMemoryIndex:
             self._embedding_cache[cache_key] = self.embedding_provider.embed_text(text)
         return self._embedding_cache[cache_key]
 
+    def _image_text_embed_cached(self, text: str) -> list[float]:
+        if self.image_text_embedding_provider is None:
+            return []
+        if text not in self._image_text_embedding_cache:
+            self._image_text_embedding_cache[text] = self.image_text_embedding_provider.embed_text(
+                text
+            )
+        return self._image_text_embedding_cache[text]
+
     def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
         if len(left) != len(right):
-            raise ValueError(
-                f"Embedding dimension mismatch: left={len(left)} right={len(right)}"
-            )
+            raise ValueError(f"Embedding dimension mismatch: left={len(left)} right={len(right)}")
         left_norm = sum(value * value for value in left) ** 0.5
         right_norm = sum(value * value for value in right) ** 0.5
         if left_norm == 0 or right_norm == 0:
             return 0.0
-        dot_product = sum(left_value * right_value for left_value, right_value in zip(left, right, strict=True))
+        dot_product = sum(
+            left_value * right_value for left_value, right_value in zip(left, right, strict=True)
+        )
         similarity = dot_product / (left_norm * right_norm)
         return max(0.0, similarity)
 

@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -19,6 +20,46 @@ from rlm.video.types import (
     VideoNodeLevel,
     VisualSummarySpan,
 )
+
+ParentVisualSummaryMode = Literal["full", "compact"]
+
+ATOM_PATTERN = re.compile(r"\b[\w.+*/<>=!-]+\b")
+CODE_ATOM_PATTERN = re.compile(
+    r"\b(?:[a-zA-Z_]\w*|\d+(?:\.\d+)?)\s*(?:==|!=|>=|<=|=|\+|-|\*|/|>|<)\s*"
+    r"(?:[a-zA-Z_]\w*|\d+(?:\.\d+)?)\b"
+)
+QUOTED_TEXT_PATTERN = re.compile(r"[\"']([^\"']{2,80})[\"']")
+ROLLUP_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "and",
+    "are",
+    "being",
+    "code",
+    "does",
+    "for",
+    "from",
+    "has",
+    "have",
+    "into",
+    "its",
+    "json",
+    "keys",
+    "mentions",
+    "return",
+    "scene",
+    "segment",
+    "shows",
+    "summary",
+    "that",
+    "the",
+    "then",
+    "this",
+    "time",
+    "video",
+    "with",
+}
 
 
 @dataclass
@@ -77,8 +118,14 @@ class VideoMemoryBuilder:
         clip_duration_seconds: float = 15.0,
         visual_span_mode: Literal["scene_and_clip", "clip"] = "scene_and_clip",
         aggregate_child_visual_summaries: bool = False,
+        parent_visual_summary_mode: ParentVisualSummaryMode = "full",
         verbose: bool = False,
     ):
+        if parent_visual_summary_mode not in {"full", "compact"}:
+            raise ValueError(
+                "parent_visual_summary_mode must be either 'full' or 'compact', "
+                f"got {parent_visual_summary_mode!r}"
+            )
         self.speech_recognizer = speech_recognizer
         self.visual_summarizer = visual_summarizer
         self.ocr_extractor = ocr_extractor
@@ -88,6 +135,7 @@ class VideoMemoryBuilder:
         self.clip_duration_seconds = clip_duration_seconds
         self.visual_span_mode = visual_span_mode
         self.aggregate_child_visual_summaries = aggregate_child_visual_summaries
+        self.parent_visual_summary_mode = parent_visual_summary_mode
         self.verbose = verbose
 
     def prepare_artifacts(
@@ -134,6 +182,7 @@ class VideoMemoryBuilder:
             "aggregate_child_visual_summaries",
             self.aggregate_child_visual_summaries,
         )
+        payload.setdefault("parent_visual_summary_mode", self.parent_visual_summary_mode)
         artifacts = PreparedVideoArtifacts(
             video_id=video_id,
             duration_seconds=duration_seconds,
@@ -231,6 +280,7 @@ class VideoMemoryBuilder:
             "aggregate_child_visual_summaries",
             self.aggregate_child_visual_summaries,
         )
+        metadata.setdefault("parent_visual_summary_mode", self.parent_visual_summary_mode)
         metadata.setdefault("node_count", len(nodes))
         memory = VideoMemory(
             video_id=artifacts.video_id,
@@ -238,6 +288,7 @@ class VideoMemoryBuilder:
             nodes=nodes,
             metadata=metadata,
         )
+        self._attach_compact_visual_detail_pointers(memory)
         self._log(f"build_memory done video_id={artifacts.video_id} nodes={len(nodes)}")
         return memory
 
@@ -282,9 +333,41 @@ class VideoMemoryBuilder:
         tags = sorted({tag for item in summaries for tag in item.tags})
         entities = sorted({entity for item in summaries for entity in item.entities})
         clip_path = self._build_clip_pointer(artifacts, time_span)
+        metadata: dict[str, Any] = {}
 
         if summaries:
-            visual_summary = " | ".join(item.summary.strip() for item in summaries if item.summary)
+            if self._should_compact_parent_visual_summary(artifacts, summaries, level):
+                visual_keywords = self._visual_keywords(summaries)
+                visual_atoms = self._visual_atoms(summaries)
+                tags = sorted(set(tags) | set(visual_keywords))
+                visual_summary = self._compact_visual_rollup(
+                    summaries=summaries,
+                    speech_spans=speech_spans,
+                    ocr_spans=ocr_spans,
+                    audio_events=audio_events,
+                    level=level,
+                    visual_keywords=visual_keywords,
+                    visual_atoms=visual_atoms,
+                )
+                metadata.update(
+                    {
+                        "visual_summary_mode": "compact_parent_rollup",
+                        "visual_detail_summary_count": len(summaries),
+                        "visual_frame_embedding_count": self._visual_frame_embedding_count(
+                            summaries
+                        ),
+                        "visual_keywords": visual_keywords,
+                        "visual_atoms": visual_atoms,
+                        "visual_source_granularities": sorted(
+                            {summary.granularity for summary in summaries}
+                        ),
+                    }
+                )
+            else:
+                visual_summary = " | ".join(
+                    item.summary.strip() for item in summaries if item.summary
+                )
+                metadata.update(self._visual_summary_node_metadata(summaries))
         else:
             visual_summary = self._fallback_visual_summary(speech_spans, ocr_spans, level)
 
@@ -300,6 +383,7 @@ class VideoMemoryBuilder:
             entities=entities,
             clip_path=clip_path,
             parent_id=parent_id,
+            metadata=metadata,
         )
 
     def _subdivide(self, span: TimeSpan, window_seconds: float) -> list[TimeSpan]:
@@ -346,7 +430,9 @@ class VideoMemoryBuilder:
             return exact
 
         matching = [
-            item for item in summaries if item.granularity == level and item.time_span.overlaps(span)
+            item
+            for item in summaries
+            if item.granularity == level and item.time_span.overlaps(span)
         ]
         if matching:
             return matching
@@ -357,8 +443,136 @@ class VideoMemoryBuilder:
             )
         )
         if aggregate_child_summaries and level in {"scene", "segment"}:
-            return [item for item in summaries if item.granularity == "clip" and item.time_span.overlaps(span)]
+            return [
+                item
+                for item in summaries
+                if item.granularity == "clip" and item.time_span.overlaps(span)
+            ]
         return []
+
+    def _should_compact_parent_visual_summary(
+        self,
+        artifacts: PreparedVideoArtifacts,
+        summaries: list[VisualSummarySpan],
+        level: VideoNodeLevel,
+    ) -> bool:
+        parent_summary_mode = artifacts.metadata.get(
+            "parent_visual_summary_mode",
+            self.parent_visual_summary_mode,
+        )
+        aggregate_child_summaries = bool(
+            artifacts.metadata.get(
+                "aggregate_child_visual_summaries",
+                self.aggregate_child_visual_summaries,
+            )
+        )
+        return (
+            parent_summary_mode == "compact"
+            and aggregate_child_summaries
+            and level in {"scene", "segment"}
+            and bool(summaries)
+            and all(summary.granularity == "clip" for summary in summaries)
+        )
+
+    def _compact_visual_rollup(
+        self,
+        *,
+        summaries: list[VisualSummarySpan],
+        speech_spans: list[SpeechSpan],
+        ocr_spans: list[OCRSpan],
+        audio_events: list[AudioEvent],
+        level: VideoNodeLevel,
+        visual_keywords: list[str],
+        visual_atoms: list[str],
+    ) -> str:
+        parts = [f"{level} visual rollup"]
+        if visual_keywords:
+            parts.append(f"topics: {', '.join(visual_keywords[:12])}")
+        if visual_atoms:
+            parts.append(f"visible/code atoms: {'; '.join(visual_atoms[:8])}")
+        parts.append(f"{len(summaries)} detailed clip summaries available")
+        if speech_spans:
+            parts.append(f"{len(speech_spans)} speech spans")
+        if ocr_spans:
+            parts.append(f"{len(ocr_spans)} OCR spans")
+        if audio_events:
+            parts.append(f"{len(audio_events)} audio events")
+        return "; ".join(parts)
+
+    def _visual_keywords(self, summaries: list[VisualSummarySpan], limit: int = 24) -> list[str]:
+        counts: dict[str, int] = {}
+        for summary in summaries:
+            parts = [summary.summary, " ".join(summary.tags), " ".join(summary.entities)]
+            for token in ATOM_PATTERN.findall(" ".join(parts).lower()):
+                normalized = token.strip("`.,:;()[]{}")
+                if (
+                    len(normalized) <= 2
+                    or normalized in ROLLUP_STOPWORDS
+                    or normalized.replace(".", "", 1).isdigit()
+                ):
+                    continue
+                counts[normalized] = counts.get(normalized, 0) + 1
+        return [
+            token
+            for token, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+        ]
+
+    def _visual_atoms(self, summaries: list[VisualSummarySpan], limit: int = 16) -> list[str]:
+        atoms: list[str] = []
+        seen: set[str] = set()
+        for summary in summaries:
+            candidates = [
+                *QUOTED_TEXT_PATTERN.findall(summary.summary),
+                *CODE_ATOM_PATTERN.findall(summary.summary),
+            ]
+            for candidate in candidates:
+                normalized = " ".join(candidate.split()).strip("`.,:;()[]{}")
+                key = normalized.lower()
+                if len(normalized) < 2 or key in seen:
+                    continue
+                seen.add(key)
+                atoms.append(normalized)
+                if len(atoms) >= limit:
+                    return atoms
+        return atoms
+
+    def _visual_summary_node_metadata(
+        self,
+        summaries: list[VisualSummarySpan],
+    ) -> dict[str, Any]:
+        if len(summaries) != 1:
+            return {}
+        return dict(summaries[0].metadata)
+
+    def _visual_frame_embedding_count(self, summaries: list[VisualSummarySpan]) -> int:
+        total = 0
+        for summary in summaries:
+            embeddings = summary.metadata.get("pitome_frame_embeddings", [])
+            if isinstance(embeddings, list):
+                total += len(embeddings)
+        return total
+
+    def _attach_compact_visual_detail_pointers(self, memory: VideoMemory) -> None:
+        for node in memory.nodes.values():
+            if node.metadata.get("visual_summary_mode") != "compact_parent_rollup":
+                continue
+            detail_node_ids = [
+                descendant.node_id
+                for descendant in self._descendant_nodes(memory, node.node_id)
+                if descendant.level == "clip" and descendant.visual_summary.strip()
+            ]
+            if detail_node_ids:
+                node.metadata["visual_detail_node_ids"] = detail_node_ids
+
+    def _descendant_nodes(self, memory: VideoMemory, node_id: str) -> list[VideoNode]:
+        descendants: list[VideoNode] = []
+        stack = list(memory.get_node(node_id).children)
+        while stack:
+            current_id = stack.pop(0)
+            current = memory.get_node(current_id)
+            descendants.append(current)
+            stack.extend(current.children)
+        return descendants
 
     def _same_span(self, left: TimeSpan, right: TimeSpan, tol: float = 1e-6) -> bool:
         return abs(left.start - right.start) <= tol and abs(left.end - right.end) <= tol

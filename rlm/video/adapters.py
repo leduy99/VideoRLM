@@ -14,7 +14,10 @@ from rlm.video.media import (
     get_videorlm_output_root,
     is_audio_path,
 )
-from rlm.video.pitome import select_visual_frames_for_span
+from rlm.video.pitome import (
+    limit_frame_selection_by_temporal_coverage,
+    select_visual_frames_for_span,
+)
 from rlm.video.types import (
     AudioEvent,
     OCRSpan,
@@ -27,32 +30,34 @@ from rlm.video.types import (
 
 @runtime_checkable
 class SpeechRecognizer(Protocol):
-    def recognize(self, video_path: str) -> list[SpeechSpan]:
-        ...
+    def recognize(self, video_path: str) -> list[SpeechSpan]: ...
 
 
 @runtime_checkable
 class VisualSummarizer(Protocol):
-    def summarize(self, video_path: str, spans: list[TimeSpan]) -> list[VisualSummarySpan]:
-        ...
+    def summarize(self, video_path: str, spans: list[TimeSpan]) -> list[VisualSummarySpan]: ...
 
 
 @runtime_checkable
 class OCRExtractor(Protocol):
-    def extract(self, video_path: str) -> list[OCRSpan]:
-        ...
+    def extract(self, video_path: str) -> list[OCRSpan]: ...
 
 
 @runtime_checkable
 class AudioEventExtractor(Protocol):
-    def extract(self, video_path: str) -> list[AudioEvent]:
-        ...
+    def extract(self, video_path: str) -> list[AudioEvent]: ...
 
 
 @runtime_checkable
 class EmbeddingProvider(Protocol):
-    def embed_text(self, text: str) -> list[float]:
-        ...
+    def embed_text(self, text: str) -> list[float]: ...
+
+
+@runtime_checkable
+class ImageTextEmbeddingProvider(Protocol):
+    def embed_text(self, text: str) -> list[float]: ...
+
+    def embed_images(self, image_paths: list[str | Path]) -> list[list[float]]: ...
 
 
 @dataclass
@@ -193,6 +198,7 @@ class OpenAICompatibleVisualSummarizer:
     pitome_embedding_backend: str = "pixel"
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
+    frame_embedding_provider: ImageTextEmbeddingProvider | None = None
     summary_granularity: VideoNodeLevel | None = None
 
     def __post_init__(self) -> None:
@@ -213,7 +219,7 @@ class OpenAICompatibleVisualSummarizer:
         ) as temp_dir:
             for index, span in enumerate(spans, start=1):
                 frame_dir = Path(temp_dir) / f"span_{index:03d}"
-                frame_paths = self._select_frame_paths(video_path, span, frame_dir)
+                frame_paths, frame_metadata = self._select_frames(video_path, span, frame_dir)
                 content = [{"type": "text", "text": self._build_prompt(span)}]
                 for frame_path in frame_paths:
                     content.append(
@@ -239,13 +245,23 @@ class OpenAICompatibleVisualSummarizer:
                         granularity=self._infer_granularity(span),
                         tags=[str(item) for item in payload.get("tags", [])],
                         entities=[str(item) for item in payload.get("entities", [])],
+                        metadata=frame_metadata,
                     )
                 )
         return outputs
 
     def _select_frame_paths(self, video_path: str, span: TimeSpan, output_dir: Path) -> list[Path]:
+        frame_paths, _ = self._select_frames(video_path, span, output_dir)
+        return frame_paths
+
+    def _select_frames(
+        self,
+        video_path: str,
+        span: TimeSpan,
+        output_dir: Path,
+    ) -> tuple[list[Path], dict[str, Any]]:
         if not self.use_pitome:
-            return extract_frames_for_span(
+            frame_paths = extract_frames_for_span(
                 media_path=video_path,
                 span=span,
                 frame_count=self.frame_count,
@@ -253,6 +269,7 @@ class OpenAICompatibleVisualSummarizer:
                 width=self.frame_width,
                 output_dir=output_dir,
             )
+            return frame_paths, {}
 
         selection = select_visual_frames_for_span(
             media_path=video_path,
@@ -269,12 +286,30 @@ class OpenAICompatibleVisualSummarizer:
             embedding_backend=self.pitome_embedding_backend,
             anchor_frame_count=self.pitome_anchor_frame_count,
         )
-        if self.pitome_max_selected_frames is None:
-            return selection.frame_paths
-        return _limit_paths_by_temporal_coverage(
-            selection.frame_paths,
-            self.pitome_max_selected_frames,
-        )
+        if self.pitome_max_selected_frames is not None:
+            selection = limit_frame_selection_by_temporal_coverage(
+                selection,
+                self.pitome_max_selected_frames,
+            )
+        metadata = selection.to_metadata()
+        metadata.update(self._semantic_frame_metadata(selection.frame_paths))
+        return selection.frame_paths, metadata
+
+    def _semantic_frame_metadata(self, frame_paths: list[Path]) -> dict[str, Any]:
+        if self.frame_embedding_provider is None or not frame_paths:
+            return {}
+        embeddings = self.frame_embedding_provider.embed_images(frame_paths)
+        if not embeddings:
+            return {}
+        return {
+            "semantic_frame_embeddings": embeddings,
+            "semantic_frame_embedding_model": getattr(
+                self.frame_embedding_provider,
+                "model_name",
+                None,
+            ),
+            "semantic_frame_embedding_dim": len(embeddings[0]),
+        }
 
     def _build_prompt(self, span: TimeSpan) -> str:
         return (
@@ -353,10 +388,7 @@ def _limit_paths_by_temporal_coverage(paths: list[Path], max_count: int) -> list
     if max_count == 1:
         return [paths[len(paths) // 2]]
     indices = sorted(
-        {
-            round(position * (len(paths) - 1) / (max_count - 1))
-            for position in range(max_count)
-        }
+        {round(position * (len(paths) - 1) / (max_count - 1)) for position in range(max_count)}
     )
     return [paths[index] for index in indices]
 

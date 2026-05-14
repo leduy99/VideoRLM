@@ -2,11 +2,12 @@ import copy
 import json
 import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from rlm.clients import get_client
 from rlm.clients.base_lm import BaseLM
 from rlm.core.types import ClientBackend
+from rlm.video.adapters import EmbeddingProvider, ImageTextEmbeddingProvider
 from rlm.video.evidence_pipeline import (
     build_evidence_board,
     build_question_spec,
@@ -43,7 +44,12 @@ class VideoRLM:
         enable_hybrid_speech_refinement: bool = False,
         speech_snippet_refiner_client: BaseLM | None = None,
         speech_refine_candidate_count: int = 4,
+        search_mode: Literal["lexical", "graph"] = "lexical",
+        embedding_provider: EmbeddingProvider | None = None,
+        image_text_embedding_provider: ImageTextEmbeddingProvider | None = None,
     ):
+        if search_mode not in {"lexical", "graph"}:
+            raise ValueError(f"Unsupported search mode: {search_mode}")
         self.controller_backend = controller_backend
         self.controller_backend_kwargs = controller_backend_kwargs or {}
         self.controller_client = controller_client or get_client(
@@ -58,6 +64,9 @@ class VideoRLM:
             self.controller_client if enable_hybrid_speech_refinement else None
         )
         self.speech_refine_candidate_count = speech_refine_candidate_count
+        self.search_mode = search_mode
+        self.embedding_provider = embedding_provider
+        self.image_text_embedding_provider = image_text_embedding_provider
 
     def run(
         self,
@@ -67,7 +76,12 @@ class VideoRLM:
         task_type: str | None = None,
     ) -> VideoRLMResult:
         start_time = time.perf_counter()
-        index = VideoMemoryIndex(memory)
+        index = VideoMemoryIndex(
+            memory,
+            embedding_provider=self.embedding_provider,
+            image_text_embedding_provider=self.image_text_embedding_provider,
+            search_mode=self.search_mode,
+        )
         tools = VideoToolExecutor(
             memory=memory,
             index=index,
@@ -92,6 +106,8 @@ class VideoRLM:
                     "video_id": memory.video_id,
                     "max_steps": self.max_steps,
                     "search_top_k": self.search_top_k,
+                    "search_mode": self.search_mode,
+                    "semantic_frame_embeddings": self.image_text_embedding_provider is not None,
                     "hybrid_speech_refinement": self.enable_hybrid_speech_refinement,
                 }
             )
@@ -185,6 +201,8 @@ class VideoRLM:
             "video_length_seconds": memory.metadata.get("duration_seconds"),
             "node_count": len(memory.nodes),
             "available_modalities": self._available_modalities(memory),
+            "search_mode": self.search_mode,
+            "semantic_frame_embeddings": self.image_text_embedding_provider is not None,
             "topical_index": scene_summaries,
             "evidence_metrics": {
                 "slot_fill_rate": 0.0,
@@ -321,7 +339,9 @@ class VideoRLM:
             return frontier
         return [item for item in frontier if item.node_id != node_id]
 
-    def _parse_action(self, raw_response: str, state: ControllerState | None = None) -> ControllerAction:
+    def _parse_action(
+        self, raw_response: str, state: ControllerState | None = None
+    ) -> ControllerAction:
         candidate = raw_response.strip()
         try:
             payload = json.loads(candidate)
@@ -348,9 +368,7 @@ class VideoRLM:
         preferred_modality = self._preferred_search_modality(state, target_slot)
         current_modality = payload.get("modality")
         resolved_modality = (
-            self._resolve_available_modality(current_modality, state)
-            if current_modality
-            else None
+            self._resolve_available_modality(current_modality, state) if current_modality else None
         )
         if action_type == "SEARCH":
             if not payload.get("query"):
@@ -387,7 +405,9 @@ class VideoRLM:
             slot = state.question_spec.get_slot(target_slot)
             if slot is not None and slot.preferred_modality is not None:
                 return self._resolve_available_modality(slot.preferred_modality, state)
-        return self._resolve_available_modality(state.question_spec.preferred_modality or "speech", state)
+        return self._resolve_available_modality(
+            state.question_spec.preferred_modality or "speech", state
+        )
 
     def _resolve_available_modality(self, modality: str, state: ControllerState) -> str:
         available = state.global_context.get("available_modalities", {})
@@ -446,7 +466,9 @@ class VideoRLM:
         else:
             allowed_ids = set()
         filtered_evidence = [
-            item for item in state.evidence_ledger if not allowed_ids or item.evidence_id in allowed_ids
+            item
+            for item in state.evidence_ledger
+            if not allowed_ids or item.evidence_id in allowed_ids
         ]
         top_evidence = sorted(
             filtered_evidence or state.evidence_ledger,
@@ -478,8 +500,7 @@ class VideoRLM:
             "Be concise and specific. If the evidence is insufficient, say that clearly.\n"
             "Do not mention internal ids or budget exhaustion.\n\n"
             f"Question: {state.question}\n\n"
-            "Evidence:\n"
-            + "\n".join(evidence_lines)
+            "Evidence:\n" + "\n".join(evidence_lines)
         )
         return self.controller_client.completion(prompt).strip()
 
@@ -559,9 +580,7 @@ def _focus_evidence_detail(detail: str, question: str, max_chars: int = 1200) ->
         late_window = min(len(normalized), max(max_chars, 1800))
         return normalized[-late_window:].strip()
     sentences = [
-        sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\s+", normalized)
-        if sentence.strip()
+        sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", normalized) if sentence.strip()
     ]
 
     candidates: list[tuple[str, int]] = []
@@ -601,7 +620,10 @@ def _focus_evidence_detail(detail: str, question: str, max_chars: int = 1200) ->
         overlap = len(question_tokens & snippet_tokens)
         keyword_hits = sum(1 for keyword in focus_keywords if keyword in snippet.lower())
         score = overlap * 3 + keyword_hits * 5
-        if any(keyword in snippet.lower() for keyword in ("worried", "lose", "lost", "fixed", "repair", "clasp", "opening")):
+        if any(
+            keyword in snippet.lower()
+            for keyword in ("worried", "lose", "lost", "fixed", "repair", "clasp", "opening")
+        ):
             score += 8
         if {"first", "beginning", "earliest", "initial"} & question_tokens:
             position = max(0.0, 1.0 - (max(start_index, 0) / max(len(normalized), 1)))

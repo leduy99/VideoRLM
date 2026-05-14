@@ -15,6 +15,7 @@ from rlm.video.types import TimeSpan
 
 FrameSelectionStrategy = Literal["uniform", "pitome"]
 FrameEmbeddingBackend = Literal["pixel", "hybrid"]
+DEFAULT_STORED_FRAME_EMBEDDING_SIZE = 64
 
 
 @dataclass
@@ -23,23 +24,60 @@ class FrameSelectionResult:
     frame_paths: list[Path]
     timestamps: list[float]
     dense_frame_count: int
+    embedding_backend: FrameEmbeddingBackend | None = None
+    embedding_size: int | None = None
+    frame_embeddings: list[list[float]] = field(default_factory=list)
     protected_timestamps: list[float] = field(default_factory=list)
     representative_timestamps: list[float] = field(default_factory=list)
     energy_scores: list[float] = field(default_factory=list)
     merged_pairs: list[tuple[float, float]] = field(default_factory=list)
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "strategy": self.strategy,
             "dense_frame_count": self.dense_frame_count,
             "selected_frame_count": len(self.timestamps),
+            "selected_frame_timestamps": list(self.timestamps),
             "protected_timestamps": list(self.protected_timestamps),
             "representative_timestamps": list(self.representative_timestamps),
-            "merged_pairs": [
-                {"left": left, "right": right}
-                for left, right in self.merged_pairs
-            ],
+            "merged_pairs": [{"left": left, "right": right} for left, right in self.merged_pairs],
         }
+        if self.frame_embeddings:
+            metadata.update(
+                {
+                    "pitome_frame_embeddings": [
+                        list(embedding) for embedding in self.frame_embeddings
+                    ],
+                    "pitome_frame_embedding_backend": self.embedding_backend,
+                    "pitome_frame_embedding_source_size": self.embedding_size,
+                    "pitome_frame_embedding_dim": len(self.frame_embeddings[0]),
+                }
+            )
+        return metadata
+
+
+def limit_frame_selection_by_temporal_coverage(
+    selection: FrameSelectionResult,
+    max_count: int,
+) -> FrameSelectionResult:
+    indices = _temporal_coverage_indices(len(selection.frame_paths), max_count)
+    if indices == list(range(len(selection.frame_paths))):
+        return selection
+    return FrameSelectionResult(
+        strategy=selection.strategy,
+        frame_paths=[selection.frame_paths[index] for index in indices],
+        timestamps=[selection.timestamps[index] for index in indices],
+        dense_frame_count=selection.dense_frame_count,
+        embedding_backend=selection.embedding_backend,
+        embedding_size=selection.embedding_size,
+        frame_embeddings=[selection.frame_embeddings[index] for index in indices]
+        if selection.frame_embeddings
+        else [],
+        protected_timestamps=list(selection.protected_timestamps),
+        representative_timestamps=list(selection.representative_timestamps),
+        energy_scores=list(selection.energy_scores),
+        merged_pairs=list(selection.merged_pairs),
+    )
 
 
 def select_visual_frames_for_span(
@@ -103,6 +141,7 @@ def select_visual_frames_for_span(
     selected_indices = selection["selected_indices"]
     selected_timestamps = [dense_timestamps[index] for index in selected_indices]
     selected_frame_paths = [dense_frame_paths[index] for index in selected_indices]
+    selected_embeddings = [compact_frame_embedding(embeddings[index]) for index in selected_indices]
     protected_timestamps = [dense_timestamps[index] for index in selection["protected_indices"]]
     representative_timestamps = [
         dense_timestamps[index] for index in selection["representative_indices"]
@@ -117,6 +156,9 @@ def select_visual_frames_for_span(
         frame_paths=selected_frame_paths,
         timestamps=selected_timestamps,
         dense_frame_count=len(dense_timestamps),
+        embedding_backend=embedding_backend,
+        embedding_size=embedding_size,
+        frame_embeddings=selected_embeddings,
         protected_timestamps=protected_timestamps,
         representative_timestamps=representative_timestamps,
         energy_scores=selection["energy_scores"],
@@ -184,9 +226,7 @@ def select_frame_indices_from_embeddings(
             continue
 
         unmatched_b.remove(best_b)
-        representative = (
-            index_a if energy_scores[index_a] >= energy_scores[best_b] else best_b
-        )
+        representative = index_a if energy_scores[index_a] >= energy_scores[best_b] else best_b
         representatives.add(representative)
         merged_pairs.append((index_a, best_b))
 
@@ -208,7 +248,12 @@ def build_similarity_matrix(embeddings: list[list[float]]) -> list[list[float]]:
     for left in normalized:
         row = []
         for right in normalized:
-            row.append(sum(left_item * right_item for left_item, right_item in zip(left, right, strict=True)))
+            row.append(
+                sum(
+                    left_item * right_item
+                    for left_item, right_item in zip(left, right, strict=True)
+                )
+            )
         matrix.append(row)
     return matrix
 
@@ -257,6 +302,28 @@ def load_frame_embeddings(
             else:
                 embeddings.append(_hybrid_embedding(image, embedding_size))
     return embeddings
+
+
+def compact_frame_embedding(
+    embedding: list[float],
+    *,
+    output_size: int = DEFAULT_STORED_FRAME_EMBEDDING_SIZE,
+) -> list[float]:
+    if output_size <= 0:
+        raise ValueError(f"output_size must be positive, got {output_size}")
+    if not embedding:
+        return []
+    if len(embedding) <= output_size:
+        compact = list(embedding)
+    else:
+        compact = []
+        length = len(embedding)
+        for index in range(output_size):
+            start = round(index * length / output_size)
+            end = round((index + 1) * length / output_size)
+            chunk = embedding[start : max(end, start + 1)]
+            compact.append(sum(chunk) / len(chunk))
+    return [round(value, 6) for value in _normalize_embedding(compact)]
 
 
 def _pixel_embedding(image: Any, embedding_size: int) -> list[float]:
@@ -328,6 +395,18 @@ def _uniform_anchor_indices(item_count: int, anchor_count: int) -> list[int]:
             round(position * (item_count - 1) / (anchor_count - 1))
             for position in range(anchor_count)
         }
+    )
+
+
+def _temporal_coverage_indices(item_count: int, max_count: int) -> list[int]:
+    if max_count <= 0:
+        raise ValueError(f"max_count must be positive, got {max_count}")
+    if item_count <= max_count:
+        return list(range(item_count))
+    if max_count == 1:
+        return [item_count // 2]
+    return sorted(
+        {round(position * (item_count - 1) / (max_count - 1)) for position in range(max_count)}
     )
 
 
