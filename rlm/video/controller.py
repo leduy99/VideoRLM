@@ -2,12 +2,18 @@ import copy
 import json
 import re
 import time
+from collections.abc import Callable
 from typing import Any, Literal
 
 from rlm.clients import get_client
 from rlm.clients.base_lm import BaseLM
 from rlm.core.types import ClientBackend
-from rlm.video.adapters import EmbeddingProvider, ImageTextEmbeddingProvider
+from rlm.video.adapters import (
+    EmbeddingProvider,
+    ImageTextEmbeddingProvider,
+    SpeechRecognizer,
+    VisualSummarizer,
+)
 from rlm.video.evidence_pipeline import (
     build_evidence_board,
     build_question_spec,
@@ -47,6 +53,8 @@ class VideoRLM:
         search_mode: Literal["lexical", "graph"] = "lexical",
         embedding_provider: EmbeddingProvider | None = None,
         image_text_embedding_provider: ImageTextEmbeddingProvider | None = None,
+        speech_refiner: SpeechRecognizer | None = None,
+        visual_refiner: VisualSummarizer | None = None,
     ):
         if search_mode not in {"lexical", "graph"}:
             raise ValueError(f"Unsupported search mode: {search_mode}")
@@ -67,6 +75,8 @@ class VideoRLM:
         self.search_mode = search_mode
         self.embedding_provider = embedding_provider
         self.image_text_embedding_provider = image_text_embedding_provider
+        self.speech_refiner = speech_refiner
+        self.visual_refiner = visual_refiner
 
     def run(
         self,
@@ -74,6 +84,7 @@ class VideoRLM:
         memory: VideoMemory,
         dialogue_context: list[dict[str, str]] | None = None,
         task_type: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> VideoRLMResult:
         start_time = time.perf_counter()
         index = VideoMemoryIndex(
@@ -89,6 +100,9 @@ class VideoRLM:
             speech_snippet_refiner=self.speech_snippet_refiner_client,
             enable_hybrid_speech_refinement=self.enable_hybrid_speech_refinement,
             speech_refine_candidate_count=self.speech_refine_candidate_count,
+            speech_refiner=self.speech_refiner,
+            visual_refiner=self.visual_refiner,
+            progress_callback=progress_callback,
         )
         state = self._build_initial_state(
             question=question,
@@ -109,6 +123,8 @@ class VideoRLM:
                     "search_mode": self.search_mode,
                     "semantic_frame_embeddings": self.image_text_embedding_provider is not None,
                     "hybrid_speech_refinement": self.enable_hybrid_speech_refinement,
+                    "speech_refinement": self.speech_refiner is not None,
+                    "visual_refinement": self.visual_refiner is not None,
                 }
             )
 
@@ -203,6 +219,8 @@ class VideoRLM:
             "available_modalities": self._available_modalities(memory),
             "search_mode": self.search_mode,
             "semantic_frame_embeddings": self.image_text_embedding_provider is not None,
+            "speech_refinement": self.speech_refiner is not None,
+            "visual_refinement": self.visual_refiner is not None,
             "topical_index": scene_summaries,
             "evidence_metrics": {
                 "slot_fill_rate": 0.0,
@@ -346,11 +364,84 @@ class VideoRLM:
         try:
             payload = json.loads(candidate)
         except json.JSONDecodeError:
-            extracted = self._extract_first_json_object(candidate)
-            payload = json.loads(extracted)
+            try:
+                extracted = self._extract_first_json_object(candidate)
+                payload = json.loads(extracted)
+            except (json.JSONDecodeError, ValueError):
+                payload = self._recover_partial_action_payload(candidate, state)
+        if not isinstance(payload, dict):
+            payload = self._recover_partial_action_payload(candidate, state)
+        payload = self._sanitize_action_payload(payload)
         if state is not None:
             payload = self._repair_action_payload(payload, state)
         return ControllerAction.from_dict(payload)
+
+    def _sanitize_action_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cleaned = dict(payload)
+        action_type = str(cleaned.get("action_type") or "").upper()
+        if action_type in {"SEARCH", "OPEN", "SPLIT", "MERGE", "STOP"}:
+            cleaned["action_type"] = action_type
+
+        evidence_ids = cleaned.get("evidence_ids")
+        if isinstance(evidence_ids, list):
+            cleaned["evidence_ids"] = [
+                item
+                for item in evidence_ids
+                if isinstance(item, str) and item.startswith("evidence_")
+            ]
+        elif isinstance(evidence_ids, str) and evidence_ids.startswith("evidence_"):
+            cleaned["evidence_ids"] = [evidence_ids]
+        else:
+            cleaned["evidence_ids"] = []
+        return cleaned
+
+    def _recover_partial_action_payload(
+        self,
+        text: str,
+        state: ControllerState | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "action_type": self._extract_json_scalar_field(text, "action_type") or "SEARCH",
+            "query": self._extract_json_scalar_field(text, "query"),
+            "modality": self._extract_json_scalar_field(text, "modality"),
+            "node_id": self._extract_json_scalar_field(text, "node_id"),
+            "target_slot": self._extract_json_scalar_field(text, "target_slot"),
+            "evidence_ids": sorted(set(re.findall(r"evidence_\d+", text))),
+            "answer": self._extract_json_scalar_field(text, "answer"),
+            "rationale": self._extract_json_scalar_field(text, "rationale"),
+        }
+        action_type = str(payload["action_type"]).upper()
+        if action_type not in {"SEARCH", "OPEN", "SPLIT", "MERGE", "STOP"}:
+            action_type = "SEARCH"
+        payload["action_type"] = action_type
+
+        if action_type == "SEARCH" and not payload["query"] and state is not None:
+            target_slot = payload["target_slot"] or select_target_slot(
+                state.question_spec,
+                state.evidence_board,
+            )
+            payload["target_slot"] = target_slot
+            payload["query"] = build_slot_queries(state.question, state.question_spec, target_slot)[
+                0
+            ]
+        return payload
+
+    def _extract_json_scalar_field(self, text: str, field_name: str) -> str | None:
+        pattern = re.compile(
+            rf'"{re.escape(field_name)}"\s*:\s*(null|"(?:\\.|[^"\\])*")',
+            re.DOTALL,
+        )
+        match = pattern.search(text)
+        if match is None:
+            return None
+        token = match.group(1)
+        if token == "null":
+            return None
+        try:
+            value = json.loads(token)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, str) else None
 
     def _repair_action_payload(
         self,

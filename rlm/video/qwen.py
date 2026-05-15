@@ -13,7 +13,13 @@ from rlm.video.adapters import (
 )
 from rlm.video.controller import VideoRLM
 from rlm.video.huggingface import default_local_model_dir, download_snapshot
-from rlm.video.local_adapters import LocalQwenASRSpeechRecognizer, LocalQwenVisualSummarizer
+from rlm.video.local_adapters import (
+    FasterWhisperSpeechRecognizer,
+    LazyPiToMeVisualIndexer,
+    LazySpeechRecognizer,
+    LocalQwenASRSpeechRecognizer,
+    LocalQwenVisualSummarizer,
+)
 from rlm.video.logger import VideoRLMLogger
 from rlm.video.memory import VideoMemoryBuilder
 from rlm.video.semantic_embeddings import LocalImageTextEmbeddingProvider
@@ -66,8 +72,10 @@ class LocalModelConfig:
 class QwenVideoRuntimeBundle:
     controller: VideoRLM
     memory_builder: VideoMemoryBuilder
-    speech_recognizer: SpeechRecognizer
+    speech_recognizer: SpeechRecognizer | None
     visual_summarizer: VisualSummarizer
+    speech_refiner: SpeechRecognizer | None = None
+    visual_refiner: VisualSummarizer | None = None
     embedding_provider: EmbeddingProvider | None = None
     image_text_embedding_provider: ImageTextEmbeddingProvider | None = None
 
@@ -94,6 +102,8 @@ class QwenVideoStackConfig:
     pitome_embedding_backend: str = "pixel"
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
+    pitome_scene_threshold: float = 0.35
+    pitome_max_scene_boundary_frames: int = 6
     parent_visual_summary_mode: Literal["full", "compact"] | None = None
     search_mode: Literal["lexical", "graph"] | None = None
     verbose: bool = False
@@ -152,14 +162,21 @@ class QwenVideoStackConfig:
         enable_hybrid_speech_refinement: bool = False,
         speech_refine_candidate_count: int = 4,
     ) -> QwenVideoRuntimeBundle:
-        speech_recognizer = OpenAICompatibleSpeechRecognizer(
+        lazy_pitome_mode = self.use_pitome
+        full_speech_recognizer = OpenAICompatibleSpeechRecognizer(
             model_name=self.speech.model_name,
             api_key=self.speech.api_key,
             base_url=self.speech.base_url,
             timeout=self.speech.timeout,
             ffmpeg_bin=self.ffmpeg_bin,
         )
-        visual_summarizer = OpenAICompatibleVisualSummarizer(
+        speech_recognizer: SpeechRecognizer = full_speech_recognizer
+        speech_refiner: SpeechRecognizer | None = None
+        if lazy_pitome_mode:
+            speech_recognizer = LazySpeechRecognizer(verbose=self.verbose)
+            speech_refiner = full_speech_recognizer
+
+        openai_visual_summarizer = OpenAICompatibleVisualSummarizer(
             model_name=self.visual.model_name,
             api_key=self.visual.api_key,
             base_url=self.visual.base_url,
@@ -168,7 +185,7 @@ class QwenVideoStackConfig:
             frame_count=self.frame_count,
             frame_width=self.frame_width,
             scene_threshold_seconds=self.scene_threshold_seconds,
-            use_pitome=self.use_pitome,
+            use_pitome=lazy_pitome_mode,
             pitome_dense_frame_rate=self.pitome_dense_frame_rate,
             pitome_min_frame_count=self.pitome_min_frame_count,
             pitome_protect_ratio=self.pitome_protect_ratio,
@@ -177,8 +194,29 @@ class QwenVideoStackConfig:
             pitome_embedding_backend=self.pitome_embedding_backend,
             pitome_anchor_frame_count=self.pitome_anchor_frame_count,
             pitome_max_selected_frames=self.pitome_max_selected_frames,
-            summary_granularity="clip" if self.use_pitome else None,
+            summary_granularity="clip" if lazy_pitome_mode else None,
         )
+        visual_summarizer: VisualSummarizer = openai_visual_summarizer
+        visual_refiner: VisualSummarizer | None = None
+        if lazy_pitome_mode:
+            visual_summarizer = LazyPiToMeVisualIndexer(
+                ffmpeg_bin=self.ffmpeg_bin,
+                frame_width=self.frame_width,
+                frame_count=self.frame_count,
+                pitome_dense_frame_rate=self.pitome_dense_frame_rate,
+                pitome_min_frame_count=self.pitome_min_frame_count,
+                pitome_protect_ratio=self.pitome_protect_ratio,
+                pitome_similarity_threshold=self.pitome_similarity_threshold,
+                pitome_embedding_size=self.pitome_embedding_size,
+                pitome_embedding_backend=self.pitome_embedding_backend,
+                pitome_anchor_frame_count=self.pitome_anchor_frame_count,
+                pitome_max_selected_frames=self.pitome_max_selected_frames,
+                pitome_scene_threshold=self.pitome_scene_threshold,
+                pitome_max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
+                summary_granularity="clip",
+                verbose=self.verbose,
+            )
+            visual_refiner = openai_visual_summarizer
         embedding_provider = None
         if self.embedding is not None:
             embedding_provider = OpenAICompatibleEmbeddingProvider(
@@ -194,10 +232,10 @@ class QwenVideoStackConfig:
             scene_duration_seconds=self.scene_duration_seconds,
             segment_duration_seconds=self.segment_duration_seconds,
             clip_duration_seconds=self.clip_duration_seconds,
-            visual_span_mode="clip" if self.use_pitome else "scene_and_clip",
-            aggregate_child_visual_summaries=self.use_pitome,
+            visual_span_mode="clip" if lazy_pitome_mode else "scene_and_clip",
+            aggregate_child_visual_summaries=lazy_pitome_mode,
             parent_visual_summary_mode=self.parent_visual_summary_mode
-            or ("compact" if self.use_pitome else "full"),
+            or ("compact" if lazy_pitome_mode else "full"),
             verbose=self.verbose,
         )
         controller = VideoRLM(
@@ -209,14 +247,18 @@ class QwenVideoStackConfig:
             max_frontier_items=max_frontier_items,
             enable_hybrid_speech_refinement=enable_hybrid_speech_refinement,
             speech_refine_candidate_count=speech_refine_candidate_count,
-            search_mode=self.search_mode or ("graph" if self.use_pitome else "lexical"),
+            search_mode=self.search_mode or ("graph" if lazy_pitome_mode else "lexical"),
             embedding_provider=embedding_provider,
+            speech_refiner=speech_refiner,
+            visual_refiner=visual_refiner,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
             memory_builder=memory_builder,
             speech_recognizer=speech_recognizer,
             visual_summarizer=visual_summarizer,
+            speech_refiner=speech_refiner,
+            visual_refiner=visual_refiner,
             embedding_provider=embedding_provider,
             image_text_embedding_provider=None,
         )
@@ -229,6 +271,13 @@ class QwenLocalVideoStackConfig:
     speech: LocalModelConfig
     forced_aligner: LocalModelConfig | None = None
     semantic_frame_embedding: LocalModelConfig | None = None
+    enable_speech_recognition: bool = True
+    speech_backend: Literal["qwen", "faster-whisper"] = "qwen"
+    faster_whisper_model: str = "small"
+    faster_whisper_device: str = "cpu"
+    faster_whisper_compute_type: str = "default"
+    lazy_speech_refinement: bool = False
+    lazy_visual_refinement: bool = False
     ffmpeg_bin: str = "ffmpeg"
     frame_count: int = 3
     frame_width: int | None = 768
@@ -247,6 +296,8 @@ class QwenLocalVideoStackConfig:
     pitome_embedding_backend: str = "pixel"
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
+    pitome_scene_threshold: float = 0.35
+    pitome_max_scene_boundary_frames: int = 6
     parent_visual_summary_mode: Literal["full", "compact"] | None = None
     search_mode: Literal["lexical", "graph"] | None = None
     semantic_frame_embedding_batch_size: int = 8
@@ -342,6 +393,12 @@ class QwenLocalVideoStackConfig:
         enable_hybrid_speech_refinement: bool = False,
         speech_refine_candidate_count: int = 4,
     ) -> QwenVideoRuntimeBundle:
+        if self.speech_backend not in {"qwen", "faster-whisper"}:
+            raise ValueError(f"Unsupported speech backend: {self.speech_backend}")
+        lazy_pitome_mode = (
+            self.use_pitome or self.lazy_visual_refinement or self.lazy_speech_refinement
+        )
+
         controller_client = TransformersClient(
             model_name=self.controller.model_name,
             model_path=self.controller.resolved_model_path(),
@@ -356,21 +413,46 @@ class QwenLocalVideoStackConfig:
             tokenizer_kwargs=self.controller.tokenizer_kwargs,
             model_kwargs=self.controller.model_kwargs,
         )
-        speech_recognizer = LocalQwenASRSpeechRecognizer(
-            model_name=self.speech.model_name,
-            model_path=self.speech.resolved_model_path(),
-            forced_aligner_name=self.forced_aligner.model_name if self.forced_aligner else None,
-            forced_aligner_path=(
-                self.forced_aligner.resolved_model_path() if self.forced_aligner else None
-            ),
-            device_map=self.speech.device_map or self.speech.device,
-            torch_dtype=self.speech.torch_dtype,
-            ffmpeg_bin=self.ffmpeg_bin,
-            chunk_duration_seconds=self.speech_chunk_duration_seconds,
-            max_new_tokens=self.speech.max_new_tokens,
-            verbose=self.verbose,
-        )
-        visual_summarizer = LocalQwenVisualSummarizer(
+        speech_recognizer = None
+        speech_refiner = None
+        if self.enable_speech_recognition:
+            if self.speech_backend == "faster-whisper":
+                full_speech_recognizer = FasterWhisperSpeechRecognizer(
+                    model_name=self.faster_whisper_model,
+                    device=self.faster_whisper_device,
+                    compute_type=self.faster_whisper_compute_type,
+                    ffmpeg_bin=self.ffmpeg_bin,
+                    verbose=self.verbose,
+                )
+            else:
+                full_speech_recognizer = LocalQwenASRSpeechRecognizer(
+                    model_name=self.speech.model_name,
+                    model_path=self.speech.resolved_model_path(),
+                    forced_aligner_name=self.forced_aligner.model_name
+                    if self.forced_aligner
+                    else None,
+                    forced_aligner_path=(
+                        self.forced_aligner.resolved_model_path() if self.forced_aligner else None
+                    ),
+                    device_map=self.speech.device_map or self.speech.device,
+                    torch_dtype=self.speech.torch_dtype,
+                    ffmpeg_bin=self.ffmpeg_bin,
+                    chunk_duration_seconds=self.speech_chunk_duration_seconds,
+                    max_new_tokens=self.speech.max_new_tokens,
+                    verbose=self.verbose,
+                )
+            if self.lazy_speech_refinement or lazy_pitome_mode:
+                speech_recognizer = LazySpeechRecognizer(
+                    chunk_duration_seconds=self.speech_chunk_duration_seconds,
+                    verbose=self.verbose,
+                )
+                speech_refiner = full_speech_recognizer
+            else:
+                speech_recognizer = full_speech_recognizer
+        frame_embedding_provider = self._build_semantic_frame_embedding_provider()
+        visual_refiner = None
+        visual_summarizer: VisualSummarizer
+        qwen_visual_summarizer = LocalQwenVisualSummarizer(
             model_name=self.visual.model_name,
             model_path=self.visual.resolved_model_path(),
             device=self.visual.device,
@@ -382,7 +464,7 @@ class QwenLocalVideoStackConfig:
             frame_width=self.frame_width,
             scene_threshold_seconds=self.scene_threshold_seconds,
             max_new_tokens=self.visual.max_new_tokens,
-            use_pitome=self.use_pitome,
+            use_pitome=lazy_pitome_mode,
             pitome_dense_frame_rate=self.pitome_dense_frame_rate,
             pitome_min_frame_count=self.pitome_min_frame_count,
             pitome_protect_ratio=self.pitome_protect_ratio,
@@ -391,21 +473,45 @@ class QwenLocalVideoStackConfig:
             pitome_embedding_backend=self.pitome_embedding_backend,
             pitome_anchor_frame_count=self.pitome_anchor_frame_count,
             pitome_max_selected_frames=self.pitome_max_selected_frames,
-            frame_embedding_provider=self._build_semantic_frame_embedding_provider(),
-            summary_granularity="clip" if self.use_pitome else None,
+            pitome_scene_threshold=self.pitome_scene_threshold,
+            pitome_max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
+            frame_embedding_provider=None if lazy_pitome_mode else frame_embedding_provider,
+            summary_granularity="clip" if lazy_pitome_mode else None,
             verbose=self.verbose,
         )
-        image_text_embedding_provider = visual_summarizer.frame_embedding_provider
+        if lazy_pitome_mode:
+            visual_summarizer = LazyPiToMeVisualIndexer(
+                ffmpeg_bin=self.ffmpeg_bin,
+                frame_width=self.frame_width,
+                frame_count=self.frame_count,
+                pitome_dense_frame_rate=self.pitome_dense_frame_rate,
+                pitome_min_frame_count=self.pitome_min_frame_count,
+                pitome_protect_ratio=self.pitome_protect_ratio,
+                pitome_similarity_threshold=self.pitome_similarity_threshold,
+                pitome_embedding_size=self.pitome_embedding_size,
+                pitome_embedding_backend=self.pitome_embedding_backend,
+                pitome_anchor_frame_count=self.pitome_anchor_frame_count,
+                pitome_max_selected_frames=self.pitome_max_selected_frames,
+                pitome_scene_threshold=self.pitome_scene_threshold,
+                pitome_max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
+                frame_embedding_provider=frame_embedding_provider,
+                summary_granularity="clip",
+                verbose=self.verbose,
+            )
+            visual_refiner = qwen_visual_summarizer
+        else:
+            visual_summarizer = qwen_visual_summarizer
+        image_text_embedding_provider = frame_embedding_provider
         memory_builder = VideoMemoryBuilder(
             speech_recognizer=speech_recognizer,
             visual_summarizer=visual_summarizer,
             scene_duration_seconds=self.scene_duration_seconds,
             segment_duration_seconds=self.segment_duration_seconds,
             clip_duration_seconds=self.clip_duration_seconds,
-            visual_span_mode="clip" if self.use_pitome else "scene_and_clip",
-            aggregate_child_visual_summaries=self.use_pitome,
+            visual_span_mode="clip" if lazy_pitome_mode else "scene_and_clip",
+            aggregate_child_visual_summaries=lazy_pitome_mode,
             parent_visual_summary_mode=self.parent_visual_summary_mode
-            or ("compact" if self.use_pitome else "full"),
+            or ("compact" if lazy_pitome_mode else "full"),
             verbose=self.verbose,
         )
         controller = VideoRLM(
@@ -416,14 +522,18 @@ class QwenLocalVideoStackConfig:
             max_frontier_items=max_frontier_items,
             enable_hybrid_speech_refinement=enable_hybrid_speech_refinement,
             speech_refine_candidate_count=speech_refine_candidate_count,
-            search_mode=self.search_mode or ("graph" if self.use_pitome else "lexical"),
+            search_mode=self.search_mode or ("graph" if lazy_pitome_mode else "lexical"),
             image_text_embedding_provider=image_text_embedding_provider,
+            speech_refiner=speech_refiner,
+            visual_refiner=visual_refiner,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
             memory_builder=memory_builder,
             speech_recognizer=speech_recognizer,
             visual_summarizer=visual_summarizer,
+            speech_refiner=speech_refiner,
+            visual_refiner=visual_refiner,
             embedding_provider=None,
             image_text_embedding_provider=image_text_embedding_provider,
         )

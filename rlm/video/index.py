@@ -1,7 +1,8 @@
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from rlm.video.adapters import EmbeddingProvider, ImageTextEmbeddingProvider
 from rlm.video.types import FrontierItem, Modality, TimeSpan, VideoMemory, VideoNodeLevel
@@ -90,6 +91,7 @@ STOPWORDS = {
     "you",
     "your",
 }
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 
 @dataclass
@@ -114,6 +116,88 @@ class SearchHit:
         )
 
 
+@dataclass
+class FrameVectorRecord:
+    node_id: str
+    embedding: list[float]
+
+
+@dataclass
+class FrameVectorMatch:
+    node_id: str
+    score: float
+
+
+class FrameVectorIndex:
+    def __init__(self, records: list[FrameVectorRecord]):
+        self.records = [record for record in records if record.embedding]
+        self.backend = "scan"
+        self.faiss_index: Any | None = None
+        self.np: Any | None = None
+        if self.records:
+            self._try_build_faiss_index()
+
+    def search(self, query_embedding: list[float], top_k: int) -> list[FrameVectorMatch]:
+        if not query_embedding or top_k <= 0 or not self.records:
+            return []
+        if self.backend == "faiss" and self.faiss_index is not None and self.np is not None:
+            return self._search_faiss(query_embedding, top_k)
+        return self._search_scan(query_embedding, top_k)
+
+    def _try_build_faiss_index(self) -> None:
+        try:
+            import faiss
+            import numpy as np
+        except ImportError:
+            return
+
+        dimension = len(self.records[0].embedding)
+        kept_records = [record for record in self.records if len(record.embedding) == dimension]
+        if not kept_records:
+            return
+        matrix = np.asarray([record.embedding for record in kept_records], dtype="float32")
+        faiss.normalize_L2(matrix)
+        index = faiss.IndexFlatIP(dimension)
+        index.add(matrix)
+        self.records = kept_records
+        self.faiss_index = index
+        self.np = np
+        self.backend = "faiss"
+
+    def _search_faiss(self, query_embedding: list[float], top_k: int) -> list[FrameVectorMatch]:
+        dimension = len(self.records[0].embedding)
+        if len(query_embedding) != dimension:
+            return []
+        query = self.np.asarray([query_embedding], dtype="float32")
+        import faiss
+
+        faiss.normalize_L2(query)
+        scores, indices = self.faiss_index.search(query, min(top_k, len(self.records)))
+        matches: list[FrameVectorMatch] = []
+        for score, index in zip(scores[0], indices[0], strict=True):
+            if int(index) < 0:
+                continue
+            matches.append(
+                FrameVectorMatch(
+                    node_id=self.records[int(index)].node_id,
+                    score=max(0.0, float(score)),
+                )
+            )
+        return matches
+
+    def _search_scan(self, query_embedding: list[float], top_k: int) -> list[FrameVectorMatch]:
+        matches = [
+            FrameVectorMatch(
+                node_id=record.node_id,
+                score=_cosine_similarity(query_embedding, record.embedding),
+            )
+            for record in self.records
+            if len(record.embedding) == len(query_embedding)
+        ]
+        matches.sort(key=lambda item: -item.score)
+        return matches[:top_k]
+
+
 class VideoMemoryIndex:
     def __init__(
         self,
@@ -134,6 +218,7 @@ class VideoMemoryIndex:
         self.search_mode = search_mode
         self._embedding_cache: dict[tuple[str, str], list[float]] = {}
         self._image_text_embedding_cache: dict[str, list[float]] = {}
+        self._semantic_frame_vector_index = self._build_semantic_frame_vector_index()
 
     def search(
         self,
@@ -361,9 +446,7 @@ class VideoMemoryIndex:
 
         for neighbor_id, similarity in self._semantic_frame_similarity_neighbors(node_id):
             edge_weight = 0.3 + (similarity * 0.2)
-            neighbors.append(
-                (neighbor_id, edge_weight, f"semantic-frame-edge:{similarity:.2f}")
-            )
+            neighbors.append((neighbor_id, edge_weight, f"semantic-frame-edge:{similarity:.2f}"))
 
         return self._dedupe_graph_neighbors(neighbors, node_id)
 
@@ -473,16 +556,13 @@ class VideoMemoryIndex:
             return
 
         matches: list[tuple[float, str, Modality, list[str], str]] = []
-        for node in self.memory.nodes.values():
-            if node.level == "video":
-                continue
-            if allowed_levels and node.level not in allowed_levels:
-                continue
-
-            frame_embeddings = self._node_semantic_frame_embeddings(node.node_id)
-            if not frame_embeddings:
-                continue
-            semantic_score = self._max_frame_similarity([query_embedding], frame_embeddings)
+        semantic_matches = self._semantic_frame_matches(
+            query_embedding=query_embedding,
+            top_k=max(top_k * 8, 24),
+            allowed_levels=allowed_levels,
+        )
+        for node_id, semantic_score in semantic_matches:
+            node = self.memory.get_node(node_id)
             if semantic_score < SEMANTIC_FRAME_SIMILARITY_THRESHOLD:
                 continue
 
@@ -511,7 +591,7 @@ class VideoMemoryIndex:
                 + temporal_score
                 + self._graph_level_bias(node.level, "visual")
             )
-            reason_parts = [f"semantic-frame:{semantic_score:.2f}"]
+            reason_parts = [f"{self._semantic_frame_backend_reason()}:{semantic_score:.2f}"]
             if atom_score > 0:
                 reason_parts.append("ocr-atoms")
             if audio_score > 0:
@@ -519,7 +599,7 @@ class VideoMemoryIndex:
             matches.append(
                 (
                     round(score, 4),
-                    node.node_id,
+                    node_id,
                     "visual",
                     sorted(set(lexical_overlap) | set(atom_overlap) | set(audio_overlap)),
                     ", ".join(reason_parts),
@@ -543,6 +623,32 @@ class VideoMemoryIndex:
                 matched_terms=matched_terms,
                 reason=reason,
             )
+
+    def _semantic_frame_matches(
+        self,
+        *,
+        query_embedding: list[float],
+        top_k: int,
+        allowed_levels: set[VideoNodeLevel] | None,
+    ) -> list[tuple[str, float]]:
+        if self._semantic_frame_vector_index is None:
+            return []
+        node_scores: dict[str, float] = {}
+        for match in self._semantic_frame_vector_index.search(query_embedding, top_k):
+            node = self.memory.get_node(match.node_id)
+            if node.level == "video":
+                continue
+            if allowed_levels and node.level not in allowed_levels:
+                continue
+            node_scores[match.node_id] = max(node_scores.get(match.node_id, 0.0), match.score)
+        return sorted(node_scores.items(), key=lambda item: (-item[1], item[0]))
+
+    def _semantic_frame_backend_reason(self) -> str:
+        if self._semantic_frame_vector_index is None:
+            return "semantic-frame"
+        if self._semantic_frame_vector_index.backend == "faiss":
+            return "faiss-semantic-frame"
+        return "semantic-frame"
 
     def _frame_seed_node_ids(self, node_id: str) -> list[str]:
         seed_ids: list[str] = []
@@ -622,6 +728,33 @@ class VideoMemoryIndex:
             return []
 
         source_node_ids = set(self._semantic_frame_seed_node_ids(node_id))
+        if (
+            self._semantic_frame_vector_index is not None
+            and self._semantic_frame_vector_index.backend == "faiss"
+        ):
+            matches_by_node: dict[str, float] = {}
+            for embedding in source_embeddings:
+                for match in self._semantic_frame_vector_index.search(embedding, limit * 8):
+                    if match.node_id == node_id or match.node_id in source_node_ids:
+                        continue
+                    candidate = self.memory.get_node(match.node_id)
+                    if candidate.level == "video":
+                        continue
+                    if match.score >= SEMANTIC_FRAME_EDGE_THRESHOLD:
+                        matches_by_node[match.node_id] = max(
+                            matches_by_node.get(match.node_id, 0.0),
+                            match.score,
+                        )
+            matches = list(matches_by_node.items())
+            matches.sort(
+                key=lambda item: (
+                    -item[1],
+                    self.memory.get_node(item[0]).time_span.start,
+                    item[0],
+                )
+            )
+            return matches[:limit]
+
         matches: list[tuple[str, float]] = []
         for candidate in self.memory.nodes.values():
             if candidate.node_id == node_id or candidate.node_id in source_node_ids:
@@ -662,6 +795,17 @@ class VideoMemoryIndex:
                 continue
             embeddings.append([float(value) for value in raw_embedding])
         return embeddings
+
+    def _build_semantic_frame_vector_index(self) -> FrameVectorIndex | None:
+        records: list[FrameVectorRecord] = []
+        for node in self.memory.nodes.values():
+            if node.level == "video":
+                continue
+            for embedding in self._node_semantic_frame_embeddings(node.node_id):
+                records.append(FrameVectorRecord(node_id=node.node_id, embedding=embedding))
+        if not records:
+            return None
+        return FrameVectorIndex(records)
 
     def _max_frame_similarity(
         self,
@@ -935,17 +1079,7 @@ class VideoMemoryIndex:
         return self._image_text_embedding_cache[text]
 
     def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
-        if len(left) != len(right):
-            raise ValueError(f"Embedding dimension mismatch: left={len(left)} right={len(right)}")
-        left_norm = sum(value * value for value in left) ** 0.5
-        right_norm = sum(value * value for value in right) ** 0.5
-        if left_norm == 0 or right_norm == 0:
-            return 0.0
-        dot_product = sum(
-            left_value * right_value for left_value, right_value in zip(left, right, strict=True)
-        )
-        similarity = dot_product / (left_norm * right_norm)
-        return max(0.0, similarity)
+        return _cosine_similarity(left, right)
 
     def _tokenize(self, text: str) -> set[str]:
         return {
@@ -953,3 +1087,17 @@ class VideoMemoryIndex:
             for token in (match.group(0).lower() for match in TOKEN_PATTERN.finditer(text))
             if token not in STOPWORDS and len(token) > 1
         }
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right):
+        raise ValueError(f"Embedding dimension mismatch: left={len(left)} right={len(right)}")
+    left_norm = sum(value * value for value in left) ** 0.5
+    right_norm = sum(value * value for value in right) ** 0.5
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    dot_product = sum(
+        left_value * right_value for left_value, right_value in zip(left, right, strict=True)
+    )
+    similarity = dot_product / (left_norm * right_norm)
+    return max(0.0, similarity)

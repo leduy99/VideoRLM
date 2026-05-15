@@ -18,6 +18,9 @@ LONGSHOT_DATASET_NAME = "postvalid_v1"
 LONGSHOT_DATASET_SPLIT = "test"
 LONGSHOT_VIDEO_URL_TEMPLATE = "https://www.youtube.com/watch?v={video_id}"
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm", ".m4v")
+SPEECH_PROGRESS_UNIT_WEIGHT = 1
+GENERIC_VISUAL_PROGRESS_UNIT_WEIGHT = 1
+LOCAL_QWEN_VISUAL_PROGRESS_UNIT_WEIGHT = 6
 
 
 def _load_hf_dataset(path: str, name: str | None, split: str):
@@ -152,8 +155,7 @@ class LongShOTVideoResolver:
 class LongShOTVideoUnavailableError(RuntimeError):
     def __init__(self, *, sample_id: str, video_id: str, reason: str):
         super().__init__(
-            f"LongShOT video unavailable for sample_id={sample_id} "
-            f"video_id={video_id}: {reason}"
+            f"LongShOT video unavailable for sample_id={sample_id} video_id={video_id}: {reason}"
         )
         self.sample_id = sample_id
         self.video_id = video_id
@@ -164,8 +166,7 @@ class LongShOTMemoryUnavailableError(RuntimeError):
     def __init__(self, *, sample_id: str, video_id: str, memory_path: Path | None):
         location = str(memory_path) if memory_path is not None else "no memory cache directory"
         super().__init__(
-            f"LongShOT memory unavailable for sample_id={sample_id} "
-            f"video_id={video_id}: {location}"
+            f"LongShOT memory unavailable for sample_id={sample_id} video_id={video_id}: {location}"
         )
         self.sample_id = sample_id
         self.video_id = video_id
@@ -225,7 +226,9 @@ class LongShOTBenchmarkRunner:
         )
 
         completed_sample_ids = {
-            sample.get("sample_id") for sample in samples if sample.get("sample_id") in completed_ids
+            sample.get("sample_id")
+            for sample in samples
+            if sample.get("sample_id") in completed_ids
         }
         sample_units = [self._estimate_progress_units(sample) for sample in samples]
         progress_total = sum(sample_units)
@@ -392,6 +395,7 @@ class LongShOTBenchmarkRunner:
                 memory,
                 dialogue_context=list(dialogue_context),
                 task_type=payload.get("task"),
+                progress_callback=progress_callback,
             )
             self._log(
                 f"VideoRLM run done sample_id={sample_id} turn={index} "
@@ -513,7 +517,7 @@ class LongShOTBenchmarkRunner:
         if self.memory_builder.speech_recognizer is not None:
             units += self._estimate_speech_progress_units(duration_seconds)
         if self.memory_builder.visual_summarizer is not None:
-            units += len(self.memory_builder._visual_spans(TimeSpan(0.0, duration_seconds)))
+            units += self._estimate_visual_progress_units(duration_seconds)
         return max(1, units)
 
     def _will_prepare_artifacts_for_progress(self, sample: dict[str, Any]) -> bool:
@@ -543,8 +547,41 @@ class LongShOTBenchmarkRunner:
             return 1
         chunk_duration = getattr(recognizer, "chunk_duration_seconds", None)
         if isinstance(chunk_duration, (int, float)) and chunk_duration > 0:
-            return max(1, math.ceil(duration_seconds / chunk_duration))
-        return 1
+            return (
+                max(1, math.ceil(duration_seconds / chunk_duration)) * SPEECH_PROGRESS_UNIT_WEIGHT
+            )
+        return SPEECH_PROGRESS_UNIT_WEIGHT
+
+    def _estimate_visual_progress_units(self, duration_seconds: float) -> int:
+        if self.memory_builder.visual_summarizer is None:
+            return 0
+        span_count = len(self.memory_builder._visual_spans(TimeSpan(0.0, duration_seconds)))
+        return span_count * self._visual_progress_unit_weight()
+
+    def _visual_progress_unit_weight(self) -> int:
+        visual_summarizer = self.memory_builder.visual_summarizer
+        if visual_summarizer is None:
+            return 0
+        explicit_weight = getattr(visual_summarizer, "progress_unit_weight", None)
+        if isinstance(explicit_weight, int) and explicit_weight > 0:
+            return explicit_weight
+        if visual_summarizer.__class__.__name__ == "LocalQwenVisualSummarizer":
+            return LOCAL_QWEN_VISUAL_PROGRESS_UNIT_WEIGHT
+        return GENERIC_VISUAL_PROGRESS_UNIT_WEIGHT
+
+    def _progress_event_units(self, event: dict[str, Any], advance: int) -> int:
+        if advance <= 0:
+            return 0
+        phase = event.get("phase")
+        if phase == "visual":
+            return advance * self._visual_progress_unit_weight()
+        if phase == "visual_refinement":
+            return advance * LOCAL_QWEN_VISUAL_PROGRESS_UNIT_WEIGHT
+        if phase == "asr":
+            return advance * SPEECH_PROGRESS_UNIT_WEIGHT
+        if phase == "speech_refinement":
+            return advance * SPEECH_PROGRESS_UNIT_WEIGHT
+        return advance
 
     def _write_trace(
         self,
@@ -673,7 +710,7 @@ class _LongShOTProgressReporter:
         advance = int(event.get("advance") or 0)
         status = str(event.get("status") or self._format_status(event))
         if advance > 0:
-            self.advance(advance, status=status)
+            self.advance(self.runner._progress_event_units(event, advance), status=status)
         elif status:
             self.runner._progress_update(
                 self.progress,

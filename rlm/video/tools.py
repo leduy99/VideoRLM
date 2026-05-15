@@ -1,7 +1,13 @@
 import json
 import re
+import tempfile
+from collections.abc import Callable
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 
 from rlm.clients.base_lm import BaseLM
+from rlm.video.adapters import SpeechRecognizer, VisualSummarizer
 from rlm.video.evidence_pipeline import (
     build_question_spec,
     is_reopen_blocked,
@@ -10,6 +16,7 @@ from rlm.video.evidence_pipeline import (
     select_target_slot,
 )
 from rlm.video.index import STOPWORDS, TOKEN_PATTERN, VideoMemoryIndex
+from rlm.video.media import extract_audio_segment, get_videorlm_output_root
 from rlm.video.types import (
     ControllerAction,
     ControllerState,
@@ -18,6 +25,7 @@ from rlm.video.types import (
     Modality,
     Observation,
     SpeechSpan,
+    TimeSpan,
     VideoMemory,
 )
 
@@ -44,6 +52,9 @@ class VideoToolExecutor:
         speech_snippet_refiner: BaseLM | None = None,
         enable_hybrid_speech_refinement: bool = False,
         speech_refine_candidate_count: int = 4,
+        speech_refiner: SpeechRecognizer | None = None,
+        visual_refiner: VisualSummarizer | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.memory = memory
         self.index = index or VideoMemoryIndex(memory)
@@ -54,6 +65,9 @@ class VideoToolExecutor:
             enable_hybrid_speech_refinement and speech_snippet_refiner is not None
         )
         self.speech_refine_candidate_count = speech_refine_candidate_count
+        self.speech_refiner = speech_refiner
+        self.visual_refiner = visual_refiner
+        self.progress_callback = progress_callback
 
     def execute(self, action: ControllerAction, state: ControllerState) -> Observation:
         if action.action_type == "SEARCH":
@@ -313,6 +327,11 @@ class VideoToolExecutor:
         max_child_details: int = 2,
         max_child_chars: int = 900,
     ) -> tuple[str, dict[str, object]]:
+        if self._should_refine_visual_node(node):
+            refined_detail, refined_metadata = self._refine_visual_node(node)
+            if refined_detail:
+                return refined_detail, refined_metadata
+
         detail = node.visual_summary.strip()
         if node.metadata.get("visual_summary_mode") != "compact_parent_rollup":
             return detail, {}
@@ -341,6 +360,43 @@ class VideoToolExecutor:
         return "\n".join(parts), {
             "visual_summary_mode": "compact_parent_rollup",
             "selected_child_node_ids": selected_ids,
+        }
+
+    def _should_refine_visual_node(self, node) -> bool:
+        if self.visual_refiner is None:
+            return False
+        if node.metadata.get("visual_summary_mode") == "on_demand_refined":
+            return False
+        return bool(node.metadata.get("on_demand_visual_refinement"))
+
+    def _refine_visual_node(self, node) -> tuple[str, dict[str, object]]:
+        source_video_path = self.memory.metadata.get("source_video_path")
+        if not source_video_path:
+            return node.visual_summary.strip(), {
+                "visual_refinement": "skipped",
+                "reason": "missing_source_video_path",
+            }
+        with _temporary_visual_refinement_progress_callback(
+            self.visual_refiner,
+            self.progress_callback,
+        ):
+            summaries = self.visual_refiner.summarize(str(source_video_path), [node.time_span])
+        if not summaries:
+            return node.visual_summary.strip(), {
+                "visual_refinement": "skipped",
+                "reason": "empty_refiner_response",
+            }
+        summary = summaries[0]
+        node.visual_summary = summary.summary
+        node.tags = sorted(set(node.tags) | set(summary.tags))
+        node.entities = sorted(set(node.entities) | set(summary.entities))
+        node.metadata.update(summary.metadata)
+        node.metadata["visual_summary_mode"] = "on_demand_refined"
+        node.metadata["visual_refinement"] = "qwenvl_on_demand"
+        node.metadata["on_demand_visual_refinement"] = False
+        return summary.summary.strip(), {
+            "visual_refinement": "qwenvl_on_demand",
+            "refined_node_id": node.node_id,
         }
 
     def _select_visual_detail_children(
@@ -480,6 +536,8 @@ class VideoToolExecutor:
         return frontier
 
     def _build_speech_evidence(self, node, state: ControllerState) -> list[Evidence]:
+        if self._should_refine_speech_node(node):
+            self._refine_speech_node(node)
         selected_spans = self._select_relevant_speech_spans(node.speech_spans, state)
         if not selected_spans:
             return []
@@ -535,6 +593,45 @@ class VideoToolExecutor:
                 )
             )
         return evidence
+
+    def _should_refine_speech_node(self, node) -> bool:
+        if self.speech_refiner is None:
+            return False
+        if node.metadata.get("speech_summary_mode") == "on_demand_refined":
+            return False
+        return any(_is_lazy_speech_span(span) for span in node.speech_spans)
+
+    def _refine_speech_node(self, node) -> None:
+        source_video_path = self.memory.metadata.get("source_video_path")
+        if not source_video_path:
+            node.metadata["speech_refinement"] = "skipped_missing_source_video_path"
+            return
+
+        temp_root = get_videorlm_output_root() / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="videorlm_lazy_asr_", dir=str(temp_root)) as name:
+            audio_path = extract_audio_segment(
+                media_path=str(source_video_path),
+                span=node.time_span,
+                output_path=Path(name) / f"{node.node_id}.wav",
+                ffmpeg_bin=getattr(self.speech_refiner, "ffmpeg_bin", "ffmpeg"),
+            )
+            with _temporary_speech_refinement_progress_callback(
+                self.speech_refiner,
+                self.progress_callback,
+            ):
+                refined_spans = self.speech_refiner.recognize(str(audio_path))
+
+        refined_spans = [
+            _offset_on_demand_speech_span(span, node.time_span)
+            for span in refined_spans
+            if span.text.strip() and not _is_lazy_speech_span(span)
+        ]
+        node.speech_spans = refined_spans
+        node.metadata["speech_summary_mode"] = "on_demand_refined"
+        node.metadata["speech_refinement"] = "asr_on_demand"
+        node.metadata["on_demand_speech_refinement"] = False
+        node.metadata["speech_refined_span_count"] = len(refined_spans)
 
     def _select_relevant_speech_spans(
         self,
@@ -1259,3 +1356,75 @@ class VideoToolExecutor:
             keyword in doc_tokens or keyword in lower_text
             for keyword in ("worried", "lose", "fix", "repair", "open", "clasp")
         )
+
+
+@contextmanager
+def _temporary_visual_refinement_progress_callback(
+    component: Any,
+    callback: Callable[[dict[str, Any]], None] | None,
+):
+    if component is None or callback is None or not hasattr(component, "progress_callback"):
+        yield
+        return
+
+    original = component.progress_callback
+
+    def wrapped(event: dict[str, Any]) -> None:
+        payload = dict(event)
+        if payload.get("phase") == "visual":
+            payload["phase"] = "visual_refinement"
+            status = str(payload.get("status") or "")
+            payload["status"] = f"vl-refine {status}".strip()
+        callback(payload)
+
+    component.progress_callback = wrapped
+    try:
+        yield
+    finally:
+        component.progress_callback = original
+
+
+@contextmanager
+def _temporary_speech_refinement_progress_callback(
+    component: Any,
+    callback: Callable[[dict[str, Any]], None] | None,
+):
+    if component is None or callback is None or not hasattr(component, "progress_callback"):
+        yield
+        return
+
+    original = component.progress_callback
+
+    def wrapped(event: dict[str, Any]) -> None:
+        payload = dict(event)
+        if payload.get("phase") == "asr":
+            payload["phase"] = "speech_refinement"
+            status = str(payload.get("status") or "")
+            payload["status"] = f"asr-refine {status}".strip()
+        callback(payload)
+
+    component.progress_callback = wrapped
+    try:
+        yield
+    finally:
+        component.progress_callback = original
+
+
+def _is_lazy_speech_span(span: SpeechSpan) -> bool:
+    return span.language == "lazy_asr" or span.text.startswith("Lazy ASR index")
+
+
+def _offset_on_demand_speech_span(span: SpeechSpan, parent_span) -> SpeechSpan:
+    if span.time_span.duration == 0:
+        time_span = parent_span
+    else:
+        time_span = TimeSpan(
+            parent_span.start + span.time_span.start,
+            min(parent_span.end, parent_span.start + span.time_span.end),
+        )
+    return SpeechSpan(
+        text=span.text,
+        time_span=time_span,
+        speaker=span.speaker,
+        language=span.language,
+    )

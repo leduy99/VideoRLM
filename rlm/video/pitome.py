@@ -24,7 +24,7 @@ class FrameSelectionResult:
     frame_paths: list[Path]
     timestamps: list[float]
     dense_frame_count: int
-    embedding_backend: FrameEmbeddingBackend | None = None
+    embedding_backend: str | None = None
     embedding_size: int | None = None
     frame_embeddings: list[list[float]] = field(default_factory=list)
     protected_timestamps: list[float] = field(default_factory=list)
@@ -43,14 +43,18 @@ class FrameSelectionResult:
             "merged_pairs": [{"left": left, "right": right} for left, right in self.merged_pairs],
         }
         if self.frame_embeddings:
+            backend = self.embedding_backend
             metadata.update(
                 {
                     "pitome_frame_embeddings": [
                         list(embedding) for embedding in self.frame_embeddings
                     ],
-                    "pitome_frame_embedding_backend": self.embedding_backend,
+                    "pitome_frame_embedding_backend": backend,
                     "pitome_frame_embedding_source_size": self.embedding_size,
                     "pitome_frame_embedding_dim": len(self.frame_embeddings[0]),
+                    "pitome_frame_embedding_semantic_fusion": bool(
+                        backend and "+semantic" in backend
+                    ),
                 }
             )
         return metadata
@@ -324,6 +328,41 @@ def compact_frame_embedding(
             chunk = embedding[start : max(end, start + 1)]
             compact.append(sum(chunk) / len(chunk))
     return [round(value, 6) for value in _normalize_embedding(compact)]
+
+
+def fuse_frame_embeddings_with_semantic(
+    frame_embeddings: list[list[float]],
+    semantic_embeddings: list[list[float]],
+    *,
+    frame_weight: float = 0.75,
+    semantic_weight: float = 1.0,
+    output_size: int = DEFAULT_STORED_FRAME_EMBEDDING_SIZE,
+) -> list[list[float]]:
+    if len(frame_embeddings) != len(semantic_embeddings):
+        raise ValueError(
+            "frame_embeddings and semantic_embeddings must have the same length, "
+            f"got {len(frame_embeddings)} and {len(semantic_embeddings)}"
+        )
+    fused: list[list[float]] = []
+    for frame_embedding, semantic_embedding in zip(
+        frame_embeddings,
+        semantic_embeddings,
+        strict=True,
+    ):
+        if not frame_embedding or not semantic_embedding:
+            fused.append(compact_frame_embedding(frame_embedding, output_size=output_size))
+            continue
+        frame_part = [value * frame_weight for value in compact_frame_embedding(frame_embedding)]
+        semantic_part = [
+            value * semantic_weight for value in compact_frame_embedding(semantic_embedding)
+        ]
+        fused.append(
+            compact_frame_embedding(
+                [*frame_part, *semantic_part],
+                output_size=output_size,
+            )
+        )
+    return fused
 
 
 def _pixel_embedding(image: Any, embedding_size: int) -> list[float]:

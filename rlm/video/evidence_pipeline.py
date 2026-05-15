@@ -363,10 +363,11 @@ def search_v2(
                     hits_by_node[candidate.node_id] = candidate
                 query_sources[candidate.node_id].append(query)
 
-    ranked_hits = sorted(
+    ranked_candidates = sorted(
         hits_by_node.values(),
         key=lambda item: (-item.score, item.time_span.start, item.node_id),
-    )[:top_k]
+    )
+    ranked_hits = _select_temporally_diverse_hits(ranked_candidates, top_k)
     frontier = [hit.to_frontier_item() for hit in ranked_hits]
     for item in frontier:
         item.why_candidate = (
@@ -383,6 +384,67 @@ def search_v2(
         "hit_count": len(frontier),
         "query_sources": dict(query_sources),
     }
+
+
+def _select_temporally_diverse_hits(hits: list[SearchHit], top_k: int) -> list[SearchHit]:
+    selected: list[SearchHit] = []
+    deferred: list[SearchHit] = []
+    for hit in hits:
+        redundant_index = _temporally_redundant_index(hit, selected)
+        if redundant_index is not None:
+            current = selected[redundant_index]
+            if _prefer_more_specific_hit(hit, current):
+                selected[redundant_index] = hit
+                deferred.append(current)
+            else:
+                deferred.append(hit)
+            continue
+        selected.append(hit)
+        if len(selected) >= top_k:
+            return selected
+
+    for hit in deferred:
+        if hit not in selected:
+            selected.append(hit)
+        if len(selected) >= top_k:
+            break
+    return selected[:top_k]
+
+
+def _temporally_redundant_index(
+    hit: SearchHit,
+    selected: list[SearchHit],
+) -> int | None:
+    for index, item in enumerate(selected):
+        if hit.node_id == item.node_id:
+            return index
+        if not hit.time_span.overlaps(item.time_span):
+            continue
+        if hit.level == item.level:
+            return index
+        overlap = min(hit.time_span.end, item.time_span.end) - max(
+            hit.time_span.start,
+            item.time_span.start,
+        )
+        shorter_duration = max(1e-6, min(hit.time_span.duration, item.time_span.duration))
+        if overlap / shorter_duration >= 0.9:
+            return index
+    return None
+
+
+def _prefer_more_specific_hit(candidate: SearchHit, current: SearchHit) -> bool:
+    candidate_rank = _window_level_rank(candidate.level)
+    current_rank = _window_level_rank(current.level)
+    return candidate_rank < current_rank and candidate.score >= (current.score * 0.85)
+
+
+def _window_level_rank(level: str) -> int:
+    return {
+        "clip": 0,
+        "segment": 1,
+        "scene": 2,
+        "video": 3,
+    }.get(level, 4)
 
 
 def open_v2(

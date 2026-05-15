@@ -6,6 +6,7 @@ dependencies:
   - python=3.12
   - pip>=24
   - ffmpeg
+  - faiss-cpu
   - pip:
       - -e .
       - accelerate>=1.12.0

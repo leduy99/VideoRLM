@@ -491,9 +491,22 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     config.segment_duration_seconds = getattr(args, "segment_duration_seconds", 45.0)
     config.clip_duration_seconds = getattr(args, "clip_duration_seconds", 15.0)
     config.speech_chunk_duration_seconds = getattr(args, "speech_chunk_duration_seconds", 60.0)
+    config.speech.max_new_tokens = getattr(args, "speech_max_new_tokens", 512)
+    config.enable_speech_recognition = not getattr(args, "no_speech_recognition", False)
+    config.speech_backend = getattr(args, "speech_backend", "qwen")
+    config.faster_whisper_model = getattr(args, "faster_whisper_model", "small")
+    config.faster_whisper_device = getattr(args, "faster_whisper_device", "cpu")
+    config.faster_whisper_compute_type = getattr(
+        args,
+        "faster_whisper_compute_type",
+        "default",
+    )
+    config.lazy_speech_refinement = getattr(args, "lazy_speech_refinement", False)
+    config.lazy_visual_refinement = getattr(args, "lazy_visual_refinement", False)
     config.controller_enable_thinking = False
     config.verbose = getattr(args, "verbose", False)
     _apply_visual_preprocessing_args(config, args)
+    _apply_official_video_strategy(config)
     return config
 
 
@@ -516,7 +529,10 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--use-pitome",
         action="store_true",
-        help="Use PiToMe frame selection and clip-only visual preprocessing.",
+        help=(
+            "Use the official lazy PiToMe strategy: cheap PiToMe/SigLIP visual indexing, "
+            "lazy ASR indexing, graph search, and on-demand QwenVL/QwenASR refinement."
+        ),
     )
     parser.add_argument("--pitome-dense-frame-rate", type=float, default=1.0)
     parser.add_argument("--pitome-min-frame-count", type=int)
@@ -526,6 +542,18 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pitome-embedding-backend", choices=["pixel", "hybrid"], default="pixel")
     parser.add_argument("--pitome-anchor-frame-count", type=int, default=0)
     parser.add_argument("--pitome-max-selected-frames", type=int)
+    parser.add_argument(
+        "--pitome-scene-threshold",
+        type=float,
+        default=0.35,
+        help="FFmpeg scene-change threshold for adding real scene-boundary frames.",
+    )
+    parser.add_argument(
+        "--pitome-max-scene-boundary-frames",
+        type=int,
+        default=6,
+        help="Maximum detected scene-boundary frames to add inside each PiToMe span.",
+    )
     parser.add_argument(
         "--parent-visual-summary-mode",
         choices=["auto", "full", "compact"],
@@ -539,7 +567,10 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
         "--search-mode",
         choices=["auto", "lexical", "graph"],
         default="auto",
-        help="Search backend. auto uses graph search for PiToMe and lexical search otherwise.",
+        help=(
+            "Search backend. auto uses graph search for the lazy PiToMe strategy and "
+            "lexical search for original VideoRLM."
+        ),
     )
 
 
@@ -553,10 +584,30 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
     config.pitome_embedding_backend = getattr(args, "pitome_embedding_backend", "pixel")
     config.pitome_anchor_frame_count = getattr(args, "pitome_anchor_frame_count", 0)
     config.pitome_max_selected_frames = getattr(args, "pitome_max_selected_frames", None)
+    config.pitome_scene_threshold = getattr(args, "pitome_scene_threshold", 0.35)
+    config.pitome_max_scene_boundary_frames = getattr(
+        args,
+        "pitome_max_scene_boundary_frames",
+        6,
+    )
     parent_mode = getattr(args, "parent_visual_summary_mode", "auto")
     config.parent_visual_summary_mode = None if parent_mode == "auto" else parent_mode
     search_mode = getattr(args, "search_mode", "auto")
     config.search_mode = None if search_mode == "auto" else search_mode
+
+
+def _apply_official_video_strategy(config) -> None:
+    lazy_pitome_requested = (
+        bool(getattr(config, "use_pitome", False))
+        or bool(getattr(config, "lazy_visual_refinement", False))
+        or bool(getattr(config, "lazy_speech_refinement", False))
+    )
+    if not lazy_pitome_requested:
+        return
+    config.use_pitome = True
+    config.lazy_visual_refinement = True
+    if getattr(config, "enable_speech_recognition", True):
+        config.lazy_speech_refinement = True
 
 
 def _resolve_parent_visual_summary_mode(args: argparse.Namespace) -> str:
@@ -575,10 +626,48 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--attn-implementation")
     parser.add_argument(
+        "--no-speech-recognition",
+        action="store_true",
+        help="Skip local ASR during memory construction for faster visual-only runs.",
+    )
+    parser.add_argument(
         "--speech-chunk-duration-seconds",
         type=float,
         default=60.0,
         help="Local Qwen ASR audio chunk duration in seconds.",
+    )
+    parser.add_argument(
+        "--speech-max-new-tokens",
+        type=int,
+        default=512,
+        help="Maximum generated tokens per local Qwen ASR chunk.",
+    )
+    parser.add_argument(
+        "--speech-backend",
+        choices=["qwen", "faster-whisper"],
+        default="qwen",
+        help="Local ASR backend. Use --no-speech-recognition to disable ASR entirely.",
+    )
+    parser.add_argument("--faster-whisper-model", default="small")
+    parser.add_argument("--faster-whisper-device", default="cpu")
+    parser.add_argument("--faster-whisper-compute-type", default="default")
+    parser.add_argument(
+        "--lazy-speech-refinement",
+        action="store_true",
+        help=(
+            "Compatibility alias for the official lazy PiToMe strategy. "
+            "Build timestamp-only lazy ASR memory, then run local ASR only when "
+            "a retrieved speech node is opened."
+        ),
+    )
+    parser.add_argument(
+        "--lazy-visual-refinement",
+        action="store_true",
+        help=(
+            "Compatibility alias for the official lazy PiToMe strategy. "
+            "Build cheap PiToMe+embedding visual memory, then run local QwenVL only when "
+            "a retrieved visual node is opened."
+        ),
     )
     parser.add_argument(
         "--semantic-frame-embedding-repo",
