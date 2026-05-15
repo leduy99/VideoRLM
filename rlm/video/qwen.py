@@ -236,6 +236,7 @@ class QwenLocalVideoStackConfig:
     scene_duration_seconds: float = 180.0
     segment_duration_seconds: float = 45.0
     clip_duration_seconds: float = 15.0
+    speech_chunk_duration_seconds: float = 60.0
     controller_enable_thinking: bool = False
     use_pitome: bool = False
     pitome_dense_frame_rate: float = 1.0
@@ -365,6 +366,7 @@ class QwenLocalVideoStackConfig:
             device_map=str(self.speech.device_map or self.speech.device),
             torch_dtype=self.speech.torch_dtype,
             ffmpeg_bin=self.ffmpeg_bin,
+            chunk_duration_seconds=self.speech_chunk_duration_seconds,
             max_new_tokens=self.speech.max_new_tokens,
             verbose=self.verbose,
         )

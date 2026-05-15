@@ -159,6 +159,18 @@ class LongShOTVideoUnavailableError(RuntimeError):
         self.reason = reason
 
 
+class LongShOTMemoryUnavailableError(RuntimeError):
+    def __init__(self, *, sample_id: str, video_id: str, memory_path: Path | None):
+        location = str(memory_path) if memory_path is not None else "no memory cache directory"
+        super().__init__(
+            f"LongShOT memory unavailable for sample_id={sample_id} "
+            f"video_id={video_id}: {location}"
+        )
+        self.sample_id = sample_id
+        self.video_id = video_id
+        self.memory_path = memory_path
+
+
 class LongShOTBenchmarkRunner:
     def __init__(
         self,
@@ -173,6 +185,7 @@ class LongShOTBenchmarkRunner:
         verbose: bool = False,
         show_progress: bool = True,
         skip_unavailable_videos: bool = False,
+        memory_cache_only: bool = False,
     ):
         if history_mode not in {"gold", "candidate"}:
             raise ValueError(f"Unsupported LongShOT history mode: {history_mode}")
@@ -187,6 +200,7 @@ class LongShOTBenchmarkRunner:
         self.verbose = verbose
         self.show_progress = show_progress
         self.skip_unavailable_videos = skip_unavailable_videos
+        self.memory_cache_only = memory_cache_only
         self._memory_cache: dict[str, tuple[VideoMemory, Path | None]] = {}
 
         for directory in (self.artifact_cache_dir, self.memory_cache_dir, self.trace_dir):
@@ -246,6 +260,21 @@ class LongShOTBenchmarkRunner:
                 sample_start = time.perf_counter()
                 try:
                     result = self.run_sample(sample)
+                except LongShOTMemoryUnavailableError as exc:
+                    if not self.memory_cache_only:
+                        self._progress_update(
+                            progress,
+                            progress_task_id,
+                            status=f"failed {sample_id}",
+                        )
+                        raise
+                    self._progress_advance(
+                        progress,
+                        progress_task_id,
+                        status=f"skipped uncached memory {sample_id}",
+                    )
+                    self._log(str(exc))
+                    continue
                 except LongShOTVideoUnavailableError as exc:
                     if not self.skip_unavailable_videos:
                         self._progress_update(
@@ -291,17 +320,29 @@ class LongShOTBenchmarkRunner:
         payload = copy.deepcopy(sample)
         video_id = str(payload["video_id"])
         sample_id = str(payload.get("sample_id", video_id))
-        self._log(f"resolve video start video_id={video_id}")
-        try:
-            video_path = self.video_resolver.resolve(video_id)
-        except (FileNotFoundError, RuntimeError) as exc:
-            raise LongShOTVideoUnavailableError(
-                sample_id=sample_id,
-                video_id=video_id,
-                reason=str(exc),
-            ) from exc
-        self._log(f"resolve video done path={video_path}")
-        memory, memory_path = self._load_or_build_memory(payload, video_path)
+        cached = self._load_cached_memory(video_id)
+        if cached is not None:
+            memory, memory_path = cached
+            source_video_path = memory.metadata.get("source_video_path")
+            video_path = Path(source_video_path) if source_video_path else None
+        else:
+            if self.memory_cache_only:
+                raise LongShOTMemoryUnavailableError(
+                    sample_id=sample_id,
+                    video_id=video_id,
+                    memory_path=self._expected_memory_path(video_id),
+                )
+            self._log(f"resolve video start video_id={video_id}")
+            try:
+                video_path = self.video_resolver.resolve(video_id)
+            except (FileNotFoundError, RuntimeError) as exc:
+                raise LongShOTVideoUnavailableError(
+                    sample_id=sample_id,
+                    video_id=video_id,
+                    reason=str(exc),
+                ) from exc
+            self._log(f"resolve video done path={video_path}")
+            memory, memory_path = self._load_or_build_memory(payload, video_path)
         self._log(f"memory ready video_id={video_id} memory_path={memory_path}")
 
         dialogue_context: list[dict[str, str]] = []
@@ -363,7 +404,7 @@ class LongShOTBenchmarkRunner:
             pending_question = None
 
         payload["video_rlm_metadata"] = {
-            "video_path": str(video_path),
+            "video_path": str(video_path) if video_path is not None else None,
             "memory_path": str(memory_path) if memory_path else None,
             "history_mode": self.history_mode,
             "turn_results": turn_results,
@@ -376,19 +417,20 @@ class LongShOTBenchmarkRunner:
         video_path: Path,
     ) -> tuple[VideoMemory, Path | None]:
         video_id = str(sample["video_id"])
-        if video_id in self._memory_cache:
-            self._log(f"memory cache hit video_id={video_id}")
-            return self._memory_cache[video_id]
+        cached = self._load_cached_memory(video_id)
+        if cached is not None:
+            return cached
 
-        memory_path = self.memory_cache_dir / f"{video_id}.json" if self.memory_cache_dir else None
-        if memory_path is not None and memory_path.exists():
-            self._log(f"loading memory cache path={memory_path}")
-            memory = self.memory_builder.load_memory(memory_path)
-            self._memory_cache[video_id] = (memory, memory_path)
-            return memory, memory_path
+        if self.memory_cache_only:
+            raise LongShOTMemoryUnavailableError(
+                sample_id=str(sample.get("sample_id", video_id)),
+                video_id=video_id,
+                memory_path=self._expected_memory_path(video_id),
+            )
 
-        artifacts = None
+        memory_path = self._expected_memory_path(video_id)
         artifact_dir = self.artifact_cache_dir / video_id if self.artifact_cache_dir else None
+        artifacts = None
         if artifact_dir is not None and artifact_dir.exists():
             self._log(f"loading artifacts cache dir={artifact_dir}")
             artifacts = self.memory_builder.load_artifacts_dir(artifact_dir)
@@ -415,6 +457,23 @@ class LongShOTBenchmarkRunner:
 
         self._memory_cache[video_id] = (memory, memory_path)
         return memory, memory_path
+
+    def _load_cached_memory(self, video_id: str) -> tuple[VideoMemory, Path | None] | None:
+        if video_id in self._memory_cache:
+            self._log(f"memory cache hit video_id={video_id}")
+            return self._memory_cache[video_id]
+
+        memory_path = self._expected_memory_path(video_id)
+        if memory_path is not None and memory_path.exists():
+            self._log(f"loading memory cache path={memory_path}")
+            memory = self.memory_builder.load_memory(memory_path)
+            self._memory_cache[video_id] = (memory, memory_path)
+            return memory, memory_path
+
+        return None
+
+    def _expected_memory_path(self, video_id: str) -> Path | None:
+        return self.memory_cache_dir / f"{video_id}.json" if self.memory_cache_dir else None
 
     def _resolve_duration_seconds(self, sample: dict[str, Any]) -> float:
         duration = sample.get("duration")

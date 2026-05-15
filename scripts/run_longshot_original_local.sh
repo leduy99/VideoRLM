@@ -9,6 +9,13 @@ CONTROLLER_DEVICE="${CONTROLLER_DEVICE:-mps}"
 VISUAL_DEVICE="${VISUAL_DEVICE:-mps}"
 SPEECH_DEVICE="${SPEECH_DEVICE:-mps}"
 TORCH_DTYPE="${TORCH_DTYPE:-float16}"
+SPEECH_CHUNK_DURATION_SECONDS="${SPEECH_CHUNK_DURATION_SECONDS:-60}"
+MEMORY_CACHE_ONLY="${MEMORY_CACHE_ONLY:-0}"
+
+MEMORY_CACHE_ONLY_ARG=""
+if [[ "${MEMORY_CACHE_ONLY}" == "1" || "${MEMORY_CACHE_ONLY}" == "true" || "${MEMORY_CACHE_ONLY}" == "yes" ]]; then
+  MEMORY_CACHE_ONLY_ARG="--memory-cache-only"
+fi
 
 PYTHONUNBUFFERED=1 PYTORCH_ENABLE_MPS_FALLBACK=1 conda run --no-capture-output -n videorlm python -u -m rlm.video.cli run-longshot-local \
   --dataset-path MBZUAI/longshot-bench \
@@ -17,6 +24,7 @@ PYTHONUNBUFFERED=1 PYTORCH_ENABLE_MPS_FALLBACK=1 conda run --no-capture-output -
   --output "${OUTPUT_ROOT}/results.jsonl" \
   --video-dir data/longshotbench/videos \
   --skip-unavailable-videos \
+  ${MEMORY_CACHE_ONLY_ARG} \
   --artifacts-dir "${OUTPUT_ROOT}/artifacts" \
   --memory-dir "${OUTPUT_ROOT}/memories" \
   --trace-dir "${OUTPUT_ROOT}/traces" \
@@ -29,6 +37,7 @@ PYTHONUNBUFFERED=1 PYTORCH_ENABLE_MPS_FALLBACK=1 conda run --no-capture-output -
   --visual-device "${VISUAL_DEVICE}" \
   --speech-device "${SPEECH_DEVICE}" \
   --torch-dtype "${TORCH_DTYPE}" \
+  --speech-chunk-duration-seconds "${SPEECH_CHUNK_DURATION_SECONDS}" \
   --frame-count "${FRAME_COUNT}" \
   --frame-width "${FRAME_WIDTH}" \
   --verbose \

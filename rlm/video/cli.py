@@ -102,6 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip benchmark samples whose video cannot be found or downloaded.",
     )
+    longshot.add_argument(
+        "--memory-cache-only",
+        action="store_true",
+        help="Skip samples whose memory JSON is not already cached; never build video memory.",
+    )
     longshot.add_argument("--yt-dlp-bin", default="yt-dlp")
     longshot.add_argument("--cookies-from-browser")
     longshot.add_argument("--artifacts-dir")
@@ -158,6 +163,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-unavailable-videos",
         action="store_true",
         help="Skip benchmark samples whose video cannot be found or downloaded.",
+    )
+    longshot_local.add_argument(
+        "--memory-cache-only",
+        action="store_true",
+        help="Skip samples whose memory JSON is not already cached; never build video memory.",
     )
     longshot_local.add_argument("--yt-dlp-bin", default="yt-dlp")
     longshot_local.add_argument("--cookies-from-browser")
@@ -301,6 +311,7 @@ def _cmd_run_longshot(args: argparse.Namespace) -> int:
         verbose=args.verbose,
         show_progress=not args.no_progress,
         skip_unavailable_videos=args.skip_unavailable_videos,
+        memory_cache_only=args.memory_cache_only,
     )
     samples = load_longshot_samples(
         dataset_path=args.dataset_path,
@@ -356,6 +367,7 @@ def _cmd_run_longshot_local(args: argparse.Namespace) -> int:
         verbose=args.verbose,
         show_progress=not args.no_progress,
         skip_unavailable_videos=args.skip_unavailable_videos,
+        memory_cache_only=args.memory_cache_only,
     )
     samples = load_longshot_samples(
         dataset_path=args.dataset_path,
@@ -478,6 +490,7 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     config.scene_duration_seconds = getattr(args, "scene_duration_seconds", 180.0)
     config.segment_duration_seconds = getattr(args, "segment_duration_seconds", 45.0)
     config.clip_duration_seconds = getattr(args, "clip_duration_seconds", 15.0)
+    config.speech_chunk_duration_seconds = getattr(args, "speech_chunk_duration_seconds", 60.0)
     config.controller_enable_thinking = False
     config.verbose = getattr(args, "verbose", False)
     _apply_visual_preprocessing_args(config, args)
@@ -561,6 +574,12 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-forced-aligner", action="store_true")
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--attn-implementation")
+    parser.add_argument(
+        "--speech-chunk-duration-seconds",
+        type=float,
+        default=60.0,
+        help="Local Qwen ASR audio chunk duration in seconds.",
+    )
     parser.add_argument(
         "--semantic-frame-embedding-repo",
         help=(
