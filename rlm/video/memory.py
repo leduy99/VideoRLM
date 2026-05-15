@@ -1,5 +1,7 @@
 import json
 import re
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -144,6 +146,7 @@ class VideoMemoryBuilder:
         duration_seconds: float,
         video_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> PreparedVideoArtifacts:
         if not video_id:
             video_id = Path(video_path).stem
@@ -156,16 +159,18 @@ class VideoMemoryBuilder:
         self._log(f"visual spans planned count={len(visual_spans)} mode={self.visual_span_mode}")
 
         self._log("speech recognition start")
-        speech_spans = (
-            self.speech_recognizer.recognize(video_path) if self.speech_recognizer else []
-        )
+        with _temporary_progress_callback(self.speech_recognizer, progress_callback):
+            speech_spans = (
+                self.speech_recognizer.recognize(video_path) if self.speech_recognizer else []
+            )
         self._log(f"speech recognition done spans={len(speech_spans)}")
         self._log("visual summarization start")
-        visual_summaries = (
-            self.visual_summarizer.summarize(video_path, visual_spans)
-            if self.visual_summarizer
-            else []
-        )
+        with _temporary_progress_callback(self.visual_summarizer, progress_callback):
+            visual_summaries = (
+                self.visual_summarizer.summarize(video_path, visual_spans)
+                if self.visual_summarizer
+                else []
+            )
         self._log(f"visual summarization done summaries={len(visual_summaries)}")
         self._log("ocr extraction start")
         ocr_spans = self.ocr_extractor.extract(video_path) if self.ocr_extractor else []
@@ -207,6 +212,7 @@ class VideoMemoryBuilder:
             duration_seconds=duration_seconds,
             video_id=video_id,
             metadata=metadata,
+            progress_callback=None,
         )
         return self.build_from_artifacts(artifacts)
 
@@ -595,3 +601,19 @@ class VideoMemoryBuilder:
         if ocr_spans:
             parts.append(f"{len(ocr_spans)} OCR spans")
         return ", ".join(parts)
+
+@contextmanager
+def _temporary_progress_callback(
+    component: Any,
+    callback: Callable[[dict[str, Any]], None] | None,
+):
+    if component is None or callback is None or not hasattr(component, "progress_callback"):
+        yield
+        return
+
+    original = component.progress_callback
+    component.progress_callback = callback
+    try:
+        yield
+    finally:
+        component.progress_callback = original

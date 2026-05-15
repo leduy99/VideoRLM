@@ -273,7 +273,7 @@ class QwenLocalVideoStackConfig:
             model_name=controller_model,
             model_path=str(default_local_model_dir(controller_model)),
             device=controller_device,
-            device_map=controller_device,
+            device_map={"": controller_device},
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
             max_new_tokens=256,
@@ -282,7 +282,7 @@ class QwenLocalVideoStackConfig:
             model_name=visual_model,
             model_path=str(default_local_model_dir(visual_model)),
             device=visual_device,
-            device_map=visual_device,
+            device_map={"": visual_device},
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
             max_new_tokens=160,
@@ -291,7 +291,7 @@ class QwenLocalVideoStackConfig:
             model_name=speech_model,
             model_path=str(default_local_model_dir(speech_model)),
             device=speech_device,
-            device_map=speech_device,
+            device_map={"": speech_device},
             torch_dtype=torch_dtype,
             max_new_tokens=512,
         )
@@ -301,7 +301,7 @@ class QwenLocalVideoStackConfig:
                 model_name=forced_aligner_model,
                 model_path=str(default_local_model_dir(forced_aligner_model)),
                 device=speech_device,
-                device_map=speech_device,
+                device_map={"": speech_device},
                 torch_dtype=torch_dtype,
             )
         semantic_frame_embedding = None
@@ -363,7 +363,7 @@ class QwenLocalVideoStackConfig:
             forced_aligner_path=(
                 self.forced_aligner.resolved_model_path() if self.forced_aligner else None
             ),
-            device_map=str(self.speech.device_map or self.speech.device),
+            device_map=self.speech.device_map or self.speech.device,
             torch_dtype=self.speech.torch_dtype,
             ffmpeg_bin=self.ffmpeg_bin,
             chunk_duration_seconds=self.speech_chunk_duration_seconds,

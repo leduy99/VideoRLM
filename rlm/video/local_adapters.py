@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ class LocalQwenASRSpeechRecognizer:
     model_path: str | None = None
     forced_aligner_name: str | None = None
     forced_aligner_path: str | None = None
-    device_map: str = "cuda:0"
+    device_map: str | dict[str, Any] = "cuda:0"
     torch_dtype: str = "bfloat16"
     ffmpeg_bin: str = "ffmpeg"
     ffprobe_bin: str = "ffprobe"
@@ -39,6 +40,7 @@ class LocalQwenASRSpeechRecognizer:
     max_new_tokens: int = 512
     model: Any | None = None
     verbose: bool = False
+    progress_callback: Callable[[dict[str, Any]], None] | None = None
 
     def recognize(self, video_path: str) -> list[SpeechSpan]:
         self._log(f"recognize start path={video_path}")
@@ -66,12 +68,26 @@ class LocalQwenASRSpeechRecognizer:
 
             if self.forced_aligner_name or self.forced_aligner_path:
                 self._log("forced aligner transcription start")
+                self._notify_progress(
+                    phase="asr",
+                    event="planned",
+                    total=1,
+                    status="asr forced-aligner 0/1",
+                )
                 results = model.transcribe(
                     audio=str(audio_path),
                     language=None,
                     return_time_stamps=True,
                 )
                 spans = self._parse_results(results)
+                self._notify_progress(
+                    phase="asr",
+                    event="advance",
+                    advance=1,
+                    index=1,
+                    total=1,
+                    status=f"asr forced-aligner done spans={len(spans)}",
+                )
                 self._log(f"forced aligner transcription done spans={len(spans)}")
                 return spans
             spans = self._recognize_in_chunks(model=model, audio_path=audio_path, stack=stack)
@@ -94,6 +110,12 @@ class LocalQwenASRSpeechRecognizer:
             f"chunked ASR duration={duration_seconds:.2f}s chunks={len(chunks)} "
             f"chunk_seconds={self.chunk_duration_seconds:.2f}"
         )
+        self._notify_progress(
+            phase="asr",
+            event="planned",
+            total=len(chunks),
+            status=f"asr 0/{len(chunks)}",
+        )
         spans: list[SpeechSpan] = []
 
         for index, chunk_span in enumerate(chunks, start=1):
@@ -110,6 +132,14 @@ class LocalQwenASRSpeechRecognizer:
                 return_time_stamps=False,
             )
             parsed = self._parse_results(chunk_results)
+            self._notify_progress(
+                phase="asr",
+                event="advance",
+                advance=1,
+                index=index,
+                total=len(chunks),
+                status=f"asr {index}/{len(chunks)} parsed_spans={len(parsed)}",
+            )
             self._log(f"ASR chunk {index}/{len(chunks)} parsed_spans={len(parsed)}")
             for item in parsed:
                 spans.append(_offset_speech_span(item, chunk_span))
@@ -202,6 +232,10 @@ class LocalQwenASRSpeechRecognizer:
             return _group_word_level_spans(raw_spans)
         return raw_spans
 
+    def _notify_progress(self, **payload: Any) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(payload)
+
     def _log(self, message: str) -> None:
         if self.verbose:
             print(f"[LocalQwenASR] {message}", flush=True)
@@ -234,9 +268,16 @@ class LocalQwenVisualSummarizer:
     frame_embedding_provider: ImageTextEmbeddingProvider | None = None
     summary_granularity: VideoNodeLevel | None = None
     verbose: bool = False
+    progress_callback: Callable[[dict[str, Any]], None] | None = None
 
     def summarize(self, video_path: str, spans: list[TimeSpan]) -> list[VisualSummarySpan]:
         self._log(f"summarize start path={video_path} spans={len(spans)}")
+        self._notify_progress(
+            phase="visual",
+            event="planned",
+            total=len(spans),
+            status=f"visual 0/{len(spans)}",
+        )
         model, processor = self._ensure_loaded()
         output_root = get_videorlm_output_root() / "tmp"
         output_root.mkdir(parents=True, exist_ok=True)
@@ -297,6 +338,14 @@ class LocalQwenVisualSummarizer:
                         entities=[str(item) for item in payload.get("entities", [])],
                         metadata=frame_metadata,
                     )
+                )
+                self._notify_progress(
+                    phase="visual",
+                    event="advance",
+                    advance=1,
+                    index=index,
+                    total=len(spans),
+                    status=f"visual {index}/{len(spans)}",
                 )
         self._log(f"summarize done summaries={len(summaries)}")
         return summaries
@@ -406,6 +455,10 @@ class LocalQwenVisualSummarizer:
         if self.summary_granularity is not None:
             return self.summary_granularity
         return "scene" if span.duration >= self.scene_threshold_seconds else "clip"
+
+    def _notify_progress(self, **payload: Any) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(payload)
 
     def _log(self, message: str) -> None:
         if self.verbose:

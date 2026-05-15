@@ -1,14 +1,15 @@
 import copy
 import json
+import math
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
 from rlm.video.controller import VideoRLM
 from rlm.video.memory import VideoMemoryBuilder
-from rlm.video.types import VideoMemory, VideoRLMResult
+from rlm.video.types import TimeSpan, VideoMemory, VideoRLMResult
 
 LongShOTHistoryMode = Literal["gold", "candidate"]
 
@@ -226,40 +227,59 @@ class LongShOTBenchmarkRunner:
         completed_sample_ids = {
             sample.get("sample_id") for sample in samples if sample.get("sample_id") in completed_ids
         }
+        sample_units = [self._estimate_progress_units(sample) for sample in samples]
+        progress_total = sum(sample_units)
+        progress_completed = sum(
+            units
+            for sample, units in zip(samples, sample_units, strict=True)
+            if sample.get("sample_id") in completed_ids
+        )
         progress = self._build_progress()
         progress_task_id = None
         if progress is not None:
             progress.start()
             progress_task_id = progress.add_task(
                 "LongShOT",
-                total=len(samples),
-                completed=len(completed_sample_ids),
+                total=progress_total,
+                completed=progress_completed,
                 status="starting",
+                progress_label=f"{len(completed_sample_ids)}/{len(samples)} samples",
             )
         try:
             for sample_index, sample in enumerate(samples, start=1):
                 sample_id = sample.get("sample_id")
+                progress_label = f"{sample_index}/{len(samples)} samples"
                 if sample_id in completed_ids:
                     self._progress_update(
                         progress,
                         progress_task_id,
                         description=f"LongShOT {sample_index}/{len(samples)}",
                         status=f"skipped {sample_id}",
+                        progress_label=progress_label,
                     )
                     self._log(
                         f"sample {sample_index}/{len(samples)} skip completed sample_id={sample_id}"
                     )
                     continue
+                sample_progress = _LongShOTProgressReporter(
+                    runner=self,
+                    progress=progress,
+                    task_id=progress_task_id,
+                    sample_id=str(sample_id),
+                    estimated_units=sample_units[sample_index - 1],
+                    progress_label=progress_label,
+                )
                 self._progress_update(
                     progress,
                     progress_task_id,
                     description=f"LongShOT {sample_index}/{len(samples)}",
                     status=f"running {sample_id}",
+                    progress_label=progress_label,
                 )
                 self._log(f"sample {sample_index}/{len(samples)} start sample_id={sample_id}")
                 sample_start = time.perf_counter()
                 try:
-                    result = self.run_sample(sample)
+                    result = self.run_sample(sample, progress_callback=sample_progress)
                 except LongShOTMemoryUnavailableError as exc:
                     if not self.memory_cache_only:
                         self._progress_update(
@@ -268,11 +288,7 @@ class LongShOTBenchmarkRunner:
                             status=f"failed {sample_id}",
                         )
                         raise
-                    self._progress_advance(
-                        progress,
-                        progress_task_id,
-                        status=f"skipped uncached memory {sample_id}",
-                    )
+                    sample_progress.finish(status=f"skipped uncached memory {sample_id}")
                     self._log(str(exc))
                     continue
                 except LongShOTVideoUnavailableError as exc:
@@ -283,11 +299,7 @@ class LongShOTBenchmarkRunner:
                             status=f"failed {sample_id}",
                         )
                         raise
-                    self._progress_advance(
-                        progress,
-                        progress_task_id,
-                        status=f"skipped unavailable video {sample_id}",
-                    )
+                    sample_progress.finish(status=f"skipped unavailable video {sample_id}")
                     self._log(str(exc))
                     continue
                 except Exception:
@@ -304,11 +316,7 @@ class LongShOTBenchmarkRunner:
                         handle.write("\n")
                     self._log(f"sample {sample_id} appended output={output_file}")
                 elapsed = time.perf_counter() - sample_start
-                self._progress_advance(
-                    progress,
-                    progress_task_id,
-                    status=f"done {sample_id} in {_format_duration(elapsed)}",
-                )
+                sample_progress.finish(status=f"done {sample_id} in {_format_duration(elapsed)}")
                 self._log(f"sample {sample_id} done")
         finally:
             if progress is not None:
@@ -316,7 +324,11 @@ class LongShOTBenchmarkRunner:
         self._log(f"run_samples done new_results={len(results)}")
         return results
 
-    def run_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+    def run_sample(
+        self,
+        sample: dict[str, Any],
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         payload = copy.deepcopy(sample)
         video_id = str(payload["video_id"])
         sample_id = str(payload.get("sample_id", video_id))
@@ -342,7 +354,11 @@ class LongShOTBenchmarkRunner:
                     reason=str(exc),
                 ) from exc
             self._log(f"resolve video done path={video_path}")
-            memory, memory_path = self._load_or_build_memory(payload, video_path)
+            memory, memory_path = self._load_or_build_memory(
+                payload,
+                video_path,
+                progress_callback=progress_callback,
+            )
         self._log(f"memory ready video_id={video_id} memory_path={memory_path}")
 
         dialogue_context: list[dict[str, str]] = []
@@ -415,6 +431,7 @@ class LongShOTBenchmarkRunner:
         self,
         sample: dict[str, Any],
         video_path: Path,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[VideoMemory, Path | None]:
         video_id = str(sample["video_id"])
         cached = self._load_cached_memory(video_id)
@@ -444,6 +461,7 @@ class LongShOTBenchmarkRunner:
                     "longshot_sample_id": sample.get("sample_id"),
                     "longshot_task": sample.get("task"),
                 },
+                progress_callback=progress_callback,
             )
             if artifact_dir is not None:
                 self.memory_builder.save_artifacts_dir(artifacts, artifact_dir)
@@ -482,6 +500,51 @@ class LongShOTBenchmarkRunner:
                 f"LongShOT sample {sample.get('sample_id')} is missing the required duration field"
             )
         return float(duration)
+
+    def _estimate_progress_units(self, sample: dict[str, Any]) -> int:
+        units = 1
+        if not self._will_prepare_artifacts_for_progress(sample):
+            return units
+        try:
+            duration_seconds = self._resolve_duration_seconds(sample)
+        except (TypeError, ValueError):
+            return units
+
+        if self.memory_builder.speech_recognizer is not None:
+            units += self._estimate_speech_progress_units(duration_seconds)
+        if self.memory_builder.visual_summarizer is not None:
+            units += len(self.memory_builder._visual_spans(TimeSpan(0.0, duration_seconds)))
+        return max(1, units)
+
+    def _will_prepare_artifacts_for_progress(self, sample: dict[str, Any]) -> bool:
+        if self.memory_cache_only:
+            return False
+        video_id = sample.get("video_id")
+        if video_id is None:
+            return False
+        video_id = str(video_id)
+        if video_id in self._memory_cache:
+            return False
+        memory_path = self._expected_memory_path(video_id)
+        if memory_path is not None and memory_path.exists():
+            return False
+        artifact_dir = self.artifact_cache_dir / video_id if self.artifact_cache_dir else None
+        return not (artifact_dir is not None and artifact_dir.exists())
+
+    def _estimate_speech_progress_units(self, duration_seconds: float) -> int:
+        recognizer = self.memory_builder.speech_recognizer
+        if recognizer is None:
+            return 0
+        if getattr(recognizer, "forced_aligner_name", None) or getattr(
+            recognizer,
+            "forced_aligner_path",
+            None,
+        ):
+            return 1
+        chunk_duration = getattr(recognizer, "chunk_duration_seconds", None)
+        if isinstance(chunk_duration, (int, float)) and chunk_duration > 0:
+            return max(1, math.ceil(duration_seconds / chunk_duration))
+        return 1
 
     def _write_trace(
         self,
@@ -530,7 +593,7 @@ class LongShOTBenchmarkRunner:
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
-            TextColumn("{task.completed:.0f}/{task.total:.0f}"),
+            TextColumn("{task.fields[progress_label]}"),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             TextColumn("{task.fields[status]}"),
@@ -545,6 +608,7 @@ class LongShOTBenchmarkRunner:
         *,
         description: str | None = None,
         status: str | None = None,
+        progress_label: str | None = None,
     ) -> None:
         if progress is None or task_id is None:
             return
@@ -553,13 +617,108 @@ class LongShOTBenchmarkRunner:
             kwargs["description"] = description
         if status is not None:
             kwargs["status"] = status
+        if progress_label is not None:
+            kwargs["progress_label"] = progress_label
         if kwargs:
             progress.update(task_id, **kwargs)
 
-    def _progress_advance(self, progress, task_id, *, status: str) -> None:
-        if progress is None or task_id is None:
+    def _progress_advance_units(
+        self,
+        progress,
+        task_id,
+        *,
+        units: int,
+        status: str | None = None,
+        progress_label: str | None = None,
+    ) -> None:
+        if progress is None or task_id is None or units <= 0:
             return
-        progress.update(task_id, advance=1, status=status)
+        kwargs: dict[str, Any] = {"advance": units}
+        if status is not None:
+            kwargs["status"] = status
+        if progress_label is not None:
+            kwargs["progress_label"] = progress_label
+        progress.update(task_id, **kwargs)
+
+    def _progress_increase_total(self, progress, task_id, *, units: int) -> None:
+        if progress is None or task_id is None or units <= 0:
+            return
+        for task in progress.tasks:
+            if task.id == task_id:
+                total = (task.total or 0) + units
+                progress.update(task_id, total=total)
+                return
+
+
+class _LongShOTProgressReporter:
+    def __init__(
+        self,
+        *,
+        runner: LongShOTBenchmarkRunner,
+        progress,
+        task_id,
+        sample_id: str,
+        estimated_units: int,
+        progress_label: str,
+    ):
+        self.runner = runner
+        self.progress = progress
+        self.task_id = task_id
+        self.sample_id = sample_id
+        self.estimated_units = max(1, estimated_units)
+        self.completed_units = 0
+        self.progress_label = progress_label
+
+    def __call__(self, event: dict[str, Any]) -> None:
+        advance = int(event.get("advance") or 0)
+        status = str(event.get("status") or self._format_status(event))
+        if advance > 0:
+            self.advance(advance, status=status)
+        elif status:
+            self.runner._progress_update(
+                self.progress,
+                self.task_id,
+                status=f"{status} {self.sample_id}",
+                progress_label=self.progress_label,
+            )
+
+    def advance(self, units: int, *, status: str | None = None) -> None:
+        if units <= 0:
+            return
+        overflow = max(0, self.completed_units + units - self.estimated_units)
+        if overflow:
+            self.runner._progress_increase_total(self.progress, self.task_id, units=overflow)
+            self.estimated_units += overflow
+        self.completed_units += units
+        self.runner._progress_advance_units(
+            self.progress,
+            self.task_id,
+            units=units,
+            status=f"{status} {self.sample_id}" if status else None,
+            progress_label=self.progress_label,
+        )
+
+    def finish(self, *, status: str) -> None:
+        remaining = max(0, self.estimated_units - self.completed_units)
+        if remaining:
+            self.advance(remaining, status=status)
+            return
+        self.runner._progress_update(
+            self.progress,
+            self.task_id,
+            status=status,
+            progress_label=self.progress_label,
+        )
+
+    def _format_status(self, event: dict[str, Any]) -> str:
+        phase = event.get("phase")
+        index = event.get("index")
+        total = event.get("total")
+        if phase and index is not None and total is not None:
+            return f"{phase} {index}/{total}"
+        if phase and total is not None:
+            return f"{phase} 0/{total}"
+        return str(phase or "running")
 
 
 def _truncate_for_log(text: str, max_length: int = 180) -> str:
