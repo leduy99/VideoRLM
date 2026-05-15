@@ -1,6 +1,7 @@
 import copy
 import json
 import subprocess
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -147,6 +148,17 @@ class LongShOTVideoResolver:
             ) from exc
 
 
+class LongShOTVideoUnavailableError(RuntimeError):
+    def __init__(self, *, sample_id: str, video_id: str, reason: str):
+        super().__init__(
+            f"LongShOT video unavailable for sample_id={sample_id} "
+            f"video_id={video_id}: {reason}"
+        )
+        self.sample_id = sample_id
+        self.video_id = video_id
+        self.reason = reason
+
+
 class LongShOTBenchmarkRunner:
     def __init__(
         self,
@@ -159,6 +171,8 @@ class LongShOTBenchmarkRunner:
         trace_dir: str | Path | None = None,
         history_mode: LongShOTHistoryMode = "gold",
         verbose: bool = False,
+        show_progress: bool = True,
+        skip_unavailable_videos: bool = False,
     ):
         if history_mode not in {"gold", "candidate"}:
             raise ValueError(f"Unsupported LongShOT history mode: {history_mode}")
@@ -171,6 +185,8 @@ class LongShOTBenchmarkRunner:
         self.trace_dir = Path(trace_dir) if trace_dir else None
         self.history_mode = history_mode
         self.verbose = verbose
+        self.show_progress = show_progress
+        self.skip_unavailable_videos = skip_unavailable_videos
         self._memory_cache: dict[str, tuple[VideoMemory, Path | None]] = {}
 
         for directory in (self.artifact_cache_dir, self.memory_cache_dir, self.trace_dir):
@@ -193,20 +209,81 @@ class LongShOTBenchmarkRunner:
             f"output={output_file}"
         )
 
-        for sample_index, sample in enumerate(samples, start=1):
-            sample_id = sample.get("sample_id")
-            if sample_id in completed_ids:
-                self._log(f"sample {sample_index}/{len(samples)} skip completed sample_id={sample_id}")
-                continue
-            self._log(f"sample {sample_index}/{len(samples)} start sample_id={sample_id}")
-            result = self.run_sample(sample)
-            results.append(result)
-            if output_file is not None:
-                with output_file.open("a", encoding="utf-8") as handle:
-                    json.dump(result, handle, ensure_ascii=False)
-                    handle.write("\n")
-                self._log(f"sample {sample_id} appended output={output_file}")
-            self._log(f"sample {sample_id} done")
+        completed_sample_ids = {
+            sample.get("sample_id") for sample in samples if sample.get("sample_id") in completed_ids
+        }
+        progress = self._build_progress()
+        progress_task_id = None
+        if progress is not None:
+            progress.start()
+            progress_task_id = progress.add_task(
+                "LongShOT",
+                total=len(samples),
+                completed=len(completed_sample_ids),
+                status="starting",
+            )
+        try:
+            for sample_index, sample in enumerate(samples, start=1):
+                sample_id = sample.get("sample_id")
+                if sample_id in completed_ids:
+                    self._progress_update(
+                        progress,
+                        progress_task_id,
+                        description=f"LongShOT {sample_index}/{len(samples)}",
+                        status=f"skipped {sample_id}",
+                    )
+                    self._log(
+                        f"sample {sample_index}/{len(samples)} skip completed sample_id={sample_id}"
+                    )
+                    continue
+                self._progress_update(
+                    progress,
+                    progress_task_id,
+                    description=f"LongShOT {sample_index}/{len(samples)}",
+                    status=f"running {sample_id}",
+                )
+                self._log(f"sample {sample_index}/{len(samples)} start sample_id={sample_id}")
+                sample_start = time.perf_counter()
+                try:
+                    result = self.run_sample(sample)
+                except LongShOTVideoUnavailableError as exc:
+                    if not self.skip_unavailable_videos:
+                        self._progress_update(
+                            progress,
+                            progress_task_id,
+                            status=f"failed {sample_id}",
+                        )
+                        raise
+                    self._progress_advance(
+                        progress,
+                        progress_task_id,
+                        status=f"skipped unavailable video {sample_id}",
+                    )
+                    self._log(str(exc))
+                    continue
+                except Exception:
+                    self._progress_update(
+                        progress,
+                        progress_task_id,
+                        status=f"failed {sample_id}",
+                    )
+                    raise
+                results.append(result)
+                if output_file is not None:
+                    with output_file.open("a", encoding="utf-8") as handle:
+                        json.dump(result, handle, ensure_ascii=False)
+                        handle.write("\n")
+                    self._log(f"sample {sample_id} appended output={output_file}")
+                elapsed = time.perf_counter() - sample_start
+                self._progress_advance(
+                    progress,
+                    progress_task_id,
+                    status=f"done {sample_id} in {_format_duration(elapsed)}",
+                )
+                self._log(f"sample {sample_id} done")
+        finally:
+            if progress is not None:
+                progress.stop()
         self._log(f"run_samples done new_results={len(results)}")
         return results
 
@@ -215,7 +292,14 @@ class LongShOTBenchmarkRunner:
         video_id = str(payload["video_id"])
         sample_id = str(payload.get("sample_id", video_id))
         self._log(f"resolve video start video_id={video_id}")
-        video_path = self.video_resolver.resolve(video_id)
+        try:
+            video_path = self.video_resolver.resolve(video_id)
+        except (FileNotFoundError, RuntimeError) as exc:
+            raise LongShOTVideoUnavailableError(
+                sample_id=sample_id,
+                video_id=video_id,
+                reason=str(exc),
+            ) from exc
         self._log(f"resolve video done path={video_path}")
         memory, memory_path = self._load_or_build_memory(payload, video_path)
         self._log(f"memory ready video_id={video_id} memory_path={memory_path}")
@@ -367,9 +451,70 @@ class LongShOTBenchmarkRunner:
         if self.verbose:
             print(f"[LongShOT] {message}", flush=True)
 
+    def _build_progress(self):
+        if not self.show_progress:
+            return None
+        try:
+            from rich.console import Console
+            from rich.progress import (
+                BarColumn,
+                Progress,
+                TaskProgressColumn,
+                TextColumn,
+                TimeElapsedColumn,
+                TimeRemainingColumn,
+            )
+        except ImportError:
+            return None
+
+        return Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("{task.completed:.0f}/{task.total:.0f}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            TextColumn("{task.fields[status]}"),
+            console=Console(stderr=True),
+            transient=False,
+        )
+
+    def _progress_update(
+        self,
+        progress,
+        task_id,
+        *,
+        description: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        if progress is None or task_id is None:
+            return
+        kwargs: dict[str, Any] = {}
+        if description is not None:
+            kwargs["description"] = description
+        if status is not None:
+            kwargs["status"] = status
+        if kwargs:
+            progress.update(task_id, **kwargs)
+
+    def _progress_advance(self, progress, task_id, *, status: str) -> None:
+        if progress is None or task_id is None:
+            return
+        progress.update(task_id, advance=1, status=status)
+
 
 def _truncate_for_log(text: str, max_length: int = 180) -> str:
     normalized = " ".join(text.split())
     if len(normalized) <= max_length:
         return normalized
     return normalized[: max_length - 3] + "..."
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remaining_seconds = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{remaining_seconds:02d}s"
+    hours, remaining_minutes = divmod(minutes, 60)
+    return f"{hours}h{remaining_minutes:02d}m"

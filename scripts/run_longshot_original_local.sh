@@ -16,6 +16,7 @@ PYTHONUNBUFFERED=1 PYTORCH_ENABLE_MPS_FALLBACK=1 conda run --no-capture-output -
   --split test \
   --output "${OUTPUT_ROOT}/results.jsonl" \
   --video-dir data/longshotbench/videos \
+  --skip-unavailable-videos \
   --artifacts-dir "${OUTPUT_ROOT}/artifacts" \
   --memory-dir "${OUTPUT_ROOT}/memories" \
   --trace-dir "${OUTPUT_ROOT}/traces" \

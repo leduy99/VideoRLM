@@ -97,6 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
     longshot.add_argument("--video-id", action="append", default=[])
     longshot.add_argument("--task-filter", action="append", default=[])
     longshot.add_argument("--download-missing", action="store_true")
+    longshot.add_argument(
+        "--skip-unavailable-videos",
+        action="store_true",
+        help="Skip benchmark samples whose video cannot be found or downloaded.",
+    )
     longshot.add_argument("--yt-dlp-bin", default="yt-dlp")
     longshot.add_argument("--cookies-from-browser")
     longshot.add_argument("--artifacts-dir")
@@ -116,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
     longshot.add_argument("--ffmpeg-bin", default="ffmpeg")
     longshot.add_argument("--log-dir")
     longshot.add_argument("--verbose", action="store_true", help="Print live progress to stdout")
+    longshot.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the LongShOT benchmark progress bar.",
+    )
     _add_visual_preprocessing_args(longshot)
     _add_shared_qwen_endpoint_args(longshot)
 
@@ -144,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
     longshot_local.add_argument("--video-id", action="append", default=[])
     longshot_local.add_argument("--task-filter", action="append", default=[])
     longshot_local.add_argument("--download-missing", action="store_true")
+    longshot_local.add_argument(
+        "--skip-unavailable-videos",
+        action="store_true",
+        help="Skip benchmark samples whose video cannot be found or downloaded.",
+    )
     longshot_local.add_argument("--yt-dlp-bin", default="yt-dlp")
     longshot_local.add_argument("--cookies-from-browser")
     longshot_local.add_argument("--artifacts-dir")
@@ -160,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
     longshot_local.add_argument("--log-dir")
     longshot_local.add_argument(
         "--verbose", action="store_true", help="Print live progress to stdout"
+    )
+    longshot_local.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the LongShOT benchmark progress bar.",
     )
     longshot_local.add_argument("--controller-device", default="cuda:0")
     longshot_local.add_argument("--visual-device", default="cuda:1")
@@ -279,6 +299,8 @@ def _cmd_run_longshot(args: argparse.Namespace) -> int:
         trace_dir=trace_dir,
         history_mode=args.history_mode,
         verbose=args.verbose,
+        show_progress=not args.no_progress,
+        skip_unavailable_videos=args.skip_unavailable_videos,
     )
     samples = load_longshot_samples(
         dataset_path=args.dataset_path,
@@ -332,6 +354,8 @@ def _cmd_run_longshot_local(args: argparse.Namespace) -> int:
         trace_dir=trace_dir,
         history_mode=args.history_mode,
         verbose=args.verbose,
+        show_progress=not args.no_progress,
+        skip_unavailable_videos=args.skip_unavailable_videos,
     )
     samples = load_longshot_samples(
         dataset_path=args.dataset_path,
