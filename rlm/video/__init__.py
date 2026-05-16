@@ -18,7 +18,6 @@ from rlm.video.huggingface import (
     sanitize_repo_id,
 )
 from rlm.video.index import SearchHit, VideoMemoryIndex
-from rlm.video.local_adapters import LocalQwenASRSpeechRecognizer, LocalQwenVisualSummarizer
 from rlm.video.logger import VideoRLMLogger
 from rlm.video.longshot import (
     LONGSHOT_DATASET_NAME,
@@ -29,13 +28,6 @@ from rlm.video.longshot import (
     load_longshot_samples,
 )
 from rlm.video.memory import PreparedVideoArtifacts, VideoMemoryBuilder
-from rlm.video.qwen import (
-    LocalModelConfig,
-    OpenAICompatibleModelConfig,
-    QwenLocalVideoStackConfig,
-    QwenVideoRuntimeBundle,
-    QwenVideoStackConfig,
-)
 from rlm.video.semantic_embeddings import LocalImageTextEmbeddingProvider
 from rlm.video.traces import result_to_training_examples, save_training_examples
 from rlm.video.types import (
@@ -65,6 +57,40 @@ from rlm.video.types import (
     VideoRLMResult,
     VisualSummarySpan,
 )
+
+_LAZY_EXPORTS = {
+    "FasterWhisperSpeechRecognizer": (
+        "rlm.video.local_adapters",
+        "FasterWhisperSpeechRecognizer",
+    ),
+    "LazyPiToMeVisualIndexer": ("rlm.video.local_adapters", "LazyPiToMeVisualIndexer"),
+    "LazySpeechRecognizer": ("rlm.video.local_adapters", "LazySpeechRecognizer"),
+    "LocalModelConfig": ("rlm.video.qwen", "LocalModelConfig"),
+    "LocalQwenASRSpeechRecognizer": (
+        "rlm.video.local_adapters",
+        "LocalQwenASRSpeechRecognizer",
+    ),
+    "LocalQwenVisualSummarizer": (
+        "rlm.video.local_adapters",
+        "LocalQwenVisualSummarizer",
+    ),
+    "OpenAICompatibleModelConfig": ("rlm.video.qwen", "OpenAICompatibleModelConfig"),
+    "QwenLocalVideoStackConfig": ("rlm.video.qwen", "QwenLocalVideoStackConfig"),
+    "QwenVideoRuntimeBundle": ("rlm.video.qwen", "QwenVideoRuntimeBundle"),
+    "QwenVideoStackConfig": ("rlm.video.qwen", "QwenVideoStackConfig"),
+}
+
+
+def __getattr__(name: str):
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute_name = _LAZY_EXPORTS[name]
+    from importlib import import_module
+
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "ActionType",

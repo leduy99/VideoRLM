@@ -20,7 +20,18 @@ from rlm.video.types import TimeSpan, VideoMemory
 VRRQA_DATASET_PATH = "ucf-crcv/ImplicitQA"
 VRRQA_SPLIT = "eval"
 VRRQA_ANNOTATION_FILENAME = "ImplicitQAv0.1.2.jsonl"
-CHOICE_PATTERN = re.compile(r"\b([A-Z])\b")
+DIRECT_CHOICE_PATTERN = re.compile(r"^(?:OPTION[\s_-]*)?([A-Z])[\).]?$")
+LABELED_CHOICE_PATTERN = re.compile(
+    r"\b(?:ANSWER|CHOICE)\s*(?:IS|=|:)\s*\(?([A-Z])\)?\b"
+    r"|\bOPTION[\s_:=.-]*\(?([A-Z])\)?\b"
+)
+LEADING_CHOICE_PATTERN = re.compile(r"^\s*([A-Z])\s*(?:[).:]|-)\s+")
+DIAGNOSTIC_PREDICTION_MARKERS = (
+    "could not fill all required evidence slots",
+    "could not collect enough grounded evidence",
+    "found related background evidence",
+    "controller exhausted its budget",
+)
 SPEECH_PROGRESS_UNIT_WEIGHT = 1
 GENERIC_VISUAL_PROGRESS_UNIT_WEIGHT = 1
 LOCAL_QWEN_VISUAL_PROGRESS_UNIT_WEIGHT = 6
@@ -207,6 +218,7 @@ class VRRQABenchmarkRunner:
         show_progress: bool = True,
         skip_unavailable_videos: bool = False,
         single_window_memory: bool = True,
+        force_choice_finalizer: bool = True,
     ):
         self.video_rlm = video_rlm
         self.memory_builder = memory_builder
@@ -220,6 +232,7 @@ class VRRQABenchmarkRunner:
         self.show_progress = show_progress
         self.skip_unavailable_videos = skip_unavailable_videos
         self.single_window_memory = single_window_memory
+        self.force_choice_finalizer = force_choice_finalizer
         self._memory_cache: dict[str, VideoMemory] = {}
 
         for directory in (
@@ -363,10 +376,15 @@ class VRRQABenchmarkRunner:
         )
         options = non_null_options(sample)
         predicted_choice = parse_choice_prediction(result.answer, options)
+        prediction = result.answer
+        forced_choice_info = None
+        if self.force_choice_finalizer and predicted_choice is None:
+            predicted_choice, forced_choice_info = self._finalize_choice(sample, options, result)
+            prediction = forced_choice_info["prediction"]
         answer_choice = normalize_answer_choice(sample.get("answer_choice"))
         correct = predicted_choice is not None and predicted_choice == answer_choice
         trace_path = self._write_trace(sample, result.to_dict())
-        return {
+        record = {
             "question_id": str(sample["question_id"]),
             "video_id": str(sample["video_id"]),
             "category": sample.get("category"),
@@ -375,7 +393,7 @@ class VRRQABenchmarkRunner:
             "question_stop_time": float(sample["question_stop_time"]),
             "question_text": sample["question_text"],
             "options": options,
-            "prediction": result.answer,
+            "prediction": prediction,
             "predicted_choice": predicted_choice,
             "answer_choice": answer_choice,
             "answer_text": sample.get("answer_text"),
@@ -386,6 +404,34 @@ class VRRQABenchmarkRunner:
             "execution_time": round(time.perf_counter() - start_time, 4),
             "steps_used": result.state.budget.steps_used,
             "tool_calls_used": result.state.budget.tool_calls_used,
+        }
+        if forced_choice_info is not None:
+            record.update(forced_choice_info)
+        return record
+
+    def _finalize_choice(
+        self,
+        sample: dict[str, Any],
+        options: dict[str, str],
+        result,
+    ) -> tuple[str, dict[str, Any]]:
+        if not options:
+            raise ValueError(f"VRR-QA sample {sample['question_id']} has no answer options")
+        controller_client = getattr(self.video_rlm, "controller_client", None)
+        if controller_client is None:
+            raise ValueError("VRR-QA forced-choice finalizer requires video_rlm.controller_client")
+        prompt = build_vrrqa_forced_choice_prompt(sample, options, result)
+        finalizer_prediction = controller_client.completion(prompt).strip()
+        predicted_choice = parse_choice_prediction(finalizer_prediction, options)
+        fallback_choice = False
+        if predicted_choice is None:
+            predicted_choice = sorted(options)[0]
+            fallback_choice = True
+        return predicted_choice, {
+            "prediction": finalizer_prediction,
+            "rlm_prediction": result.answer,
+            "forced_choice_used": True,
+            "forced_choice_fallback": fallback_choice,
         }
 
     def _load_or_build_memory(
@@ -817,6 +863,64 @@ def build_vrrqa_prompt(sample: dict[str, Any]) -> str:
     )
 
 
+def build_vrrqa_forced_choice_prompt(
+    sample: dict[str, Any],
+    options: dict[str, str],
+    result,
+) -> str:
+    option_lines = [f"{letter}. {text}" for letter, text in options.items()]
+    evidence_lines = _vrrqa_evidence_lines(result)
+    trace_lines = _vrrqa_trace_lines(result)
+    sections = [
+        "You are a strict multiple-choice evaluator for VRR-QA.",
+        "Choose the best option from the listed choices using the available evidence.",
+        "Return only one option letter. Do not explain.",
+        "",
+        f"Question: {sample['question_text']}",
+        "Options:",
+        *option_lines,
+        "",
+        f"Initial VideoRLM answer: {result.answer}",
+    ]
+    if evidence_lines:
+        sections.extend(["", "Collected evidence:", *evidence_lines])
+    if trace_lines:
+        sections.extend(["", "Recent observations:", *trace_lines])
+    sections.extend(["", "Final answer letter:"])
+    return "\n".join(sections)
+
+
+def _vrrqa_evidence_lines(result, max_items: int = 8) -> list[str]:
+    evidence = getattr(getattr(result, "state", None), "evidence_ledger", [])
+    ordered = sorted(evidence, key=lambda item: (-item.confidence, item.time_span.start))
+    lines = []
+    for item in ordered[:max_items]:
+        detail = item.detail or item.claim
+        lines.append(
+            "- "
+            + json.dumps(
+                {
+                    "modality": item.modality,
+                    "time_span": item.time_span.to_dict(),
+                    "claim": item.claim,
+                    "detail": detail[:500],
+                },
+                ensure_ascii=True,
+            )
+        )
+    return lines
+
+
+def _vrrqa_trace_lines(result, max_items: int = 4) -> list[str]:
+    lines = []
+    for step in list(getattr(result, "trace", []))[-max_items:]:
+        observation = step.get("observation") or {}
+        summary = observation.get("summary")
+        if summary:
+            lines.append(f"- {summary}")
+    return lines
+
+
 def non_null_options(sample: dict[str, Any]) -> dict[str, str]:
     raw_options = sample.get("options") or {}
     if isinstance(raw_options, str):
@@ -856,17 +960,25 @@ def normalize_answer_choice(value: Any) -> str | None:
             return chr(ord("A") + index)
     if len(text) == 1 and "A" <= text <= "Z":
         return text
-    match = re.search(r"(?:^|[^A-Z])([A-Z])(?:$|[^A-Z])", text)
+    match = DIRECT_CHOICE_PATTERN.fullmatch(text)
     return match.group(1) if match else None
 
 
 def parse_choice_prediction(prediction: str, options: dict[str, str]) -> str | None:
     valid_choices = set(options)
+    if is_diagnostic_vrrqa_prediction(prediction):
+        return None
     normalized = prediction.strip().upper()
     if normalized in valid_choices:
         return normalized
-    for match in CHOICE_PATTERN.finditer(normalized):
-        choice = match.group(1)
+    direct_match = DIRECT_CHOICE_PATTERN.fullmatch(normalized)
+    if direct_match is not None and direct_match.group(1) in valid_choices:
+        return direct_match.group(1)
+    leading_match = LEADING_CHOICE_PATTERN.match(normalized)
+    if leading_match is not None and leading_match.group(1) in valid_choices:
+        return leading_match.group(1)
+    for match in LABELED_CHOICE_PATTERN.finditer(normalized):
+        choice = match.group(1) or match.group(2)
         if choice in valid_choices:
             return choice
 
@@ -875,6 +987,13 @@ def parse_choice_prediction(prediction: str, options: dict[str, str]) -> str | N
         if normalized_text == _normalize_text(option_text):
             return choice
     return None
+
+
+def is_diagnostic_vrrqa_prediction(prediction: str | None) -> bool:
+    if prediction is None:
+        return False
+    normalized = " ".join(str(prediction).lower().split())
+    return any(marker in normalized for marker in DIAGNOSTIC_PREDICTION_MARKERS)
 
 
 def evaluate_vrrqa_predictions(
@@ -896,9 +1015,12 @@ def evaluate_vrrqa_predictions(
             excluded_question_ids.append(question_id)
             continue
         options = non_null_options(sample) if "options" in sample else {}
-        predicted_choice = normalize_answer_choice(raw_prediction.get("predicted_choice"))
-        if predicted_choice is None and raw_prediction.get("prediction") and options:
-            predicted_choice = parse_choice_prediction(str(raw_prediction["prediction"]), options)
+        prediction_text = str(raw_prediction.get("prediction") or "")
+        predicted_choice = None
+        if prediction_text and options:
+            predicted_choice = parse_choice_prediction(prediction_text, options)
+        if predicted_choice is None and not is_diagnostic_vrrqa_prediction(prediction_text):
+            predicted_choice = normalize_answer_choice(raw_prediction.get("predicted_choice"))
         answer_choice = normalize_answer_choice(
             sample.get("answer_choice", raw_prediction.get("answer_choice"))
         )

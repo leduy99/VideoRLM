@@ -2,9 +2,22 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from rlm.video.qwen import QwenLocalVideoStackConfig
+try:
+    from rlm.video.qwen import QwenLocalVideoStackConfig
+except ModuleNotFoundError as exc:
+    if exc.name == "PIL":
+        raise SystemExit(
+            "Could not import Pillow/PIL for VRR-QA inference.\n"
+            f"Python executable: {sys.executable}\n"
+            "Install into that environment with:\n"
+            f"  {sys.executable} -m pip install Pillow\n"
+            "or, if this is the videorlm conda env:\n"
+            "  conda install -n videorlm -y pillow"
+        ) from exc
+    raise
 from rlm.video.vrrqa import (
     VRRQA_ANNOTATION_FILENAME,
     VRRQA_DATASET_PATH,
@@ -54,6 +67,11 @@ def parse_args() -> argparse.Namespace:
         "--no-progress",
         action="store_true",
         help="Disable the VRR-QA benchmark progress bar.",
+    )
+    parser.add_argument(
+        "--disable-forced-choice-finalizer",
+        action="store_true",
+        help="Disable the VRR-QA-only final multiple-choice fallback.",
     )
     parser.add_argument("--semantic-frame-embedding-repo")
     parser.add_argument("--semantic-frame-embedding-model-path")
@@ -163,6 +181,7 @@ def main() -> int:
         show_progress=not args.no_progress,
         skip_unavailable_videos=args.skip_unavailable_videos,
         single_window_memory=not args.multi_window_memory,
+        force_choice_finalizer=not args.disable_forced_choice_finalizer,
     )
     runner.run_samples(samples, output_path=output_path)
     print(f"Saved VRR-QA predictions to {output_path}")

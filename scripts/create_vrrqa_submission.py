@@ -6,7 +6,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from rlm.video.vrrqa import load_vrrqa_samples, normalize_answer_choice, parse_choice_prediction
+from rlm.video.vrrqa import (
+    is_diagnostic_vrrqa_prediction,
+    load_vrrqa_samples,
+    normalize_answer_choice,
+    parse_choice_prediction,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,13 +95,17 @@ def _load_records(path: Path) -> list[dict[str, Any]]:
 
 
 def _prediction_choice(prediction: dict[str, Any]) -> str | None:
+    options = prediction.get("options")
+    text = str(prediction.get("prediction") or "")
+    if is_diagnostic_vrrqa_prediction(text):
+        return None
+    if options and text:
+        choice = parse_choice_prediction(text, options)
+        if choice is not None:
+            return choice
     choice = normalize_answer_choice(prediction.get("predicted_choice"))
     if choice is not None:
         return choice
-    options = prediction.get("options")
-    text = str(prediction.get("prediction") or "")
-    if options and text:
-        return parse_choice_prediction(text, options)
     return normalize_answer_choice(text)
 
 
