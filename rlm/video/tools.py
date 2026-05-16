@@ -1,3 +1,4 @@
+import difflib
 import json
 import re
 import tempfile
@@ -137,10 +138,17 @@ class VideoToolExecutor:
         state: ControllerState,
         target_slot: str | None = None,
     ) -> Observation:
-        node = self.memory.get_node(node_id)
         selected_modality = modality or "visual"
         question_spec = state.question_spec or build_question_spec(state.question, state.task_type)
         selected_slot = target_slot or select_target_slot(question_spec, state.evidence_board)
+        node = self._get_node_or_none(node_id)
+        if node is None:
+            return self._unknown_node_observation(
+                action_type="OPEN",
+                node_id=node_id,
+                modality=selected_modality,
+                target_slot=selected_slot,
+            )
 
         if is_reopen_blocked(state.evidence_board, node.node_id, selected_modality, selected_slot):
             return Observation(
@@ -235,10 +243,18 @@ class VideoToolExecutor:
         )
 
     def split(self, node_id: str) -> Observation:
-        children = self.memory.child_nodes(node_id)
+        node = self._get_node_or_none(node_id)
+        if node is None:
+            return self._unknown_node_observation(
+                action_type="SPLIT",
+                node_id=node_id,
+                modality=None,
+                target_slot=None,
+            )
+        children = self.memory.child_nodes(node.node_id)
         frontier = []
         for child in children:
-            reason = f"Child node of {node_id} spanning {child.time_span.to_display()}"
+            reason = f"Child node of {node.node_id} spanning {child.time_span.to_display()}"
             recommended = self._recommended_modalities(child)
             frontier.append(
                 FrontierItem(
@@ -252,12 +268,12 @@ class VideoToolExecutor:
                 )
             )
 
-        summary = f"SPLIT expanded {node_id} into {len(frontier)} child nodes."
+        summary = f"SPLIT expanded {node.node_id} into {len(frontier)} child nodes."
         return Observation(
             kind="split",
             summary=summary,
             frontier=frontier,
-            node_id=node_id,
+            node_id=node.node_id,
             metadata={"child_count": len(frontier)},
         )
 
@@ -295,6 +311,53 @@ class VideoToolExecutor:
             evidence=selected,
             metadata={"answer": answer, "evidence_ids": list(evidence_ids)},
         )
+
+    def _get_node_or_none(self, node_id: str):
+        if not node_id:
+            return None
+        return self.memory.nodes.get(node_id)
+
+    def _unknown_node_observation(
+        self,
+        *,
+        action_type: str,
+        node_id: str,
+        modality: Modality | None,
+        target_slot: str | None,
+    ) -> Observation:
+        suggestions = self._suggest_existing_node_ids(node_id)
+        suffix = f" Suggested existing node ids: {', '.join(suggestions)}." if suggestions else ""
+        return Observation(
+            kind=action_type.lower(),
+            summary=(
+                f"{action_type} skipped unknown node_id {node_id!r}. "
+                "Use SEARCH results or SPLIT an existing parent node before opening a child."
+                f"{suffix}"
+            ),
+            node_id=node_id or None,
+            metadata={
+                "result": "unknown_node",
+                "requested_node_id": node_id,
+                "modality": modality,
+                "target_slot": target_slot,
+                "suggested_node_ids": suggestions,
+                "node_count": len(self.memory.nodes),
+                "progress_made": False,
+                "no_new_information": True,
+                "filled_slots": [],
+                "missing_slots": [],
+            },
+        )
+
+    def _suggest_existing_node_ids(self, node_id: str, *, limit: int = 5) -> list[str]:
+        if not node_id:
+            return []
+        node_ids = list(self.memory.nodes)
+        prefix_matches = [item for item in node_ids if item.startswith(_node_prefix(node_id))]
+        if prefix_matches:
+            return sorted(prefix_matches)[:limit]
+        return difflib.get_close_matches(node_id, node_ids, n=limit, cutoff=0.45)
+
 
     def _build_detail(self, node, modality: Modality) -> str:
         detail, _ = self._build_detail_with_metadata(node, modality, state=None)
@@ -1428,3 +1491,10 @@ def _offset_on_demand_speech_span(span: SpeechSpan, parent_span) -> SpeechSpan:
         speaker=span.speaker,
         language=span.language,
     )
+
+
+def _node_prefix(node_id: str) -> str:
+    for marker in ("_clip_", "_seg_", "_scene_"):
+        if marker in node_id:
+            return node_id.rsplit(marker, 1)[0] + marker
+    return node_id[: max(1, len(node_id) // 2)]

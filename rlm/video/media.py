@@ -2,8 +2,10 @@ import math
 import re
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from shutil import which
+from typing import Literal
 
 from rlm.video.types import TimeSpan
 
@@ -17,6 +19,13 @@ AUDIO_EXTENSIONS = {
     ".webm",
 }
 FFMPEG_SHOWINFO_PTS_PATTERN = re.compile(r"pts_time:([0-9]+(?:\.[0-9]+)?)")
+FrameExtractionStrategy = Literal["auto", "batch", "seek", "sequence"]
+FFMPEG_FRAME_EXTRACTION_BATCH_SIZE = 128
+FFMPEG_FRAME_EXTRACTION_MIN_BATCH_FRAMES = 16
+FFMPEG_FRAME_EXTRACTION_MAX_SECONDS_PER_FRAME = 1.0
+FFMPEG_FRAME_EXTRACTION_MAX_UNIFORM_STEP_DRIFT_SECONDS = 0.05
+FFMPEG_FRAME_EXTRACTION_SEEK_MARGIN_SECONDS = 0.25
+DEFAULT_SCENE_DETECTION_SAMPLE_RATE = None
 
 
 def get_repo_output_root() -> Path:
@@ -191,21 +200,56 @@ def extract_frame(
     media = Path(media_path)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        ffmpeg_bin,
-        "-y",
-        "-ss",
-        f"{timestamp_seconds:.3f}",
-        "-i",
-        str(media),
-        "-frames:v",
-        "1",
-    ]
+
+    errors: list[str] = []
+    for seek_before_input in (True, False):
+        command = _extract_frame_command(
+            media=media,
+            timestamp_seconds=timestamp_seconds,
+            output=output,
+            ffmpeg_bin=ffmpeg_bin,
+            width=width,
+            seek_before_input=seek_before_input,
+        )
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode == 0 and output.exists():
+            return output
+        if output.exists() and output.stat().st_size > 0:
+            return output
+        errors.append(_format_ffmpeg_error(command, result))
+
+    raise RuntimeError(
+        f"ffmpeg failed to extract frame at {timestamp_seconds:.3f}s from {media}. "
+        + " | ".join(errors)
+    )
+
+
+def _extract_frame_command(
+    *,
+    media: Path,
+    timestamp_seconds: float,
+    output: Path,
+    ffmpeg_bin: str,
+    width: int | None,
+    seek_before_input: bool,
+) -> list[str]:
+    command = [ffmpeg_bin, "-hide_banner", "-nostats", "-y"]
+    if seek_before_input:
+        command.extend(["-ss", f"{timestamp_seconds:.3f}"])
+    command.extend(["-i", str(media)])
+    if not seek_before_input:
+        command.extend(["-ss", f"{timestamp_seconds:.3f}"])
+    command.extend(["-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1"])
     if width is not None:
         command.extend(["-vf", f"scale={width}:-1"])
-    command.append(str(output))
-    subprocess.run(command, check=True, capture_output=True)
-    return output
+    command.extend(["-update", "1", "-q:v", "2", str(output)])
+    return command
+
+
+def _format_ffmpeg_error(command: list[str], result: subprocess.CompletedProcess[str]) -> str:
+    stderr = (result.stderr or "").strip().splitlines()
+    tail = "\n".join(stderr[-8:]) if stderr else "no stderr"
+    return f"returncode={result.returncode} command={' '.join(command)} stderr={tail}"
 
 
 def extract_frames_for_span(
@@ -215,27 +259,19 @@ def extract_frames_for_span(
     ffmpeg_bin: str = "ffmpeg",
     width: int | None = None,
     output_dir: str | Path | None = None,
+    extraction_strategy: FrameExtractionStrategy = "auto",
+    seek_workers: int = 1,
 ) -> list[Path]:
-    timestamps = sample_span_timestamps(span, frame_count)
-    if output_dir is None:
-        temp_dir = make_videorlm_temp_dir("videorlm_frames_")
-    else:
-        temp_dir = Path(output_dir)
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-    paths: list[Path] = []
-    for index, timestamp in enumerate(timestamps, start=1):
-        frame_path = temp_dir / f"frame_{index:03d}.jpg"
-        paths.append(
-            extract_frame(
-                media_path=media_path,
-                timestamp_seconds=timestamp,
-                output_path=frame_path,
-                ffmpeg_bin=ffmpeg_bin,
-                width=width,
-            )
-        )
-    return paths
+    return extract_frames_for_timestamps(
+        media_path=media_path,
+        timestamps=sample_span_timestamps(span, frame_count),
+        ffmpeg_bin=ffmpeg_bin,
+        width=width,
+        output_dir=output_dir,
+        prefix="frame",
+        extraction_strategy=extraction_strategy,
+        seek_workers=seek_workers,
+    )
 
 
 def extract_frames_for_timestamps(
@@ -245,6 +281,8 @@ def extract_frames_for_timestamps(
     width: int | None = None,
     output_dir: str | Path | None = None,
     prefix: str = "frame",
+    extraction_strategy: FrameExtractionStrategy = "auto",
+    seek_workers: int = 1,
 ) -> list[Path]:
     if output_dir is None:
         temp_dir = make_videorlm_temp_dir("videorlm_frames_")
@@ -252,19 +290,228 @@ def extract_frames_for_timestamps(
         temp_dir = Path(output_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
 
-    paths: list[Path] = []
-    for index, timestamp in enumerate(timestamps, start=1):
-        frame_path = temp_dir / f"{prefix}_{index:03d}.jpg"
-        paths.append(
-            extract_frame(
+    paths = [temp_dir / f"{prefix}_{index:03d}.jpg" for index in range(1, len(timestamps) + 1)]
+    if not paths:
+        return []
+
+    if extraction_strategy not in {"auto", "batch", "seek", "sequence"}:
+        raise ValueError(f"Unsupported frame extraction strategy: {extraction_strategy}")
+    if seek_workers < 1:
+        raise ValueError(f"seek_workers must be at least 1, got {seek_workers}")
+
+    should_sequence = extraction_strategy == "sequence"
+    if should_sequence:
+        try:
+            return _extract_frames_for_timestamps_sequence(
                 media_path=media_path,
-                timestamp_seconds=timestamp,
-                output_path=frame_path,
+                timestamps=timestamps,
+                output_paths=paths,
                 ffmpeg_bin=ffmpeg_bin,
                 width=width,
             )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            pass
+
+    should_batch = extraction_strategy == "batch" or (
+        extraction_strategy == "auto" and _should_batch_frame_extraction(timestamps)
+    )
+    if should_batch:
+        try:
+            return _extract_frames_for_timestamps_batched(
+                media_path=media_path,
+                timestamps=timestamps,
+                output_paths=paths,
+                ffmpeg_bin=ffmpeg_bin,
+                width=width,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            pass
+
+    return _extract_frames_for_timestamps_seeked(
+        media_path=media_path,
+        timestamps=timestamps,
+        output_paths=paths,
+        ffmpeg_bin=ffmpeg_bin,
+        width=width,
+        seek_workers=seek_workers,
+    )
+
+
+def _should_sequence_frame_extraction(timestamps: list[float]) -> bool:
+    if len(timestamps) < FFMPEG_FRAME_EXTRACTION_MIN_BATCH_FRAMES:
+        return False
+    step = _uniform_timestamp_step(timestamps)
+    return step is not None and step > 0
+
+
+def _uniform_timestamp_step(timestamps: list[float]) -> float | None:
+    if len(timestamps) < 2:
+        return None
+    deltas = [right - left for left, right in zip(timestamps, timestamps[1:], strict=False)]
+    if any(delta <= 0 for delta in deltas):
+        return None
+    step = sum(deltas) / len(deltas)
+    tolerance = max(FFMPEG_FRAME_EXTRACTION_MAX_UNIFORM_STEP_DRIFT_SECONDS, step * 0.02)
+    if any(abs(delta - step) > tolerance for delta in deltas):
+        return None
+    return step
+
+
+def _extract_frames_for_timestamps_sequence(
+    *,
+    media_path: str | Path,
+    timestamps: list[float],
+    output_paths: list[Path],
+    ffmpeg_bin: str,
+    width: int | None,
+) -> list[Path]:
+    step = _uniform_timestamp_step(timestamps)
+    if step is None or step <= 0:
+        raise RuntimeError("ffmpeg sequence extraction requires uniformly spaced timestamps")
+
+    _require_executable(ffmpeg_bin)
+    output_dir = output_paths[0].parent
+    for output_path in output_paths:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    prefix = _sequence_output_prefix(output_paths)
+    output_pattern = str(output_dir / f"{prefix}_%03d.jpg")
+    fps = 1.0 / step
+    filters = [f"fps=fps={fps:.8f}"]
+    if width is not None:
+        filters.append(f"scale={width}:-1")
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-nostats",
+        "-y",
+        "-ss",
+        f"{timestamps[0]:.3f}",
+        "-i",
+        str(Path(media_path)),
+        "-frames:v",
+        str(len(timestamps)),
+        "-vf",
+        ",".join(filters),
+        "-q:v",
+        "2",
+        output_pattern,
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+    missing_paths = [path for path in output_paths if not path.exists()]
+    if missing_paths:
+        missing = ", ".join(str(path) for path in missing_paths[:3])
+        if len(missing_paths) > 3:
+            missing += ", ..."
+        raise RuntimeError(f"ffmpeg sequence frame extraction missed output file(s): {missing}")
+    return output_paths
+
+
+def _sequence_output_prefix(output_paths: list[Path]) -> str:
+    first_stem = output_paths[0].stem
+    match = re.match(r"(.+)_\d+$", first_stem)
+    return match.group(1) if match else first_stem
+
+
+def _should_batch_frame_extraction(timestamps: list[float]) -> bool:
+    if len(timestamps) < FFMPEG_FRAME_EXTRACTION_MIN_BATCH_FRAMES:
+        return False
+    timestamp_range = max(timestamps) - min(timestamps)
+    if timestamp_range <= 0:
+        return False
+    seconds_per_frame = timestamp_range / max(len(timestamps) - 1, 1)
+    return seconds_per_frame <= FFMPEG_FRAME_EXTRACTION_MAX_SECONDS_PER_FRAME
+
+
+def _extract_frames_for_timestamps_seeked(
+    *,
+    media_path: str | Path,
+    timestamps: list[float],
+    output_paths: list[Path],
+    ffmpeg_bin: str,
+    width: int | None,
+    seek_workers: int,
+) -> list[Path]:
+    def extract_one(item: tuple[float, Path]) -> Path:
+        timestamp, frame_path = item
+        return extract_frame(
+            media_path=media_path,
+            timestamp_seconds=timestamp,
+            output_path=frame_path,
+            ffmpeg_bin=ffmpeg_bin,
+            width=width,
         )
-    return paths
+
+    items = list(zip(timestamps, output_paths, strict=True))
+    if seek_workers == 1 or len(items) <= 1:
+        return [extract_one(item) for item in items]
+
+    worker_count = min(seek_workers, len(items))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(extract_one, items))
+
+
+def _extract_frames_for_timestamps_batched(
+    *,
+    media_path: str | Path,
+    timestamps: list[float],
+    output_paths: list[Path],
+    ffmpeg_bin: str,
+    width: int | None,
+) -> list[Path]:
+    if len(timestamps) != len(output_paths):
+        raise ValueError(
+            "timestamps and output_paths must have the same length, "
+            f"got {len(timestamps)} and {len(output_paths)}"
+        )
+    _require_executable(ffmpeg_bin)
+    for start in range(0, len(timestamps), FFMPEG_FRAME_EXTRACTION_BATCH_SIZE):
+        end = start + FFMPEG_FRAME_EXTRACTION_BATCH_SIZE
+        _run_frame_extraction_batch(
+            media_path=media_path,
+            timestamps=timestamps[start:end],
+            output_paths=output_paths[start:end],
+            ffmpeg_bin=ffmpeg_bin,
+            width=width,
+        )
+    return output_paths
+
+
+def _run_frame_extraction_batch(
+    *,
+    media_path: str | Path,
+    timestamps: list[float],
+    output_paths: list[Path],
+    ffmpeg_bin: str,
+    width: int | None,
+) -> None:
+    if not timestamps:
+        return
+
+    media = Path(media_path)
+    seek_start = max(
+        0.0,
+        min(timestamps) - FFMPEG_FRAME_EXTRACTION_SEEK_MARGIN_SECONDS,
+    )
+    command = [ffmpeg_bin, "-hide_banner", "-nostats", "-y"]
+    if seek_start > 0:
+        command.extend(["-ss", f"{seek_start:.3f}"])
+    command.extend(["-i", str(media)])
+
+    for timestamp, output_path in zip(timestamps, output_paths, strict=True):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        relative_timestamp = max(0.0, timestamp - seek_start)
+        command.extend(["-map", "0:v:0", "-ss", f"{relative_timestamp:.3f}"])
+        if width is not None:
+            command.extend(["-vf", f"scale={width}:-1"])
+        command.extend(["-frames:v", "1", "-update", "1", str(output_path)])
+
+    subprocess.run(command, check=True, capture_output=True)
+    missing_paths = [path for path in output_paths if not path.exists()]
+    if missing_paths:
+        missing = ", ".join(str(path) for path in missing_paths[:3])
+        if len(missing_paths) > 3:
+            missing += ", ..."
+        raise RuntimeError(f"ffmpeg batch frame extraction missed output file(s): {missing}")
 
 
 def detect_scene_boundary_timestamps(
@@ -275,6 +522,8 @@ def detect_scene_boundary_timestamps(
     threshold: float = 0.35,
     max_timestamps: int = 8,
     width: int | None = 160,
+    sample_rate: float | None = DEFAULT_SCENE_DETECTION_SAMPLE_RATE,
+    keyframes_only: bool = False,
 ) -> list[float]:
     if threshold <= 0 or threshold >= 1:
         raise ValueError(f"threshold must be within (0, 1), got {threshold}")
@@ -282,16 +531,22 @@ def detect_scene_boundary_timestamps(
         raise ValueError(f"max_timestamps must be non-negative, got {max_timestamps}")
     if max_timestamps == 0:
         return []
+    if sample_rate is not None and sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive when provided, got {sample_rate}")
     if span is not None and span.duration <= 0:
         return []
 
     _require_executable(ffmpeg_bin)
     media = Path(media_path)
     command = [ffmpeg_bin, "-hide_banner", "-nostats"]
+    if keyframes_only:
+        command.extend(["-skip_frame", "nokey"])
     if span is not None:
         command.extend(["-ss", f"{span.start:.3f}", "-t", f"{span.duration:.3f}"])
     command.extend(["-i", str(media)])
     filters = []
+    if sample_rate is not None:
+        filters.append(f"fps=fps={sample_rate:.6f}")
     if width is not None:
         filters.append(f"scale={width}:-1")
     filters.append(f"select=gt(scene\\,{threshold:.3f})")

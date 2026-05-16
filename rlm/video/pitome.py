@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from rlm.video.media import (
+    FrameExtractionStrategy,
     extract_frames_for_span,
     extract_frames_for_timestamps,
     sample_span_timestamps,
@@ -16,6 +17,7 @@ from rlm.video.types import TimeSpan
 FrameSelectionStrategy = Literal["uniform", "pitome"]
 FrameEmbeddingBackend = Literal["pixel", "hybrid"]
 DEFAULT_STORED_FRAME_EMBEDDING_SIZE = 64
+FRAME_EMBEDDING_TORCH_BATCH_SIZE = 128
 
 
 @dataclass
@@ -98,7 +100,10 @@ def select_visual_frames_for_span(
     similarity_threshold: float = 0.8,
     embedding_size: int = 16,
     embedding_backend: FrameEmbeddingBackend = "pixel",
+    embedding_device: str | None = None,
     anchor_frame_count: int = 0,
+    frame_extraction_strategy: FrameExtractionStrategy = "auto",
+    frame_extraction_seek_workers: int = 1,
 ) -> FrameSelectionResult:
     if strategy == "uniform":
         timestamps = sample_span_timestamps(span, uniform_frame_count)
@@ -109,6 +114,8 @@ def select_visual_frames_for_span(
             ffmpeg_bin=ffmpeg_bin,
             width=width,
             output_dir=output_dir,
+            extraction_strategy=frame_extraction_strategy,
+            seek_workers=frame_extraction_seek_workers,
         )
         return FrameSelectionResult(
             strategy="uniform",
@@ -129,17 +136,21 @@ def select_visual_frames_for_span(
         width=width,
         output_dir=output_dir,
         prefix="dense",
+        extraction_strategy=frame_extraction_strategy,
+        seek_workers=frame_extraction_seek_workers,
     )
     embeddings = load_frame_embeddings(
         dense_frame_paths,
         embedding_size=embedding_size,
         backend=embedding_backend,
+        device=embedding_device,
     )
     selection = select_frame_indices_from_embeddings(
         embeddings,
         protect_ratio=protect_ratio,
         similarity_threshold=similarity_threshold,
         anchor_count=anchor_frame_count,
+        embedding_device=embedding_device,
     )
 
     selected_indices = selection["selected_indices"]
@@ -176,6 +187,7 @@ def select_frame_indices_from_embeddings(
     protect_ratio: float = 0.15,
     similarity_threshold: float = 0.8,
     anchor_count: int = 0,
+    embedding_device: str | None = None,
 ) -> dict[str, Any]:
     if not embeddings:
         return {
@@ -199,8 +211,8 @@ def select_frame_indices_from_embeddings(
             "energy_scores": [0.0],
         }
 
-    similarity_matrix = build_similarity_matrix(embeddings)
-    energy_scores = compute_energy_scores(similarity_matrix)
+    similarity_matrix = build_similarity_matrix(embeddings, device=embedding_device)
+    energy_scores = compute_energy_scores(similarity_matrix, device=embedding_device)
     protected_count = max(1, math.ceil(len(embeddings) * protect_ratio))
     energy_order = sorted(range(len(embeddings)), key=lambda index: energy_scores[index])
     anchor_indices = _uniform_anchor_indices(len(embeddings), anchor_count)
@@ -246,7 +258,72 @@ def select_frame_indices_from_embeddings(
     }
 
 
-def build_similarity_matrix(embeddings: list[list[float]]) -> list[list[float]]:
+def build_similarity_matrix(
+    embeddings: list[list[float]],
+    *,
+    device: str | None = None,
+) -> list[list[float]]:
+    torch_matrix = _build_similarity_matrix_torch(embeddings, device=device)
+    if torch_matrix is not None:
+        return torch_matrix
+    numpy_matrix = _build_similarity_matrix_numpy(embeddings)
+    if numpy_matrix is not None:
+        return numpy_matrix
+    return _build_similarity_matrix_python(embeddings)
+
+
+def _build_similarity_matrix_torch(
+    embeddings: list[list[float]],
+    *,
+    device: str | None,
+) -> list[list[float]] | None:
+    torch_module = _load_torch_for_device(device)
+    if torch_module is None:
+        return None
+    if not embeddings:
+        return []
+    dimension = len(embeddings[0])
+    if any(len(item) != dimension for item in embeddings):
+        return None
+
+    torch_device = _resolve_torch_device(torch_module, device)
+    with torch_module.inference_mode():
+        matrix = torch_module.tensor(embeddings, dtype=torch_module.float32, device=torch_device)
+        if matrix.ndim != 2:
+            return None
+        norms = matrix.norm(p=2, dim=1, keepdim=True)
+        normalized = matrix / norms.clamp_min(1e-12)
+        zero_norm_rows = norms.squeeze(1) == 0
+        if bool(zero_norm_rows.any()) and dimension > 0:
+            normalized[zero_norm_rows] = 1.0 / math.sqrt(dimension)
+        return (normalized @ normalized.T).detach().cpu().tolist()
+
+
+def _build_similarity_matrix_numpy(embeddings: list[list[float]]) -> list[list[float]] | None:
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    if not embeddings:
+        return []
+    dimension = len(embeddings[0])
+    if any(len(item) != dimension for item in embeddings):
+        return None
+
+    matrix = np.asarray(embeddings, dtype=np.float32)
+    if matrix.ndim != 2:
+        return None
+
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    normalized = matrix / np.maximum(norms, 1e-12)
+    zero_norm_rows = norms[:, 0] == 0
+    if zero_norm_rows.any() and dimension > 0:
+        normalized[zero_norm_rows] = 1.0 / math.sqrt(dimension)
+    return (normalized @ normalized.T).tolist()
+
+
+def _build_similarity_matrix_python(embeddings: list[list[float]]) -> list[list[float]]:
     normalized = [_normalize_embedding(item) for item in embeddings]
     matrix: list[list[float]] = []
     for left in normalized:
@@ -262,7 +339,48 @@ def build_similarity_matrix(embeddings: list[list[float]]) -> list[list[float]]:
     return matrix
 
 
-def compute_energy_scores(similarity_matrix: list[list[float]]) -> list[float]:
+def compute_energy_scores(
+    similarity_matrix: list[list[float]],
+    *,
+    device: str | None = None,
+) -> list[float]:
+    torch_scores = _compute_energy_scores_torch(similarity_matrix, device=device)
+    if torch_scores is not None:
+        return torch_scores
+    return _compute_energy_scores_python(similarity_matrix)
+
+
+def _compute_energy_scores_torch(
+    similarity_matrix: list[list[float]],
+    *,
+    device: str | None,
+) -> list[float] | None:
+    torch_module = _load_torch_for_device(device)
+    if torch_module is None:
+        return None
+    if not similarity_matrix:
+        return []
+
+    torch_device = _resolve_torch_device(torch_module, device)
+    with torch_module.inference_mode():
+        matrix = torch_module.tensor(
+            similarity_matrix,
+            dtype=torch_module.float32,
+            device=torch_device,
+        )
+        item_count = matrix.shape[0]
+        indices = torch_module.arange(item_count, device=torch_device)
+        distances = (indices[:, None] - indices[None, :]).abs().float()
+        weights = 1.0 / (1.0 + distances)
+        weights.fill_diagonal_(0.0)
+        weighted_totals = (matrix * weights).sum(dim=1)
+        weight_sums = weights.sum(dim=1).clamp_min(1e-12)
+        scores = weighted_totals / weight_sums
+        scores = torch_module.where(weight_sums > 0, scores, torch_module.zeros_like(scores))
+        return scores.detach().cpu().tolist()
+
+
+def _compute_energy_scores_python(similarity_matrix: list[list[float]]) -> list[float]:
     if not similarity_matrix:
         return []
 
@@ -285,6 +403,7 @@ def load_frame_embeddings(
     *,
     embedding_size: int = 16,
     backend: FrameEmbeddingBackend = "pixel",
+    device: str | None = None,
 ) -> list[list[float]]:
     try:
         from PIL import Image
@@ -298,6 +417,15 @@ def load_frame_embeddings(
     if backend not in {"pixel", "hybrid"}:
         raise ValueError(f"Unsupported PiToMe embedding backend: {backend}")
 
+    torch_embeddings = _load_frame_embeddings_torch(
+        frame_paths,
+        embedding_size=embedding_size,
+        backend=backend,
+        device=device,
+    )
+    if torch_embeddings is not None:
+        return torch_embeddings
+
     embeddings: list[list[float]] = []
     for frame_path in frame_paths:
         with Image.open(frame_path) as image:
@@ -305,6 +433,82 @@ def load_frame_embeddings(
                 embeddings.append(_pixel_embedding(image, embedding_size))
             else:
                 embeddings.append(_hybrid_embedding(image, embedding_size))
+    return embeddings
+
+
+def _load_frame_embeddings_torch(
+    frame_paths: list[Path],
+    *,
+    embedding_size: int,
+    backend: FrameEmbeddingBackend,
+    device: str | None,
+) -> list[list[float]] | None:
+    torch_module = _load_torch_for_device(device)
+    if torch_module is None:
+        return None
+
+    try:
+        import numpy as np
+        from PIL import Image
+        from torch.nn import functional as torch_functional
+    except ImportError:
+        if device:
+            raise
+        return None
+
+    torch_device = _resolve_torch_device(torch_module, device)
+    embeddings: list[list[float]] = []
+    for start in range(0, len(frame_paths), FRAME_EMBEDDING_TORCH_BATCH_SIZE):
+        batch_paths = frame_paths[start : start + FRAME_EMBEDDING_TORCH_BATCH_SIZE]
+        if not batch_paths:
+            continue
+
+        pixel_arrays = []
+        histogram_arrays = []
+        edge_arrays = []
+        edge_size = max(4, min(16, embedding_size))
+        for frame_path in batch_paths:
+            with Image.open(frame_path) as image:
+                rgb = image.convert("RGB")
+                pixel_arrays.append(
+                    np.asarray(
+                        rgb.resize((embedding_size, embedding_size)),
+                        dtype=np.float32,
+                    )
+                )
+                if backend == "hybrid":
+                    histogram_arrays.append(
+                        np.asarray(rgb.resize((128, 128)), dtype=np.int64)
+                    )
+                    edge_arrays.append(
+                        np.asarray(
+                            rgb.convert("L").resize((edge_size + 1, edge_size + 1)),
+                            dtype=np.float32,
+                        )
+                    )
+
+        with torch_module.inference_mode():
+            pixels = torch_module.from_numpy(np.stack(pixel_arrays)).to(torch_device) / 255.0
+            features = pixels.reshape(len(batch_paths), -1)
+            if backend == "hybrid":
+                features = features * 0.75
+                histograms = torch_module.from_numpy(np.stack(histogram_arrays)).to(torch_device)
+                histogram_features = []
+                for channel_index in range(3):
+                    buckets = ((histograms[..., channel_index] * 16) // 256).clamp(0, 15)
+                    one_hot = torch_functional.one_hot(buckets, num_classes=16)
+                    counts = one_hot.sum(dim=(1, 2)).float()
+                    histogram_features.append(counts / float(128 * 128))
+                histogram_feature = torch_module.cat(histogram_features, dim=1) * 2.0
+
+                edges = torch_module.from_numpy(np.stack(edge_arrays)).to(torch_device)
+                current = edges[:, :edge_size, :edge_size]
+                right = edges[:, :edge_size, 1 : edge_size + 1]
+                down = edges[:, 1 : edge_size + 1, :edge_size]
+                edge_feature = ((current - right).abs() + (current - down).abs()) / 510.0
+                edge_feature = edge_feature.reshape(len(batch_paths), -1)
+                features = torch_module.cat([features, histogram_feature, edge_feature], dim=1)
+            embeddings.extend(features.detach().cpu().tolist())
     return embeddings
 
 
@@ -363,6 +567,44 @@ def fuse_frame_embeddings_with_semantic(
             )
         )
     return fused
+
+
+def _load_torch_for_device(device: str | None):
+    if device is None or not str(device).strip():
+        return None
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            "PiToMe GPU acceleration requires PyTorch. Install torch or omit "
+            "--pitome-embedding-device."
+        ) from exc
+    return torch
+
+
+def _resolve_torch_device(torch_module: Any, device: str | None):
+    if device is None or not str(device).strip():
+        raise ValueError("device must be provided for Torch PiToMe acceleration")
+    value = str(device).strip()
+    if value == "auto":
+        if torch_module.cuda.is_available():
+            return torch_module.device("cuda:0")
+        if hasattr(torch_module.backends, "mps") and torch_module.backends.mps.is_available():
+            return torch_module.device("mps")
+        return torch_module.device("cpu")
+
+    torch_device = torch_module.device(value)
+    if torch_device.type == "cuda" and not torch_module.cuda.is_available():
+        raise RuntimeError(
+            f"PiToMe embedding device {value!r} requested but CUDA is not available."
+        )
+    if (
+        torch_device.type == "mps"
+        and hasattr(torch_module.backends, "mps")
+        and not torch_module.backends.mps.is_available()
+    ):
+        raise RuntimeError(f"PiToMe embedding device {value!r} requested but MPS is not available.")
+    return torch_device
 
 
 def _pixel_embedding(image: Any, embedding_size: int) -> list[float]:

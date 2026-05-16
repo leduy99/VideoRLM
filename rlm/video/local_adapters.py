@@ -6,7 +6,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PIL import Image
 
@@ -320,10 +320,16 @@ class LocalQwenVisualSummarizer:
     pitome_similarity_threshold: float = 0.8
     pitome_embedding_size: int = 16
     pitome_embedding_backend: str = "pixel"
+    pitome_embedding_device: str | None = None
+    pitome_frame_width: int | None = None
+    pitome_frame_extraction_strategy: Literal["auto", "batch", "seek", "sequence"] = "auto"
+    pitome_frame_extraction_workers: int = 1
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
     pitome_scene_threshold: float = 0.35
     pitome_max_scene_boundary_frames: int = 6
+    pitome_scene_sample_rate: float | None = 1.0
+    pitome_scene_keyframes_only: bool = True
     frame_embedding_provider: ImageTextEmbeddingProvider | None = None
     summary_granularity: VideoNodeLevel | None = None
     vl_retry_frame_count: int = 4
@@ -513,13 +519,16 @@ class LocalQwenVisualSummarizer:
             uniform_frame_count=self.pitome_min_frame_count or self.frame_count,
             dense_frame_rate=self.pitome_dense_frame_rate,
             ffmpeg_bin=self.ffmpeg_bin,
-            width=self.frame_width,
+            width=self.pitome_frame_width if self.pitome_frame_width is not None else self.frame_width,
             output_dir=output_dir,
             protect_ratio=self.pitome_protect_ratio,
             similarity_threshold=self.pitome_similarity_threshold,
             embedding_size=self.pitome_embedding_size,
             embedding_backend=self.pitome_embedding_backend,
+            embedding_device=self.pitome_embedding_device,
             anchor_frame_count=self.pitome_anchor_frame_count,
+            frame_extraction_strategy=self.pitome_frame_extraction_strategy,
+            frame_extraction_seek_workers=self.pitome_frame_extraction_workers,
         )
         selection, boundary_metadata = self._add_boundary_frames(
             video_path=video_path,
@@ -553,11 +562,15 @@ class LocalQwenVisualSummarizer:
             output_dir=output_dir,
             selection=selection,
             ffmpeg_bin=self.ffmpeg_bin,
-            frame_width=self.frame_width,
+            frame_width=self.pitome_frame_width if self.pitome_frame_width is not None else self.frame_width,
             embedding_size=self.pitome_embedding_size,
             embedding_backend=self.pitome_embedding_backend,
+            embedding_device=self.pitome_embedding_device,
+            frame_extraction_workers=self.pitome_frame_extraction_workers,
             scene_threshold=self.pitome_scene_threshold,
             max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
+            scene_sample_rate=self.pitome_scene_sample_rate,
+            scene_keyframes_only=self.pitome_scene_keyframes_only,
         )
 
     def _semantic_frame_metadata(self, frame_paths: list[Path]) -> dict[str, Any]:
@@ -641,10 +654,16 @@ class LazyPiToMeVisualIndexer:
     pitome_similarity_threshold: float = 0.8
     pitome_embedding_size: int = 16
     pitome_embedding_backend: str = "pixel"
+    pitome_embedding_device: str | None = None
+    pitome_frame_width: int | None = None
+    pitome_frame_extraction_strategy: Literal["auto", "batch", "seek", "sequence"] = "auto"
+    pitome_frame_extraction_workers: int = 1
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
     pitome_scene_threshold: float = 0.35
     pitome_max_scene_boundary_frames: int = 6
+    pitome_scene_sample_rate: float | None = 1.0
+    pitome_scene_keyframes_only: bool = True
     frame_embedding_provider: ImageTextEmbeddingProvider | None = None
     summary_granularity: VideoNodeLevel | None = "clip"
     verbose: bool = False
@@ -677,13 +696,16 @@ class LazyPiToMeVisualIndexer:
                     uniform_frame_count=self.pitome_min_frame_count or self.frame_count,
                     dense_frame_rate=self.pitome_dense_frame_rate,
                     ffmpeg_bin=self.ffmpeg_bin,
-                    width=self.frame_width,
+                    width=self.pitome_frame_width if self.pitome_frame_width is not None else self.frame_width,
                     output_dir=frame_dir,
                     protect_ratio=self.pitome_protect_ratio,
                     similarity_threshold=self.pitome_similarity_threshold,
                     embedding_size=self.pitome_embedding_size,
                     embedding_backend=self.pitome_embedding_backend,
+                    embedding_device=self.pitome_embedding_device,
                     anchor_frame_count=self.pitome_anchor_frame_count,
+                    frame_extraction_strategy=self.pitome_frame_extraction_strategy,
+                    frame_extraction_seek_workers=self.pitome_frame_extraction_workers,
                 )
                 selection, boundary_metadata = self._add_boundary_frames(
                     video_path=video_path,
@@ -756,11 +778,15 @@ class LazyPiToMeVisualIndexer:
             output_dir=output_dir,
             selection=selection,
             ffmpeg_bin=self.ffmpeg_bin,
-            frame_width=self.frame_width,
+            frame_width=self.pitome_frame_width if self.pitome_frame_width is not None else self.frame_width,
             embedding_size=self.pitome_embedding_size,
             embedding_backend=self.pitome_embedding_backend,
+            embedding_device=self.pitome_embedding_device,
+            frame_extraction_workers=self.pitome_frame_extraction_workers,
             scene_threshold=self.pitome_scene_threshold,
             max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
+            scene_sample_rate=self.pitome_scene_sample_rate,
+            scene_keyframes_only=self.pitome_scene_keyframes_only,
         )
 
     def _infer_granularity(self, span: TimeSpan) -> str:
@@ -946,8 +972,12 @@ def _add_boundary_frames_to_selection(
     frame_width: int | None,
     embedding_size: int,
     embedding_backend: str,
+    embedding_device: str | None,
+    frame_extraction_workers: int,
     scene_threshold: float,
     max_scene_boundary_frames: int,
+    scene_sample_rate: float | None,
+    scene_keyframes_only: bool,
 ) -> tuple[FrameSelectionResult, dict[str, list[float]]]:
     boundary_metadata = _boundary_timestamps_for_span(
         video_path=video_path,
@@ -955,28 +985,30 @@ def _add_boundary_frames_to_selection(
         ffmpeg_bin=ffmpeg_bin,
         threshold=scene_threshold,
         max_scene_boundary_frames=max_scene_boundary_frames,
+        scene_sample_rate=scene_sample_rate,
+        scene_keyframes_only=scene_keyframes_only,
     )
     boundary_timestamps = boundary_metadata["all"]
     if not boundary_timestamps:
         return selection, boundary_metadata
 
-    try:
-        boundary_paths = extract_frames_for_timestamps(
-            media_path=video_path,
-            timestamps=boundary_timestamps,
-            ffmpeg_bin=ffmpeg_bin,
-            width=frame_width,
-            output_dir=output_dir / "boundaries",
-            prefix="boundary",
-        )
-    except (OSError, ValueError, subprocess.CalledProcessError):
-        return selection, boundary_metadata
+    boundary_paths = extract_frames_for_timestamps(
+        media_path=video_path,
+        timestamps=boundary_timestamps,
+        ffmpeg_bin=ffmpeg_bin,
+        width=frame_width,
+        output_dir=output_dir / "boundaries",
+        prefix="boundary",
+        extraction_strategy="seek",
+        seek_workers=frame_extraction_workers,
+    )
     boundary_embeddings = [
         compact_frame_embedding(embedding)
         for embedding in load_frame_embeddings(
             boundary_paths,
             embedding_size=embedding_size,
             backend=embedding_backend,
+            device=embedding_device,
         )
     ]
     return (
@@ -997,6 +1029,8 @@ def _boundary_timestamps_for_span(
     ffmpeg_bin: str,
     threshold: float,
     max_scene_boundary_frames: int,
+    scene_sample_rate: float | None,
+    scene_keyframes_only: bool,
 ) -> dict[str, list[float]]:
     edge_timestamps = _span_boundary_timestamps(span)
     scene_timestamps = detect_scene_boundary_timestamps(
@@ -1005,6 +1039,8 @@ def _boundary_timestamps_for_span(
         ffmpeg_bin=ffmpeg_bin,
         threshold=threshold,
         max_timestamps=max_scene_boundary_frames,
+        sample_rate=scene_sample_rate,
+        keyframes_only=scene_keyframes_only,
     )
     return {
         "all": _merge_timestamps([*edge_timestamps, *scene_timestamps]),

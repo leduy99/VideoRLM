@@ -4,7 +4,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import openai
 
@@ -196,6 +196,10 @@ class OpenAICompatibleVisualSummarizer:
     pitome_similarity_threshold: float = 0.8
     pitome_embedding_size: int = 16
     pitome_embedding_backend: str = "pixel"
+    pitome_embedding_device: str | None = None
+    pitome_frame_width: int | None = None
+    pitome_frame_extraction_strategy: Literal["auto", "batch", "seek", "sequence"] = "auto"
+    pitome_frame_extraction_workers: int = 1
     pitome_anchor_frame_count: int = 0
     pitome_max_selected_frames: int | None = None
     frame_embedding_provider: ImageTextEmbeddingProvider | None = None
@@ -278,13 +282,16 @@ class OpenAICompatibleVisualSummarizer:
             uniform_frame_count=self.pitome_min_frame_count or self.frame_count,
             dense_frame_rate=self.pitome_dense_frame_rate,
             ffmpeg_bin=self.ffmpeg_bin,
-            width=self.frame_width,
+            width=self.pitome_frame_width if self.pitome_frame_width is not None else self.frame_width,
             output_dir=output_dir,
             protect_ratio=self.pitome_protect_ratio,
             similarity_threshold=self.pitome_similarity_threshold,
             embedding_size=self.pitome_embedding_size,
             embedding_backend=self.pitome_embedding_backend,
+            embedding_device=self.pitome_embedding_device,
             anchor_frame_count=self.pitome_anchor_frame_count,
+            frame_extraction_strategy=self.pitome_frame_extraction_strategy,
+            frame_extraction_seek_workers=self.pitome_frame_extraction_workers,
         )
         if self.pitome_max_selected_frames is not None:
             selection = limit_frame_selection_by_temporal_coverage(

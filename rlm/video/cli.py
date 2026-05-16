@@ -540,6 +540,27 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pitome-similarity-threshold", type=float, default=0.8)
     parser.add_argument("--pitome-embedding-size", type=int, default=16)
     parser.add_argument("--pitome-embedding-backend", choices=["pixel", "hybrid"], default="pixel")
+    parser.add_argument(
+        "--pitome-frame-width",
+        type=int,
+        help="Optional frame extraction width for the cheap PiToMe index pass.",
+    )
+    parser.add_argument(
+        "--pitome-embedding-device",
+        help="Optional Torch device for PiToMe embedding and similarity math, for example cuda:0.",
+    )
+    parser.add_argument(
+        "--pitome-frame-extraction-strategy",
+        choices=["auto", "batch", "seek", "sequence"],
+        default="auto",
+        help="FFmpeg strategy for extracting cheap PiToMe frames.",
+    )
+    parser.add_argument(
+        "--pitome-frame-extraction-workers",
+        type=int,
+        default=1,
+        help="Parallel ffmpeg workers for the seek-based PiToMe frame extraction path.",
+    )
     parser.add_argument("--pitome-anchor-frame-count", type=int, default=0)
     parser.add_argument("--pitome-max-selected-frames", type=int)
     parser.add_argument(
@@ -553,6 +574,18 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=6,
         help="Maximum detected scene-boundary frames to add inside each PiToMe span.",
+    )
+    parser.add_argument(
+        "--pitome-scene-sample-rate",
+        type=float,
+        default=1.0,
+        help="Frame rate sampled before FFmpeg scene-boundary detection; use 0 to disable sampling.",
+    )
+    parser.add_argument(
+        "--pitome-scene-keyframes-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use decoder keyframes only for faster PiToMe scene-boundary detection.",
     )
     parser.add_argument(
         "--parent-visual-summary-mode",
@@ -582,6 +615,14 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
     config.pitome_similarity_threshold = getattr(args, "pitome_similarity_threshold", 0.8)
     config.pitome_embedding_size = getattr(args, "pitome_embedding_size", 16)
     config.pitome_embedding_backend = getattr(args, "pitome_embedding_backend", "pixel")
+    config.pitome_embedding_device = getattr(args, "pitome_embedding_device", None)
+    config.pitome_frame_width = getattr(args, "pitome_frame_width", None)
+    config.pitome_frame_extraction_strategy = getattr(
+        args,
+        "pitome_frame_extraction_strategy",
+        "auto",
+    )
+    config.pitome_frame_extraction_workers = getattr(args, "pitome_frame_extraction_workers", 1)
     config.pitome_anchor_frame_count = getattr(args, "pitome_anchor_frame_count", 0)
     config.pitome_max_selected_frames = getattr(args, "pitome_max_selected_frames", None)
     config.pitome_scene_threshold = getattr(args, "pitome_scene_threshold", 0.35)
@@ -590,6 +631,9 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
         "pitome_max_scene_boundary_frames",
         6,
     )
+    scene_sample_rate = getattr(args, "pitome_scene_sample_rate", 1.0)
+    config.pitome_scene_sample_rate = None if scene_sample_rate == 0 else scene_sample_rate
+    config.pitome_scene_keyframes_only = getattr(args, "pitome_scene_keyframes_only", True)
     parent_mode = getattr(args, "parent_visual_summary_mode", "auto")
     config.parent_visual_summary_mode = None if parent_mode == "auto" else parent_mode
     search_mode = getattr(args, "search_mode", "auto")
