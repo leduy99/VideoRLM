@@ -34,6 +34,7 @@ SEMANTIC_FRAME_EMBEDDING_MODEL_PATH="${SEMANTIC_FRAME_EMBEDDING_MODEL_PATH:-}"
 SEMANTIC_FRAME_EMBEDDING_DEVICE="${SEMANTIC_FRAME_EMBEDDING_DEVICE:-mps}"
 SEMANTIC_FRAME_EMBEDDING_TORCH_DTYPE="${SEMANTIC_FRAME_EMBEDDING_TORCH_DTYPE:-float32}"
 SEMANTIC_FRAME_EMBEDDING_BATCH_SIZE="${SEMANTIC_FRAME_EMBEDDING_BATCH_SIZE:-8}"
+USE_SEMANTIC_FRAME_EMBEDDINGS="${USE_SEMANTIC_FRAME_EMBEDDINGS:-1}"
 
 SKIP_SPEECH_RECOGNITION="${SKIP_SPEECH_RECOGNITION:-0}"
 SPEECH_BACKEND="${SPEECH_BACKEND:-qwen}"
@@ -76,10 +77,6 @@ cmd=(
   --faster-whisper-model "${FASTER_WHISPER_MODEL}"
   --faster-whisper-device "${FASTER_WHISPER_DEVICE}"
   --faster-whisper-compute-type "${FASTER_WHISPER_COMPUTE_TYPE}"
-  --semantic-frame-embedding-repo "${SEMANTIC_FRAME_EMBEDDING_REPO}"
-  --semantic-frame-embedding-device "${SEMANTIC_FRAME_EMBEDDING_DEVICE}"
-  --semantic-frame-embedding-torch-dtype "${SEMANTIC_FRAME_EMBEDDING_TORCH_DTYPE}"
-  --semantic-frame-embedding-batch-size "${SEMANTIC_FRAME_EMBEDDING_BATCH_SIZE}"
   --frame-count "${FRAME_COUNT}"
   --frame-width "${FRAME_WIDTH}"
   --verbose
@@ -117,8 +114,16 @@ fi
 if [[ -n "${COOKIES_FROM_BROWSER}" ]]; then
   cmd+=(--cookies-from-browser "${COOKIES_FROM_BROWSER}")
 fi
-if [[ -n "${SEMANTIC_FRAME_EMBEDDING_MODEL_PATH}" ]]; then
-  cmd+=(--semantic-frame-embedding-model-path "${SEMANTIC_FRAME_EMBEDDING_MODEL_PATH}")
+if [[ "${USE_SEMANTIC_FRAME_EMBEDDINGS}" == "1" || "${USE_SEMANTIC_FRAME_EMBEDDINGS}" == "true" || "${USE_SEMANTIC_FRAME_EMBEDDINGS}" == "yes" ]]; then
+  cmd+=(
+    --semantic-frame-embedding-repo "${SEMANTIC_FRAME_EMBEDDING_REPO}"
+    --semantic-frame-embedding-device "${SEMANTIC_FRAME_EMBEDDING_DEVICE}"
+    --semantic-frame-embedding-torch-dtype "${SEMANTIC_FRAME_EMBEDDING_TORCH_DTYPE}"
+    --semantic-frame-embedding-batch-size "${SEMANTIC_FRAME_EMBEDDING_BATCH_SIZE}"
+  )
+  if [[ -n "${SEMANTIC_FRAME_EMBEDDING_MODEL_PATH}" ]]; then
+    cmd+=(--semantic-frame-embedding-model-path "${SEMANTIC_FRAME_EMBEDDING_MODEL_PATH}")
+  fi
 fi
 
 KMP_DUPLICATE_LIB_OK=TRUE PYTHONUNBUFFERED=1 PYTORCH_ENABLE_MPS_FALLBACK=1 "${cmd[@]}"

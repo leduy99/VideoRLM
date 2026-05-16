@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_RUN_A="output/longshot_small_pitome_hybrid_local_embedding_siglip_8frames_1fps"
+DEFAULT_RUN_A="output/longshot_lazy_pitome_refinement_local_faiss"
 if [[ ! -d "${DEFAULT_RUN_A}" ]]; then
   DEFAULT_RUN_A="output/longshot_small_local"
 fi

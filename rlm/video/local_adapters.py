@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -959,14 +960,17 @@ def _add_boundary_frames_to_selection(
     if not boundary_timestamps:
         return selection, boundary_metadata
 
-    boundary_paths = extract_frames_for_timestamps(
-        media_path=video_path,
-        timestamps=boundary_timestamps,
-        ffmpeg_bin=ffmpeg_bin,
-        width=frame_width,
-        output_dir=output_dir / "boundaries",
-        prefix="boundary",
-    )
+    try:
+        boundary_paths = extract_frames_for_timestamps(
+            media_path=video_path,
+            timestamps=boundary_timestamps,
+            ffmpeg_bin=ffmpeg_bin,
+            width=frame_width,
+            output_dir=output_dir / "boundaries",
+            prefix="boundary",
+        )
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return selection, boundary_metadata
     boundary_embeddings = [
         compact_frame_embedding(embedding)
         for embedding in load_frame_embeddings(

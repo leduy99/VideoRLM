@@ -449,6 +449,9 @@ class VideoRLM:
         state: ControllerState,
     ) -> dict[str, Any]:
         action_type = payload.get("action_type")
+        if action_type == "SPLIT":
+            self._repair_node_id_payload(payload, state)
+            return payload
         if action_type not in {"SEARCH", "OPEN"}:
             return payload
 
@@ -483,7 +486,25 @@ class VideoRLM:
         else:
             payload["modality"] = resolved_modality
         payload["target_slot"] = target_slot
+        if action_type == "OPEN":
+            self._repair_node_id_payload(payload, state)
         return payload
+
+    def _repair_node_id_payload(
+        self,
+        payload: dict[str, Any],
+        state: ControllerState,
+    ) -> None:
+        node_id = payload.get("node_id")
+        frontier_ids = state.frontier_ids()
+        if node_id in frontier_ids:
+            return
+        if state.frontier:
+            payload["node_id"] = state.frontier[0].node_id
+            return
+        payload["action_type"] = "SEARCH"
+        payload["node_id"] = None
+        payload["query"] = payload.get("query") or state.question
 
     def _preferred_search_modality(
         self,

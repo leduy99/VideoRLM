@@ -1043,6 +1043,8 @@ def _reason_description(question: str) -> str:
 
 def _infer_preferred_modality(question: str, task_type: str | None) -> Modality:
     lowered = question.lower()
+    if task_type in {"multiple_choice_visual_qa", "vrrqa", "vrrqa_visual_only"}:
+        return "visual"
     visual_cues = (
         "stare",
         "doorway",

@@ -124,6 +124,42 @@ def extract_audio_segment(
     return output
 
 
+def extract_video_segment(
+    media_path: str | Path,
+    span: TimeSpan,
+    output_path: str | Path,
+    ffmpeg_bin: str = "ffmpeg",
+    *,
+    reencode: bool = True,
+) -> Path:
+    _require_executable(ffmpeg_bin)
+    if span.duration <= 0:
+        raise ValueError(f"Video segment duration must be positive, got {span.duration}")
+    media = Path(media_path)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-ss",
+        f"{span.start:.3f}",
+        "-t",
+        f"{span.duration:.3f}",
+        "-i",
+        str(media),
+        "-map",
+        "0:v:0",
+        "-an",
+    ]
+    if reencode:
+        command.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"])
+    else:
+        command.extend(["-c:v", "copy"])
+    command.extend(["-movflags", "+faststart", str(output)])
+    subprocess.run(command, check=True, capture_output=True)
+    return output
+
+
 def probe_media_duration(media_path: str | Path, ffprobe_bin: str = "ffprobe") -> float:
     _require_executable(ffprobe_bin)
     media = Path(media_path)
