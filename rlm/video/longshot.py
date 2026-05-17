@@ -384,10 +384,26 @@ class LongShOTBenchmarkRunner:
                 continue
 
             if pending_question is None:
-                raise ValueError(
-                    f"Assistant turn at index {index} in LongShOT sample {sample_id} "
-                    "does not have a preceding user question"
+                self._log(
+                    f"assistant turn skipped sample_id={sample_id} turn={index} "
+                    "reason=missing_user_question"
                 )
+                turn["candidate_response"] = ""
+                dialogue_context.append({"role": "assistant", "content": content})
+                turn_results.append(
+                    {
+                        "turn_index": index,
+                        "question": None,
+                        "answer": "",
+                        "execution_time": 0.0,
+                        "steps_used": 0,
+                        "tool_calls_used": 0,
+                        "trace_path": None,
+                        "skipped": True,
+                        "skip_reason": "missing_user_question",
+                    }
+                )
+                continue
 
             self._log(f"VideoRLM run start sample_id={sample_id} turn={index}")
             result = self.video_rlm.run(

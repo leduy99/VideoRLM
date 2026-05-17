@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import re
-import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
