@@ -55,6 +55,8 @@ class VideoRLM:
         image_text_embedding_provider: ImageTextEmbeddingProvider | None = None,
         speech_refiner: SpeechRecognizer | None = None,
         visual_refiner: VisualSummarizer | None = None,
+        enable_vrrqa_graph_refinement_expansion: bool = True,
+        vrrqa_graph_refinement_neighbor_count: int = 1,
     ):
         if search_mode not in {"lexical", "graph"}:
             raise ValueError(f"Unsupported search mode: {search_mode}")
@@ -77,6 +79,8 @@ class VideoRLM:
         self.image_text_embedding_provider = image_text_embedding_provider
         self.speech_refiner = speech_refiner
         self.visual_refiner = visual_refiner
+        self.enable_vrrqa_graph_refinement_expansion = enable_vrrqa_graph_refinement_expansion
+        self.vrrqa_graph_refinement_neighbor_count = vrrqa_graph_refinement_neighbor_count
 
     def run(
         self,
@@ -102,6 +106,10 @@ class VideoRLM:
             speech_refine_candidate_count=self.speech_refine_candidate_count,
             speech_refiner=self.speech_refiner,
             visual_refiner=self.visual_refiner,
+            enable_vrrqa_graph_refinement_expansion=(
+                self.enable_vrrqa_graph_refinement_expansion
+            ),
+            vrrqa_graph_refinement_neighbor_count=self.vrrqa_graph_refinement_neighbor_count,
             progress_callback=progress_callback,
         )
         state = self._build_initial_state(
@@ -125,6 +133,9 @@ class VideoRLM:
                     "hybrid_speech_refinement": self.enable_hybrid_speech_refinement,
                     "speech_refinement": self.speech_refiner is not None,
                     "visual_refinement": self.visual_refiner is not None,
+                    "vrrqa_graph_refinement_expansion": (
+                        self.enable_vrrqa_graph_refinement_expansion
+                    ),
                 }
             )
 
@@ -133,6 +144,30 @@ class VideoRLM:
         consecutive_empty_open_steps = 0
 
         while state.budget.steps_remaining > 0:
+            if self._should_use_multiple_choice_final_step(state):
+                previous_state = copy.deepcopy(state.to_dict())
+                answer, raw_response = self._multiple_choice_completion_from_state(state)
+                action = ControllerAction(
+                    action_type="STOP",
+                    answer=answer,
+                    evidence_ids=self._final_answer_evidence_ids(state),
+                )
+                observation = tools.execute(action, state)
+                state = self._apply_observation(state, action, observation)
+                next_state = state.to_dict()
+                trace_step = TraceStep(
+                    step_index=state.budget.steps_used,
+                    state=previous_state,
+                    action=action.to_dict(),
+                    observation=observation.to_dict(),
+                    next_state=next_state,
+                    raw_model_response=raw_response,
+                )
+                trace_steps.append(trace_step.to_dict())
+                if self.logger:
+                    self.logger.log_step(trace_step)
+                break
+
             prompt = build_controller_prompt(
                 state,
                 max_frontier_items=self.max_frontier_items,
@@ -159,7 +194,7 @@ class VideoRLM:
                 self.logger.log_step(trace_step)
 
             if action.action_type == "STOP":
-                answer = action.answer or self._fallback_answer_from_state(state)
+                answer = self._answer_from_stop_action(action, state)
                 break
             if action.action_type == "OPEN" and not observation.evidence:
                 consecutive_empty_open_steps += 1
@@ -192,8 +227,10 @@ class VideoRLM:
         dialogue_context: list[dict[str, str]],
         task_type: str | None,
     ) -> ControllerState:
+        clean_question = _clean_controller_question(question, task_type)
+        answer_options = _extract_multiple_choice_options(question)
         question_spec = build_question_spec(
-            question=question,
+            question=clean_question,
             task_type=task_type,
             dialogue_context=dialogue_context,
         )
@@ -221,6 +258,10 @@ class VideoRLM:
             "semantic_frame_embeddings": self.image_text_embedding_provider is not None,
             "speech_refinement": self.speech_refiner is not None,
             "visual_refinement": self.visual_refiner is not None,
+            "vrrqa_graph_refinement_expansion": self.enable_vrrqa_graph_refinement_expansion,
+            "clean_question": clean_question,
+            "answer_options": answer_options,
+            "valid_answer_letters": sorted(answer_options),
             "topical_index": scene_summaries,
             "evidence_metrics": {
                 "slot_fill_rate": 0.0,
@@ -260,6 +301,16 @@ class VideoRLM:
             ]
         state.frontier = frontier[: self.max_frontier_items]
         return state
+
+    def _answer_from_stop_action(
+        self,
+        action: ControllerAction,
+        state: ControllerState,
+    ) -> str:
+        multiple_choice_answer = self._multiple_choice_answer_from_state(state)
+        if multiple_choice_answer is not None:
+            return multiple_choice_answer
+        return action.answer or self._fallback_answer_from_state(state)
 
     def _apply_observation(
         self,
@@ -421,9 +472,7 @@ class VideoRLM:
                 state.evidence_board,
             )
             payload["target_slot"] = target_slot
-            payload["query"] = build_slot_queries(state.question, state.question_spec, target_slot)[
-                0
-            ]
+            payload["query"] = self._default_search_query(state, target_slot)
         return payload
 
     def _extract_json_scalar_field(self, text: str, field_name: str) -> str | None:
@@ -465,12 +514,24 @@ class VideoRLM:
             self._resolve_available_modality(current_modality, state) if current_modality else None
         )
         if action_type == "SEARCH":
+            if self._should_open_frontier_instead_of_search(state):
+                payload["action_type"] = "OPEN"
+                payload["node_id"] = state.frontier[0].node_id
+                payload["query"] = None
+                resolved_modality = self._resolve_available_modality(
+                    state.frontier[0].recommended_modalities[0]
+                    if state.frontier[0].recommended_modalities
+                    else preferred_modality,
+                    state,
+                )
+                payload["modality"] = resolved_modality
+                payload["target_slot"] = target_slot
+                self._repair_node_id_payload(payload, state)
+                return payload
             if not payload.get("query"):
-                payload["query"] = build_slot_queries(
-                    state.question,
-                    state.question_spec,
-                    target_slot,
-                )[0]
+                payload["query"] = self._default_search_query(state, target_slot)
+            else:
+                payload["query"] = self._clean_search_query(str(payload["query"]), state)
             if resolved_modality is None or self._should_override_open_modality(
                 current_modality=resolved_modality,
                 preferred_modality=preferred_modality,
@@ -490,6 +551,37 @@ class VideoRLM:
             self._repair_node_id_payload(payload, state)
         return payload
 
+    def _default_search_query(self, state: ControllerState, target_slot: str | None) -> str:
+        question = _clean_controller_question(state.question, state.task_type)
+        if state.question_spec is None:
+            return question
+        return build_slot_queries(question, state.question_spec, target_slot)[0]
+
+    def _clean_search_query(self, query: str, state: ControllerState) -> str:
+        if state.task_type != "multiple_choice_visual_qa":
+            return query
+        clean_question = _clean_controller_question(state.question, state.task_type)
+        query_text = " ".join(query.split())
+        if "Valid answer letters:" in query_text or "Do not answer with None" in query_text:
+            return clean_question
+        if len(query_text) > max(len(clean_question) * 2, 180):
+            return clean_question
+        return query
+
+    def _should_open_frontier_instead_of_search(self, state: ControllerState) -> bool:
+        if state.task_type != "multiple_choice_visual_qa":
+            return False
+        if not state.frontier:
+            return False
+        if state.evidence_ledger:
+            return False
+        if not state.action_history:
+            return False
+        last_action = state.action_history[-1]
+        if last_action.get("action_type") != "SEARCH":
+            return False
+        return any(item.status == "unopened" for item in state.frontier)
+
     def _repair_node_id_payload(
         self,
         payload: dict[str, Any],
@@ -504,7 +596,9 @@ class VideoRLM:
             return
         payload["action_type"] = "SEARCH"
         payload["node_id"] = None
-        payload["query"] = payload.get("query") or state.question
+        payload["query"] = payload.get("query") or _clean_controller_question(
+            state.question, state.task_type
+        )
 
     def _preferred_search_modality(
         self,
@@ -564,6 +658,9 @@ class VideoRLM:
         raise ValueError(f"Could not parse controller action JSON from: {text}")
 
     def _fallback_answer_from_state(self, state: ControllerState) -> str:
+        multiple_choice_answer = self._multiple_choice_answer_from_state(state)
+        if multiple_choice_answer is not None:
+            return multiple_choice_answer
         if state.evidence_board is not None and state.evidence_board.missing_required_slots:
             return self._diagnostic_abstain_from_state(state)
         if state.evidence_ledger:
@@ -571,6 +668,9 @@ class VideoRLM:
         return "Controller exhausted its budget before collecting grounded evidence."
 
     def _synthesize_answer_from_evidence(self, state: ControllerState) -> str:
+        multiple_choice_answer = self._multiple_choice_answer_from_state(state)
+        if multiple_choice_answer is not None:
+            return multiple_choice_answer
         if state.evidence_board is not None:
             allowed_ids = set(
                 state.evidence_board.core_evidence_ids + state.evidence_board.support_evidence_ids
@@ -615,6 +715,114 @@ class VideoRLM:
             "Evidence:\n" + "\n".join(evidence_lines)
         )
         return self.controller_client.completion(prompt).strip()
+
+    def _should_use_multiple_choice_final_step(self, state: ControllerState) -> bool:
+        return (
+            state.task_type == "multiple_choice_visual_qa"
+            and state.budget.steps_remaining == 1
+            and bool(state.evidence_ledger)
+            and bool(_extract_multiple_choice_options(state.question))
+        )
+
+    def _multiple_choice_answer_from_state(self, state: ControllerState) -> str | None:
+        completion = self._multiple_choice_completion_from_state(state)
+        if completion is None:
+            return None
+        answer, _raw_response = completion
+        return answer
+
+    def _multiple_choice_completion_from_state(
+        self,
+        state: ControllerState,
+    ) -> tuple[str, str] | None:
+        if state.task_type != "multiple_choice_visual_qa":
+            return None
+        options = _extract_multiple_choice_options(state.question)
+        if not options:
+            return None
+        evidence_best_option = self._best_verified_option_from_evidence(state, options)
+        if evidence_best_option is not None:
+            return evidence_best_option, json.dumps(
+                {
+                    "source": "vrrqa_visual_verification",
+                    "best_option": evidence_best_option,
+                }
+            )
+
+        evidence_lines = []
+        for item in sorted(
+            state.evidence_ledger,
+            key=lambda evidence: (-evidence.confidence, evidence.time_span.start),
+        )[:8]:
+            evidence_lines.append(
+                json.dumps(
+                    {
+                        "slot": item.metadata.get("slot"),
+                        "role": item.metadata.get("role"),
+                        "modality": item.modality,
+                        "time_span": item.time_span.to_dict(),
+                        "detail": _focus_evidence_detail(item.detail or item.claim, state.question),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+
+        option_lines = [f"{letter}. {text}" for letter, text in options.items()]
+        prompt = "\n".join(
+            [
+                "You are answering a VRR-QA multiple-choice question.",
+                "Return exactly one option letter from the valid choices. Do not explain.",
+                "If the evidence is incomplete or ambiguous, still choose the best-supported option.",
+                "",
+                f"Question: {_strip_options_from_question(state.question)}",
+                "Options:",
+                *option_lines,
+                "",
+                "Evidence:",
+                *(evidence_lines or ["No direct evidence was collected."]),
+                "",
+                f"Valid answer letters: {', '.join(options)}",
+                "Final answer letter:",
+            ]
+        )
+        response = self.controller_client.completion(prompt).strip()
+        parsed = _parse_multiple_choice_letter(response, options)
+        return parsed or sorted(options)[0], response
+
+    def _best_verified_option_from_evidence(
+        self,
+        state: ControllerState,
+        options: dict[str, str],
+    ) -> str | None:
+        verified: list[tuple[float, float, str]] = []
+        valid_choices = set(options)
+        for item in state.evidence_ledger:
+            best_option = item.metadata.get("vrrqa_best_option")
+            if not isinstance(best_option, str) or best_option not in valid_choices:
+                continue
+            score = _verified_option_score(best_option, item.metadata.get("vrrqa_option_scores"))
+            verified.append((score, item.confidence, best_option))
+        if not verified:
+            return None
+        verified.sort(reverse=True)
+        return verified[0][2]
+
+    def _final_answer_evidence_ids(self, state: ControllerState, max_items: int = 4) -> list[str]:
+        if state.evidence_board is not None:
+            allowed_ids = set(
+                state.evidence_board.core_evidence_ids + state.evidence_board.support_evidence_ids
+            )
+        else:
+            allowed_ids = set()
+        evidence = [
+            item
+            for item in state.evidence_ledger
+            if not allowed_ids or item.evidence_id in allowed_ids
+        ]
+        if not evidence:
+            evidence = list(state.evidence_ledger)
+        evidence.sort(key=lambda item: (-item.confidence, item.time_span.start))
+        return [item.evidence_id for item in evidence[:max_items]]
 
     def _diagnostic_abstain_from_state(self, state: ControllerState) -> str:
         if state.evidence_board is None:
@@ -748,3 +956,97 @@ def _focus_evidence_detail(detail: str, question: str, max_chars: int = 1200) ->
             best_snippet = snippet
 
     return best_snippet[:max_chars]
+
+
+MULTIPLE_CHOICE_OPTION_PATTERN = re.compile(r"^\s*([A-Z])\.\s+(.+?)\s*$")
+MULTIPLE_CHOICE_LETTER_PATTERN = re.compile(
+    r"^\s*(?:OPTION\s*)?([A-Z])(?:[\).:]|\s|$)"
+    r"|\b(?:ANSWER|CHOICE)\s*(?:IS|=|:)\s*\(?([A-Z])\)?\b"
+)
+
+
+def _extract_multiple_choice_options(question: str) -> dict[str, str]:
+    options: dict[str, str] = {}
+    for line in question.splitlines():
+        match = MULTIPLE_CHOICE_OPTION_PATTERN.match(line)
+        if match is None:
+            continue
+        options[match.group(1)] = match.group(2).strip()
+    return dict(sorted(options.items()))
+
+
+def _strip_options_from_question(question: str) -> str:
+    lines = []
+    for line in question.splitlines():
+        if line.strip().lower() == "options:":
+            continue
+        if MULTIPLE_CHOICE_OPTION_PATTERN.match(line):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _clean_controller_question(question: str, task_type: str | None = None) -> str:
+    if task_type != "multiple_choice_visual_qa":
+        return question
+    cleaned = _strip_options_from_question(question)
+    lines = []
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("task:"):
+            continue
+        if lowered.startswith("valid answer letters:"):
+            continue
+        if lowered.startswith("use the options above"):
+            continue
+        if lowered.startswith("when you stop"):
+            continue
+        if lowered.startswith("do not answer"):
+            continue
+        if lowered.startswith("if the evidence is incomplete"):
+            continue
+        if lowered.startswith("question:"):
+            stripped = stripped.split(":", maxsplit=1)[1].strip()
+        lines.append(stripped)
+    return " ".join(lines).strip() or question
+
+
+def _parse_multiple_choice_letter(response: str, options: dict[str, str]) -> str | None:
+    valid_letters = set(options)
+    normalized = response.strip().upper()
+    if normalized in valid_letters:
+        return normalized
+    for match in MULTIPLE_CHOICE_LETTER_PATTERN.finditer(response.upper()):
+        letter = match.group(1) or match.group(2)
+        if letter in valid_letters:
+            return letter
+    response_text = _normalize_choice_text(response)
+    contained = [
+        letter
+        for letter, option_text in options.items()
+        if _normalize_choice_text(option_text) and _normalize_choice_text(option_text) in response_text
+    ]
+    if len(contained) == 1:
+        return contained[0]
+    return None
+
+
+def _verified_option_score(choice: str, option_scores: Any) -> float:
+    if not isinstance(option_scores, dict):
+        return 1.0
+    raw_score = option_scores.get(choice)
+    try:
+        return float(raw_score)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _normalize_choice_text(text: str) -> str:
+    return " ".join(
+        token.group(0).lower()
+        for token in TOKEN_PATTERN.finditer(text)
+        if token.group(0).lower() not in STOPWORDS
+    )

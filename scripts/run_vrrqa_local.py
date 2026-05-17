@@ -56,8 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speech-device", default="mps")
     parser.add_argument("--torch-dtype", default="float16")
     parser.add_argument("--attn-implementation")
+    parser.add_argument("--visual-max-new-tokens", type=int, default=512)
     parser.add_argument("--frame-count", type=int, default=16)
     parser.add_argument("--frame-width", type=int, default=768)
+    parser.add_argument("--scene-duration-seconds", type=float, default=180.0)
+    parser.add_argument("--segment-duration-seconds", type=float, default=45.0)
+    parser.add_argument("--clip-duration-seconds", type=float, default=15.0)
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument("--search-top-k", type=int, default=5)
     parser.add_argument("--max-frontier-items", type=int, default=8)
@@ -86,6 +90,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pitome-max-selected-frames", type=int, default=8)
     parser.add_argument("--pitome-scene-threshold", type=float, default=0.35)
     parser.add_argument("--pitome-max-scene-boundary-frames", type=int, default=6)
+    parser.add_argument(
+        "--disable-vrrqa-graph-refinement-expansion",
+        action="store_true",
+        help=(
+            "Disable VRR-QA-only visual refinement expansion through neighboring "
+            "memory graph nodes."
+        ),
+    )
+    parser.add_argument(
+        "--vrrqa-graph-refinement-neighbor-count",
+        type=int,
+        default=1,
+        help="Number of previous/next sibling graph nodes to include during VRR-QA visual refinement.",
+    )
     parser.add_argument(
         "--multi-window-memory",
         action="store_true",
@@ -127,9 +145,17 @@ def main() -> int:
     config.enable_speech_recognition = False
     config.frame_count = args.frame_count
     config.frame_width = args.frame_width
+    config.visual.max_new_tokens = args.visual_max_new_tokens
+    config.scene_duration_seconds = args.scene_duration_seconds
+    config.segment_duration_seconds = args.segment_duration_seconds
+    config.clip_duration_seconds = args.clip_duration_seconds
     config.ffmpeg_bin = args.ffmpeg_bin
     config.verbose = args.verbose
     config.semantic_frame_embedding_batch_size = args.semantic_frame_embedding_batch_size
+    config.enable_vrrqa_graph_refinement_expansion = (
+        not args.disable_vrrqa_graph_refinement_expansion
+    )
+    config.vrrqa_graph_refinement_neighbor_count = args.vrrqa_graph_refinement_neighbor_count
     if config.semantic_frame_embedding is not None and args.semantic_frame_embedding_model_path:
         config.semantic_frame_embedding.model_path = args.semantic_frame_embedding_model_path
     if args.strategy == "lazy-pitome":

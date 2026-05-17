@@ -112,6 +112,8 @@ class QwenVideoStackConfig:
     pitome_scene_keyframes_only: bool = True
     parent_visual_summary_mode: Literal["full", "compact"] | None = None
     search_mode: Literal["lexical", "graph"] | None = None
+    enable_vrrqa_graph_refinement_expansion: bool = True
+    vrrqa_graph_refinement_neighbor_count: int = 1
     verbose: bool = False
 
     @classmethod
@@ -267,6 +269,10 @@ class QwenVideoStackConfig:
             embedding_provider=embedding_provider,
             speech_refiner=speech_refiner,
             visual_refiner=visual_refiner,
+            enable_vrrqa_graph_refinement_expansion=(
+                self.enable_vrrqa_graph_refinement_expansion
+            ),
+            vrrqa_graph_refinement_neighbor_count=self.vrrqa_graph_refinement_neighbor_count,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
@@ -323,6 +329,8 @@ class QwenLocalVideoStackConfig:
     parent_visual_summary_mode: Literal["full", "compact"] | None = None
     search_mode: Literal["lexical", "graph"] | None = None
     semantic_frame_embedding_batch_size: int = 8
+    enable_vrrqa_graph_refinement_expansion: bool = True
+    vrrqa_graph_refinement_neighbor_count: int = 1
     verbose: bool = False
 
     @classmethod
@@ -358,7 +366,7 @@ class QwenLocalVideoStackConfig:
             device_map={"": visual_device},
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
-            max_new_tokens=160,
+            max_new_tokens=512,
         )
         speech = LocalModelConfig(
             model_name=speech_model,
@@ -560,6 +568,10 @@ class QwenLocalVideoStackConfig:
             image_text_embedding_provider=image_text_embedding_provider,
             speech_refiner=speech_refiner,
             visual_refiner=visual_refiner,
+            enable_vrrqa_graph_refinement_expansion=(
+                self.enable_vrrqa_graph_refinement_expansion
+            ),
+            vrrqa_graph_refinement_neighbor_count=self.vrrqa_graph_refinement_neighbor_count,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,

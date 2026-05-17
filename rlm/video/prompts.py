@@ -29,6 +29,8 @@ Return exactly one JSON object with this schema:
 Rules:
 - Prefer SEARCH when frontier is weak or empty, or when a required slot is still missing.
 - Prefer OPEN when a frontier node already looks promising for the current target slot.
+- For multiple_choice_visual_qa, use `global_context.clean_question` for search wording and `global_context.answer_options` as the only final answer choices.
+- For multiple_choice_visual_qa, STOP answers must be exactly one valid option letter.
 - Respect question_spec preferred_modality: use visual for screen/sign/visible text, audio for sound/noise, and speech for spoken explanations.
 - Use SPLIT when a node is still too broad.
 - Use MERGE when multiple evidence items already support one claim.

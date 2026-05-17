@@ -854,13 +854,14 @@ class _TemporaryMemoryWindow:
 
 def build_vrrqa_prompt(sample: dict[str, Any]) -> str:
     options = non_null_options(sample)
+    if not options:
+        raise ValueError(f"VRR-QA sample {sample.get('question_id')} has no answer options")
     option_lines = [f"{letter}. {text}" for letter, text in options.items()]
     return "\n".join(
         [
             f"Question: {sample['question_text']}",
             "Options:",
             *option_lines,
-            "Answer with only the option letter.",
         ]
     )
 
@@ -988,6 +989,13 @@ def parse_choice_prediction(prediction: str, options: dict[str, str]) -> str | N
     for choice, option_text in options.items():
         if normalized_text == _normalize_text(option_text):
             return choice
+    contained_choices = [
+        choice
+        for choice, option_text in options.items()
+        if _normalize_text(option_text) and _normalize_text(option_text) in normalized_text
+    ]
+    if len(contained_choices) == 1:
+        return contained_choices[0]
     return None
 
 

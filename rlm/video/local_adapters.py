@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -331,6 +332,8 @@ class LocalQwenVisualSummarizer:
     pitome_scene_keyframes_only: bool = True
     frame_embedding_provider: ImageTextEmbeddingProvider | None = None
     summary_granularity: VideoNodeLevel | None = None
+    prompt_override: str | None = None
+    forced_frame_timestamps_override: list[float] | None = None
     vl_retry_frame_count: int = 4
     verbose: bool = False
     progress_callback: Callable[[dict[str, Any]], None] | None = None
@@ -366,7 +369,9 @@ class LocalQwenVisualSummarizer:
                     metadata=frame_metadata,
                 )
                 payload = _parse_json_object(output_text)
-                summary_text = str(payload.get("summary", output_text)).strip()
+                summary_text = _visual_summary_text_from_payload(payload, output_text)
+                summary_metadata = dict(frame_metadata)
+                summary_metadata.update(_vrrqa_visual_verification_metadata(payload))
                 self._log(
                     f"visual span {index}/{len(spans)} summary={_truncate_for_log(summary_text)}"
                 )
@@ -377,7 +382,7 @@ class LocalQwenVisualSummarizer:
                         granularity=self._infer_granularity(span),
                         tags=[str(item) for item in payload.get("tags", [])],
                         entities=[str(item) for item in payload.get("entities", [])],
-                        metadata=frame_metadata,
+                        metadata=summary_metadata,
                     )
                 )
                 self._notify_progress(
@@ -545,7 +550,77 @@ class LocalQwenVisualSummarizer:
         metadata = selection.to_metadata()
         metadata.update(_selected_boundary_metadata(selection.timestamps, boundary_metadata))
         metadata.update(semantic_metadata)
-        return selection.frame_paths, metadata
+        frame_paths = selection.frame_paths
+        if self.forced_frame_timestamps_override:
+            frame_paths, relationship_metadata = self._apply_relationship_frame_policy(
+                video_path=video_path,
+                span=span,
+                output_dir=output_dir,
+                pitome_frame_paths=selection.frame_paths,
+                pitome_timestamps=selection.timestamps,
+                forced_timestamps=self.forced_frame_timestamps_override,
+            )
+            metadata.update(relationship_metadata)
+        return frame_paths, metadata
+
+    def _apply_relationship_frame_policy(
+        self,
+        *,
+        video_path: str,
+        span: TimeSpan,
+        output_dir: Path,
+        pitome_frame_paths: list[Path],
+        pitome_timestamps: list[float],
+        forced_timestamps: list[float],
+    ) -> tuple[list[Path], dict[str, Any]]:
+        requested_timestamps = _merge_timestamps(
+            [
+                timestamp
+                for timestamp in forced_timestamps
+                if span.start <= float(timestamp) <= span.end
+            ]
+        )
+        if not requested_timestamps:
+            return pitome_frame_paths, {
+                "relationship_frame_policy": "graph_node_start_mid_end",
+                "relationship_frame_policy_applied": False,
+                "relationship_frame_policy_reason": "no_timestamps_in_span",
+            }
+
+        forced_paths = extract_frames_for_timestamps(
+            media_path=video_path,
+            timestamps=requested_timestamps,
+            ffmpeg_bin=self.ffmpeg_bin,
+            width=self.pitome_frame_width if self.pitome_frame_width is not None else self.frame_width,
+            output_dir=output_dir,
+            prefix="relationship",
+            extraction_strategy=self.pitome_frame_extraction_strategy,
+            seek_workers=self.pitome_frame_extraction_workers,
+        )
+        max_count = self.pitome_max_selected_frames
+        if max_count is not None and len(forced_paths) > max_count:
+            forced_paths = _limit_paths_by_temporal_coverage(forced_paths, max_count)
+            requested_timestamps = _limit_values_by_temporal_coverage(
+                requested_timestamps,
+                max_count,
+            )
+        remaining_capacity = None if max_count is None else max(0, max_count - len(forced_paths))
+        pitome_pairs = [
+            (path, timestamp)
+            for path, timestamp in zip(pitome_frame_paths, pitome_timestamps, strict=False)
+            if not _has_nearby_timestamp(timestamp, requested_timestamps)
+        ]
+        if remaining_capacity is not None:
+            pitome_pairs = _limit_pairs_by_temporal_coverage(pitome_pairs, remaining_capacity)
+        selected_paths = [*forced_paths, *[path for path, _timestamp in pitome_pairs]]
+        return selected_paths, {
+            "relationship_frame_policy": "graph_node_start_mid_end",
+            "relationship_frame_policy_applied": True,
+            "relationship_forced_frame_count": len(forced_paths),
+            "relationship_forced_frame_timestamps": requested_timestamps,
+            "relationship_pitome_frame_count": len(pitome_pairs),
+            "relationship_total_frame_count": len(selected_paths),
+        }
 
     def _add_boundary_frames(
         self,
@@ -621,6 +696,8 @@ class LocalQwenVisualSummarizer:
             raise ValueError("Vision model has no parameters") from exc
 
     def _build_prompt(self, span: TimeSpan) -> str:
+        if self.prompt_override is not None:
+            return self.prompt_override
         return (
             "Summarize this video segment for long-video reasoning. "
             "Return strict JSON with keys `summary`, `tags`, and `entities`. "
@@ -911,6 +988,44 @@ def _limit_paths_by_temporal_coverage(paths: list[Path], max_count: int) -> list
     return [paths[index] for index in indices]
 
 
+def _limit_values_by_temporal_coverage(values: list[float], max_count: int) -> list[float]:
+    if max_count <= 0:
+        raise ValueError(f"max_count must be positive, got {max_count}")
+    if len(values) <= max_count:
+        return values
+    if max_count == 1:
+        return [values[len(values) // 2]]
+    indices = sorted(
+        {round(position * (len(values) - 1) / (max_count - 1)) for position in range(max_count)}
+    )
+    return [values[index] for index in indices]
+
+
+def _limit_pairs_by_temporal_coverage(
+    pairs: list[tuple[Path, float]],
+    max_count: int,
+) -> list[tuple[Path, float]]:
+    if max_count <= 0:
+        return []
+    if len(pairs) <= max_count:
+        return pairs
+    if max_count == 1:
+        return [pairs[len(pairs) // 2]]
+    indices = sorted(
+        {round(position * (len(pairs) - 1) / (max_count - 1)) for position in range(max_count)}
+    )
+    return [pairs[index] for index in indices]
+
+
+def _has_nearby_timestamp(
+    timestamp: float,
+    candidates: list[float],
+    *,
+    tolerance: float = 0.05,
+) -> bool:
+    return any(abs(float(timestamp) - candidate) <= tolerance for candidate in candidates)
+
+
 def _semantic_frame_metadata(
     provider: ImageTextEmbeddingProvider | None,
     frame_paths: list[Path],
@@ -959,6 +1074,70 @@ def _fuse_selection_with_semantic_embeddings(
         energy_scores=list(selection.energy_scores),
         merged_pairs=list(selection.merged_pairs),
     )
+
+
+def _visual_summary_text_from_payload(payload: dict[str, Any], raw_text: str) -> str:
+    summary = payload.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    evidence = payload.get("evidence")
+    best_option = payload.get("best_option")
+    if isinstance(evidence, str) and evidence.strip():
+        if isinstance(best_option, str) and best_option.strip():
+            return f"Best option {best_option.strip().upper()}: {evidence.strip()}"
+        return evidence.strip()
+    return str(raw_text).strip()
+
+
+def _vrrqa_visual_verification_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    raw_summary = payload.get("summary")
+    if isinstance(raw_summary, str):
+        metadata.update(_extract_vrrqa_metadata_from_text(raw_summary))
+    if "frame_timeline" in payload:
+        metadata["vrrqa_frame_timeline"] = payload["frame_timeline"]
+    if "visible_relation" in payload:
+        metadata["vrrqa_visible_relation"] = payload["visible_relation"]
+    evidence = payload.get("evidence")
+    if isinstance(evidence, str) and evidence.strip():
+        metadata["vrrqa_evidence"] = evidence.strip()
+    option_scores = payload.get("option_scores")
+    if isinstance(option_scores, dict):
+        metadata["vrrqa_option_scores"] = {
+            str(letter).strip().upper(): score for letter, score in option_scores.items()
+        }
+    best_option = payload.get("best_option")
+    if isinstance(best_option, str) and best_option.strip():
+        metadata["vrrqa_best_option"] = best_option.strip().upper()[:1]
+    if any(key.startswith("vrrqa_") for key in metadata):
+        metadata["vrrqa_visual_verification"] = True
+    return metadata
+
+
+def _extract_vrrqa_metadata_from_text(text: str) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    best_match = re.search(r'"best_option"\s*:\s*"([A-Z])"', text)
+    if best_match is not None:
+        metadata["vrrqa_best_option"] = best_match.group(1)
+    scores_match = re.search(r'"option_scores"\s*:\s*(\{[^{}]*\})', text, flags=re.DOTALL)
+    if scores_match is not None:
+        try:
+            scores = json.loads(scores_match.group(1))
+        except json.JSONDecodeError:
+            scores = None
+        if isinstance(scores, dict):
+            metadata["vrrqa_option_scores"] = {
+                str(letter).strip().upper(): score for letter, score in scores.items()
+            }
+    evidence_match = re.search(r'"evidence"\s*:\s*"((?:[^"\\]|\\.)*)"', text, flags=re.DOTALL)
+    if evidence_match is not None:
+        try:
+            evidence = json.loads(f'"{evidence_match.group(1)}"')
+        except json.JSONDecodeError:
+            evidence = evidence_match.group(1)
+        if isinstance(evidence, str) and evidence.strip():
+            metadata["vrrqa_evidence"] = evidence.strip()
+    return metadata
 
 
 def _add_boundary_frames_to_selection(
@@ -1099,7 +1278,7 @@ def _merge_timestamps(timestamps: list[float], *, tolerance: float = 0.05) -> li
 def _span_boundary_timestamps(span: TimeSpan) -> list[float]:
     if span.duration <= 0:
         return [span.start]
-    margin = min(0.5, max(0.05, span.duration * 0.02))
+    margin = min(0.5, max(0.25, span.duration * 0.02))
     start = span.start + margin
     end = span.end - margin
     if end <= start:

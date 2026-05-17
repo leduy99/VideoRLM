@@ -25,6 +25,7 @@ FFMPEG_FRAME_EXTRACTION_MIN_BATCH_FRAMES = 16
 FFMPEG_FRAME_EXTRACTION_MAX_SECONDS_PER_FRAME = 1.0
 FFMPEG_FRAME_EXTRACTION_MAX_UNIFORM_STEP_DRIFT_SECONDS = 0.05
 FFMPEG_FRAME_EXTRACTION_SEEK_MARGIN_SECONDS = 0.25
+FFMPEG_FRAME_EXTRACTION_EOF_MARGIN_SECONDS = 0.25
 DEFAULT_SCENE_DETECTION_SAMPLE_RATE = None
 
 
@@ -299,6 +300,12 @@ def extract_frames_for_timestamps(
     if seek_workers < 1:
         raise ValueError(f"seek_workers must be at least 1, got {seek_workers}")
 
+    timestamps = _clamp_timestamps_for_media_duration(
+        media_path=media_path,
+        timestamps=timestamps,
+        ffprobe_bin=_ffprobe_bin_for_ffmpeg(ffmpeg_bin),
+    )
+
     should_sequence = extraction_strategy == "sequence"
     if should_sequence:
         try:
@@ -342,6 +349,30 @@ def _should_sequence_frame_extraction(timestamps: list[float]) -> bool:
         return False
     step = _uniform_timestamp_step(timestamps)
     return step is not None and step > 0
+
+
+def _clamp_timestamps_for_media_duration(
+    *,
+    media_path: str | Path,
+    timestamps: list[float],
+    ffprobe_bin: str,
+) -> list[float]:
+    if not timestamps:
+        return []
+    try:
+        duration = probe_media_duration(media_path, ffprobe_bin=ffprobe_bin)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        return list(timestamps)
+    if duration <= 0:
+        return list(timestamps)
+    safe_end = max(0.0, duration - FFMPEG_FRAME_EXTRACTION_EOF_MARGIN_SECONDS)
+    return [min(max(0.0, timestamp), safe_end) for timestamp in timestamps]
+
+
+def _ffprobe_bin_for_ffmpeg(ffmpeg_bin: str) -> str:
+    if ffmpeg_bin.endswith("ffmpeg"):
+        return ffmpeg_bin[: -len("ffmpeg")] + "ffprobe"
+    return "ffprobe"
 
 
 def _uniform_timestamp_step(timestamps: list[float]) -> float | None:

@@ -64,6 +64,8 @@ class VideoToolExecutor:
         speech_refine_candidate_count: int = 4,
         speech_refiner: SpeechRecognizer | None = None,
         visual_refiner: VisualSummarizer | None = None,
+        enable_vrrqa_graph_refinement_expansion: bool = True,
+        vrrqa_graph_refinement_neighbor_count: int = 1,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.memory = memory
@@ -77,6 +79,8 @@ class VideoToolExecutor:
         self.speech_refine_candidate_count = speech_refine_candidate_count
         self.speech_refiner = speech_refiner
         self.visual_refiner = visual_refiner
+        self.enable_vrrqa_graph_refinement_expansion = enable_vrrqa_graph_refinement_expansion
+        self.vrrqa_graph_refinement_neighbor_count = vrrqa_graph_refinement_neighbor_count
         self.progress_callback = progress_callback
 
     def execute(self, action: ControllerAction, state: ControllerState) -> Observation:
@@ -494,7 +498,7 @@ class VideoToolExecutor:
         max_child_chars: int = 900,
     ) -> tuple[str, dict[str, object]]:
         if self._should_refine_visual_node(node):
-            refined_detail, refined_metadata = self._refine_visual_node(node)
+            refined_detail, refined_metadata = self._refine_visual_node(node, state)
             if refined_detail:
                 return refined_detail, refined_metadata
 
@@ -535,18 +539,29 @@ class VideoToolExecutor:
             return False
         return bool(node.metadata.get("on_demand_visual_refinement"))
 
-    def _refine_visual_node(self, node) -> tuple[str, dict[str, object]]:
+    def _refine_visual_node(
+        self,
+        node,
+        state: ControllerState | None,
+    ) -> tuple[str, dict[str, object]]:
         source_video_path = self.memory.metadata.get("source_video_path")
         if not source_video_path:
             return node.visual_summary.strip(), {
                 "visual_refinement": "skipped",
                 "reason": "missing_source_video_path",
             }
+        refinement_span, graph_metadata = self._visual_refinement_span(node, state)
+        prompt_override = self._visual_refinement_prompt(state, graph_metadata)
         with _temporary_visual_refinement_progress_callback(
             self.visual_refiner,
             self.progress_callback,
+        ), _temporary_visual_prompt_override(
+            self.visual_refiner, prompt_override
+        ), _temporary_visual_forced_frame_timestamps(
+            self.visual_refiner,
+            graph_metadata.get("vrrqa_relationship_frame_timestamps"),
         ):
-            summaries = self.visual_refiner.summarize(str(source_video_path), [node.time_span])
+            summaries = self.visual_refiner.summarize(str(source_video_path), [refinement_span])
         if not summaries:
             return node.visual_summary.strip(), {
                 "visual_refinement": "skipped",
@@ -560,10 +575,145 @@ class VideoToolExecutor:
         node.metadata["visual_summary_mode"] = "on_demand_refined"
         node.metadata["visual_refinement"] = "qwenvl_on_demand"
         node.metadata["on_demand_visual_refinement"] = False
+        node.metadata.update(graph_metadata)
         return summary.summary.strip(), {
+            **summary.metadata,
             "visual_refinement": "qwenvl_on_demand",
             "refined_node_id": node.node_id,
+            "question_aware_visual_refinement": bool(prompt_override),
+            **graph_metadata,
         }
+
+    def _visual_refinement_span(
+        self,
+        node: VideoNode,
+        state: ControllerState | None,
+    ) -> tuple[TimeSpan, dict[str, object]]:
+        if not self._should_expand_vrrqa_visual_refinement(state):
+            return node.time_span, {}
+        graph_nodes = self._vrrqa_graph_refinement_nodes(node)
+        if len(graph_nodes) <= 1:
+            return node.time_span, {
+                "vrrqa_graph_expansion_enabled": True,
+                "vrrqa_graph_expansion_applied": False,
+                "vrrqa_graph_expansion_node_ids": [node.node_id],
+                "vrrqa_graph_expansion_node_spans": [node.time_span.to_dict()],
+                "vrrqa_relationship_frame_policy": "graph_node_start_mid_end",
+                "vrrqa_relationship_frame_timestamps": self._relationship_frame_timestamps(
+                    [node]
+                ),
+                "vrrqa_graph_expansion_reason": "no_graph_neighbors",
+            }
+        expanded_span = TimeSpan(
+            start=min(candidate.time_span.start for candidate in graph_nodes),
+            end=max(candidate.time_span.end for candidate in graph_nodes),
+        )
+        return expanded_span, {
+            "vrrqa_graph_expansion_enabled": True,
+            "vrrqa_graph_expansion_applied": expanded_span != node.time_span,
+            "vrrqa_graph_expansion_source_node_id": node.node_id,
+            "vrrqa_graph_expansion_node_ids": [candidate.node_id for candidate in graph_nodes],
+            "vrrqa_graph_expansion_levels": [candidate.level for candidate in graph_nodes],
+            "vrrqa_graph_expansion_node_spans": [
+                candidate.time_span.to_dict() for candidate in graph_nodes
+            ],
+            "vrrqa_graph_expansion_original_span": node.time_span.to_dict(),
+            "vrrqa_graph_expansion_span": expanded_span.to_dict(),
+            "vrrqa_graph_expansion_neighbor_count": self.vrrqa_graph_refinement_neighbor_count,
+            "vrrqa_relationship_frame_policy": "graph_node_start_mid_end",
+            "vrrqa_relationship_frame_timestamps": self._relationship_frame_timestamps(
+                graph_nodes
+            ),
+            "vrrqa_graph_expansion_reason": "parent_child_sibling_edges",
+        }
+
+    def _should_expand_vrrqa_visual_refinement(self, state: ControllerState | None) -> bool:
+        return (
+            self.enable_vrrqa_graph_refinement_expansion
+            and self.memory.metadata.get("vrrqa_visual_only") is True
+            and state is not None
+            and state.task_type == "multiple_choice_visual_qa"
+        )
+
+    def _vrrqa_graph_refinement_nodes(self, node: VideoNode) -> list[VideoNode]:
+        if node.parent_id is None:
+            return [node]
+        parent = self.memory.get_node(node.parent_id)
+        siblings = sorted(
+            self.memory.child_nodes(parent.node_id),
+            key=lambda candidate: (candidate.time_span.start, candidate.node_id),
+        )
+        try:
+            current_index = next(
+                index for index, candidate in enumerate(siblings) if candidate.node_id == node.node_id
+            )
+        except StopIteration:
+            return [node]
+        neighbor_count = max(0, self.vrrqa_graph_refinement_neighbor_count)
+        start_index = max(0, current_index - neighbor_count)
+        end_index = min(len(siblings), current_index + neighbor_count + 1)
+        return siblings[start_index:end_index]
+
+    def _relationship_frame_timestamps(self, nodes: list[VideoNode]) -> list[float]:
+        timestamps: list[float] = []
+        for node in nodes:
+            timestamps.extend(
+                [
+                    node.time_span.start,
+                    node.time_span.start + (node.time_span.duration / 2.0),
+                    node.time_span.end,
+                ]
+            )
+        return _merge_float_values(timestamps)
+
+    def _visual_refinement_prompt(
+        self,
+        state: ControllerState | None,
+        graph_metadata: dict[str, object] | None = None,
+    ) -> str | None:
+        if state is None or state.task_type != "multiple_choice_visual_qa":
+            return None
+        clean_question = _clean_vrrqa_question(state.question)
+        options = _extract_vrrqa_options(state.question)
+        if not clean_question or not options:
+            return None
+        option_lines = "\n".join(f"{letter}. {text}" for letter, text in options.items())
+        graph_lines = []
+        if graph_metadata and graph_metadata.get("vrrqa_graph_expansion_applied"):
+            graph_lines = [
+                "",
+                "Graph inspection context:",
+                "The frames may cover the current memory node plus adjacent graph nodes reached via "
+                "parent-child sibling edges.",
+                "Use the extra graph context only to resolve the current question; do not treat it as "
+                "arbitrary temporal padding.",
+                f"Current node: {graph_metadata.get('vrrqa_graph_expansion_source_node_id')}",
+                "Graph nodes inspected: "
+                + ", ".join(
+                    str(node_id)
+                    for node_id in graph_metadata.get("vrrqa_graph_expansion_node_ids", [])
+                ),
+            ]
+        return "\n".join(
+            [
+                "Analyze this short video clip for VRR-QA multiple-choice answering.",
+                "The images are ordered frames from one clip span. Inspect them carefully in order.",
+                "Return strict JSON only. Put the answer fields first so they are never omitted.",
+                "Required key order: `best_option`, `option_scores`, `evidence`, "
+                "`summary`, `frame_timeline`, `tags`, `entities`.",
+                "`best_option` must be exactly one option letter from the choices.",
+                "`option_scores` must map each option letter to a confidence from 0.0 to 1.0.",
+                "`evidence` must be one concise sentence grounded in visible frames.",
+                "`summary` must directly state the selected option and why.",
+                "`frame_timeline` should be short: at most one brief phrase per key frame.",
+                "Do not wrap the JSON in markdown fences.",
+                "",
+                f"Question: {clean_question}",
+                "Options:",
+                option_lines,
+                *graph_lines,
+            ]
+        )
 
     def _select_visual_detail_children(
         self,
@@ -1559,6 +1709,37 @@ def _temporary_visual_refinement_progress_callback(
 
 
 @contextmanager
+def _temporary_visual_prompt_override(component: Any, prompt: str | None):
+    if component is None or prompt is None or not hasattr(component, "prompt_override"):
+        yield
+        return
+
+    original = component.prompt_override
+    component.prompt_override = prompt
+    try:
+        yield
+    finally:
+        component.prompt_override = original
+
+
+@contextmanager
+def _temporary_visual_forced_frame_timestamps(component: Any, timestamps):
+    if component is None or not hasattr(component, "forced_frame_timestamps_override"):
+        yield
+        return
+
+    original = component.forced_frame_timestamps_override
+    normalized = None
+    if isinstance(timestamps, list):
+        normalized = [float(timestamp) for timestamp in timestamps]
+    component.forced_frame_timestamps_override = normalized
+    try:
+        yield
+    finally:
+        component.forced_frame_timestamps_override = original
+
+
+@contextmanager
 def _temporary_speech_refinement_progress_callback(
     component: Any,
     callback: Callable[[dict[str, Any]], None] | None,
@@ -1609,3 +1790,45 @@ def _node_prefix(node_id: str) -> str:
         if marker in node_id:
             return node_id.rsplit(marker, 1)[0] + marker
     return node_id[: max(1, len(node_id) // 2)]
+
+
+VRRQA_OPTION_PATTERN = re.compile(r"^\s*([A-Z])\.\s+(.+?)\s*$")
+
+
+def _extract_vrrqa_options(question: str) -> dict[str, str]:
+    options = {}
+    for line in question.splitlines():
+        match = VRRQA_OPTION_PATTERN.match(line)
+        if match is not None:
+            options[match.group(1)] = match.group(2).strip()
+    return dict(sorted(options.items()))
+
+
+def _clean_vrrqa_question(question: str) -> str:
+    lines = []
+    for line in question.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if not stripped:
+            continue
+        if lowered == "options:" or VRRQA_OPTION_PATTERN.match(stripped):
+            continue
+        if lowered.startswith("task:") or lowered.startswith("valid answer letters:"):
+            continue
+        if lowered.startswith("use the options above") or lowered.startswith("when you stop"):
+            continue
+        if lowered.startswith("do not answer") or lowered.startswith("if the evidence is incomplete"):
+            continue
+        if lowered.startswith("question:"):
+            stripped = stripped.split(":", maxsplit=1)[1].strip()
+        lines.append(stripped)
+    return " ".join(lines).strip()
+
+
+def _merge_float_values(values: list[float], *, tolerance: float = 0.03) -> list[float]:
+    merged: list[float] = []
+    for value in sorted(float(item) for item in values):
+        if merged and abs(merged[-1] - value) <= tolerance:
+            continue
+        merged.append(round(value, 3))
+    return merged
