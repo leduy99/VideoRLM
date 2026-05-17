@@ -28,6 +28,7 @@ from rlm.video.types import (
     SpeechSpan,
     TimeSpan,
     VideoMemory,
+    VideoNode,
 )
 
 CONTROL_QUERY_TOKENS = {
@@ -40,6 +41,14 @@ CONTROL_QUERY_TOKENS = {
     "final",
     "ending",
     "end",
+}
+
+GENERIC_VISUAL_SUMMARIES = {
+    "",
+    "video node",
+    "scene node",
+    "segment node",
+    "clip node",
 }
 
 
@@ -150,6 +159,24 @@ class VideoToolExecutor:
                 target_slot=selected_slot,
             )
 
+        requested_node = node
+        node = self._redirect_visual_open_node(
+            node=node,
+            modality=selected_modality,
+            state=state,
+            target_slot=selected_slot,
+        )
+        open_redirect_metadata: dict[str, object] = {}
+        if node.node_id != requested_node.node_id:
+            open_redirect_metadata = {
+                "requested_node_id": requested_node.node_id,
+                "opened_node_id": node.node_id,
+                "visual_open_redirected": True,
+                "visual_open_redirect_reason": (
+                    "generic_vrrqa_parent_open_redirected_to_visual_leaf"
+                ),
+            }
+
         if is_reopen_blocked(state.evidence_board, node.node_id, selected_modality, selected_slot):
             return Observation(
                 kind="open",
@@ -161,6 +188,7 @@ class VideoToolExecutor:
                 metadata={
                     "modality": selected_modality,
                     "clip_path": node.clip_path,
+                    **open_redirect_metadata,
                     "target_slot": selected_slot,
                     "background_only": False,
                     "no_new_information": True,
@@ -206,7 +234,12 @@ class VideoToolExecutor:
             evidence_items=raw_evidence,
         )
         refinement_frontier: list[FrontierItem] = []
-        if open_metadata.get("background_only") or open_metadata.get("no_new_information"):
+        needs_refinement = (
+            open_metadata.get("background_only")
+            or open_metadata.get("no_new_information")
+            or open_metadata.get("result") == "support_only"
+        )
+        if needs_refinement:
             refinement_frontier = self._build_refinement_frontier(
                 node=node,
                 state=state,
@@ -238,6 +271,7 @@ class VideoToolExecutor:
             metadata={
                 "modality": selected_modality,
                 "clip_path": node.clip_path,
+                **open_redirect_metadata,
                 **open_metadata,
             },
         )
@@ -358,6 +392,75 @@ class VideoToolExecutor:
             return sorted(prefix_matches)[:limit]
         return difflib.get_close_matches(node_id, node_ids, n=limit, cutoff=0.45)
 
+    def _redirect_visual_open_node(
+        self,
+        *,
+        node: VideoNode,
+        modality: Modality,
+        state: ControllerState,
+        target_slot: str | None,
+    ) -> VideoNode:
+        if modality != "visual":
+            return node
+        if not self.memory.metadata.get("vrrqa_visual_only"):
+            return node
+        if node.level == "clip" or not self._is_generic_visual_node(node):
+            return node
+
+        candidates = self._visual_refinement_descendants(node)
+        if not candidates:
+            return node
+
+        unopened = [
+            candidate
+            for candidate in candidates
+            if not is_reopen_blocked(state.evidence_board, candidate.node_id, modality, target_slot)
+        ]
+        return unopened[0] if unopened else candidates[0]
+
+    def _is_generic_visual_node(self, node: VideoNode) -> bool:
+        summary = " ".join(node.visual_summary.lower().split()).strip()
+        return summary in GENERIC_VISUAL_SUMMARIES
+
+    def _visual_refinement_descendants(self, node: VideoNode) -> list[VideoNode]:
+        descendants: list[VideoNode] = []
+        pending = list(self.memory.child_nodes(node.node_id))
+        while pending:
+            candidate = pending.pop(0)
+            if self._is_visual_leaf_candidate(candidate):
+                descendants.append(candidate)
+            pending.extend(self.memory.child_nodes(candidate.node_id))
+
+        if not descendants:
+            return []
+
+        level_priority = {"clip": 0, "segment": 1, "scene": 2, "video": 3}
+        descendants.sort(
+            key=lambda candidate: (
+                level_priority.get(candidate.level, 9),
+                not bool(candidate.metadata.get("on_demand_visual_refinement")),
+                not self._has_visual_frame_index(candidate),
+                candidate.time_span.start,
+                candidate.node_id,
+            )
+        )
+        return descendants
+
+    def _is_visual_leaf_candidate(self, node: VideoNode) -> bool:
+        if not node.visual_summary.strip():
+            return False
+        if node.metadata.get("on_demand_visual_refinement"):
+            return True
+        if self._has_visual_frame_index(node):
+            return True
+        return node.level == "clip" and not node.children
+
+    def _has_visual_frame_index(self, node: VideoNode) -> bool:
+        return (
+            node.metadata.get("visual_summary_mode") == "lazy_pitome_index"
+            or bool(node.metadata.get("pitome_frame_embeddings"))
+            or bool(node.metadata.get("semantic_frame_embeddings"))
+        )
 
     def _build_detail(self, node, modality: Modality) -> str:
         detail, _ = self._build_detail_with_metadata(node, modality, state=None)
@@ -534,6 +637,7 @@ class VideoToolExecutor:
 
     def _refinement_priority(self, node, candidate_kind: str, index: int) -> float:
         base = {
+            "descendant": 0.78,
             "child": 0.72,
             "sibling": 0.56,
             "parent": 0.4,
@@ -560,8 +664,15 @@ class VideoToolExecutor:
         target_slot: str | None,
         max_items: int = 4,
     ) -> list[FrontierItem]:
-        candidates = self.memory.child_nodes(node.node_id)
-        candidate_kind = "child"
+        if modality == "visual":
+            candidates = self._visual_refinement_descendants(node)
+            candidate_kind = "descendant"
+        else:
+            candidates = []
+            candidate_kind = "child"
+        if not candidates:
+            candidates = self.memory.child_nodes(node.node_id)
+            candidate_kind = "child"
         if not candidates and node.parent_id:
             parent = self.memory.get_node(node.parent_id)
             siblings = self.memory.child_nodes(parent.node_id)
@@ -587,7 +698,7 @@ class VideoToolExecutor:
                     level=candidate.level,
                     score=self._refinement_priority(candidate, candidate_kind, index),
                     why_candidate=(
-                        f"Refine {candidate_kind} node after background-only "
+                        f"Refine {candidate_kind} node after weak "
                         f"{modality} open for slot '{target_slot or 'generic'}'"
                     ),
                     recommended_modalities=recommended or [modality],

@@ -447,6 +447,7 @@ class VRRQABenchmarkRunner:
         memory_path = self._memory_path(sample)
         if memory_path is not None and memory_path.exists():
             memory = self.memory_builder.load_memory(memory_path)
+            memory.metadata.setdefault("vrrqa_visual_only", True)
             self._memory_cache[question_id] = memory
             return memory
 
@@ -456,6 +457,7 @@ class VRRQABenchmarkRunner:
         artifacts = None
         if artifact_dir is not None and artifact_dir.exists():
             artifacts = self.memory_builder.load_artifacts_dir(artifact_dir)
+            artifacts.metadata.setdefault("vrrqa_visual_only", True)
         if artifacts is None:
             with self._single_window_overrides(duration_seconds):
                 artifacts = self.memory_builder.prepare_artifacts(
