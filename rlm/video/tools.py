@@ -122,6 +122,31 @@ class VideoToolExecutor:
         state: ControllerState,
         target_slot: str | None = None,
     ) -> Observation:
+        if node_id not in self.memory.nodes:
+            selected_modality = modality or "visual"
+            question_spec = state.question_spec or build_question_spec(state.question, state.task_type)
+            selected_slot = target_slot or select_target_slot(question_spec, state.evidence_board)
+            return Observation(
+                kind="open",
+                summary=(
+                    f"OPEN skipped invalid node_id {node_id} for "
+                    f"slot '{selected_slot or 'generic'}'."
+                ),
+                node_id=node_id,
+                metadata={
+                    "modality": selected_modality,
+                    "target_slot": selected_slot,
+                    "background_only": False,
+                    "no_new_information": True,
+                    "filled_slots": [],
+                    "missing_slots": [],
+                    "duplicate_evidence_count": 0,
+                    "suggested_queries": [],
+                    "progress_made": False,
+                    "result": "invalid_node_id",
+                    "invalid_node_id": True,
+                },
+            )
         node = self.memory.get_node(node_id)
         selected_modality = modality or "visual"
         question_spec = state.question_spec or build_question_spec(state.question, state.task_type)
@@ -216,6 +241,18 @@ class VideoToolExecutor:
         )
 
     def split(self, node_id: str) -> Observation:
+        if node_id not in self.memory.nodes:
+            return Observation(
+                kind="split",
+                summary=f"SPLIT skipped invalid node_id {node_id}.",
+                node_id=node_id,
+                metadata={
+                    "child_count": 0,
+                    "progress_made": False,
+                    "result": "invalid_node_id",
+                    "invalid_node_id": True,
+                },
+            )
         children = self.memory.child_nodes(node_id)
         frontier = []
         for child in children:

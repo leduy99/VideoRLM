@@ -236,6 +236,28 @@ def test_open_reopen_guard_blocks_same_node_modality_and_slot():
     assert second.metadata["result"] == "reopen_blocked"
 
 
+def test_open_invalid_node_id_returns_observation_instead_of_raising():
+    memory = build_memory_for_tools(
+        [
+            SpeechSpan(
+                text="She wore it right away because she wanted to show the new diamond.",
+                time_span=TimeSpan(0.0, 10.0),
+            )
+        ]
+    )
+    executor = VideoToolExecutor(memory)
+    state = ControllerState(
+        question="Why did she decide to wear the new diamond add-on right away?",
+    )
+
+    observation = executor.open("tool_sample_scene_999", "speech", state, target_slot="reason")
+
+    assert observation.evidence == []
+    assert observation.node_id == "tool_sample_scene_999"
+    assert observation.metadata["invalid_node_id"] is True
+    assert observation.metadata["result"] == "invalid_node_id"
+
+
 def test_open_speech_why_query_prefers_causal_late_snippet_over_early_setup():
     memory = build_memory_for_tools(
         [

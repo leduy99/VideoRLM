@@ -61,6 +61,17 @@ GENERIC_SLOT_KEYWORDS: dict[str, list[str]] = {
     "missing_context": ["context", "missing", "unclear", "not enough"],
 }
 CONTROL_QUERY_TOKENS = {"why", "first", "last", "earliest", "initial", "beginning", "final"}
+TIMELOGIC_TEMPORAL_KEYWORDS = {
+    "before",
+    "after",
+    "until",
+    "overlap",
+    "eventually",
+    "co",
+    "occur",
+    "immediately",
+    "always",
+}
 
 
 def build_question_spec(
@@ -75,7 +86,23 @@ def build_question_spec(
     slots: list[EvidenceSlotSpec]
     answer_policy = "answer_only_if_required_slots_filled"
 
-    if "why" in tokens:
+    if task_type == "timelogic_temporal_reasoning":
+        question_type = "temporal_logic"
+        preferred_modality = "visual"
+        slots = [
+            EvidenceSlotSpec(
+                slot="main_claim",
+                description=f"Temporal answer to: {question}",
+                preferred_modality="visual",
+            ),
+            EvidenceSlotSpec(
+                slot="supporting_detail",
+                description="Visual evidence describing the relevant events and their temporal relation",
+                required=False,
+                preferred_modality="visual",
+            ),
+        ]
+    elif "why" in tokens:
         question_type = "why_reason"
         slots = [
             EvidenceSlotSpec(
@@ -797,6 +824,8 @@ def _reason_description(question: str) -> str:
 
 def _infer_preferred_modality(question: str, task_type: str | None) -> Modality:
     lowered = question.lower()
+    if task_type == "timelogic_temporal_reasoning":
+        return "visual"
     visual_cues = (
         "stare",
         "doorway",
@@ -811,6 +840,10 @@ def _infer_preferred_modality(question: str, task_type: str | None) -> Modality:
         "mouse",
         "cat",
     )
+    if any(keyword in lowered for keyword in (" before ", " after ", " until ", " overlap ", " eventually ", " co-occur ", " overlap ?", " overlap ?")):
+        return "visual"
+    if TIMELOGIC_TEMPORAL_KEYWORDS & _tokenize(question):
+        return "visual"
     if any(cue in lowered for cue in visual_cues):
         return "visual"
     if task_type in {"information_retrieval", "multimodal_synthesis"} and any(

@@ -36,6 +36,7 @@ from rlm.video.qwen import (
     QwenVideoStackConfig,
 )
 from rlm.video.traces import result_to_training_examples, save_training_examples
+from rlm.video.timelogic_auditing import parse_timelogic_category
 from rlm.video.types import (
     ActionType,
     AudioEvent,
@@ -98,6 +99,7 @@ __all__ = [
     "OpenAICompatibleVisualSummarizer",
     "PreparedArtifactStore",
     "PreparedVideoArtifacts",
+    "parse_timelogic_category",
     "QwenLocalVideoStackConfig",
     "QwenVideoRuntimeBundle",
     "QwenVideoStackConfig",

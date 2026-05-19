@@ -75,6 +75,7 @@ class VideoMemoryBuilder:
         scene_duration_seconds: float = 180.0,
         segment_duration_seconds: float = 45.0,
         clip_duration_seconds: float = 15.0,
+        min_visual_span_seconds: float = 0.5,
     ):
         self.speech_recognizer = speech_recognizer
         self.visual_summarizer = visual_summarizer
@@ -83,6 +84,7 @@ class VideoMemoryBuilder:
         self.scene_duration_seconds = scene_duration_seconds
         self.segment_duration_seconds = segment_duration_seconds
         self.clip_duration_seconds = clip_duration_seconds
+        self.min_visual_span_seconds = min_visual_span_seconds
 
     def prepare_artifacts(
         self,
@@ -96,7 +98,11 @@ class VideoMemoryBuilder:
 
         scene_spans = self._subdivide(TimeSpan(0.0, duration_seconds), self.scene_duration_seconds)
         clip_spans = self._subdivide(TimeSpan(0.0, duration_seconds), self.clip_duration_seconds)
-        visual_spans = scene_spans + clip_spans
+        visual_spans = [
+            span
+            for span in scene_spans + clip_spans
+            if span.duration >= self.min_visual_span_seconds
+        ]
 
         speech_spans = (
             self.speech_recognizer.recognize(video_path) if self.speech_recognizer else []
@@ -112,6 +118,7 @@ class VideoMemoryBuilder:
         payload = dict(metadata or {})
         payload.setdefault("source_video_path", video_path)
         payload.setdefault("duration_seconds", duration_seconds)
+        payload.setdefault("min_visual_span_seconds", self.min_visual_span_seconds)
         return PreparedVideoArtifacts(
             video_id=video_id,
             duration_seconds=duration_seconds,
@@ -195,6 +202,7 @@ class VideoMemoryBuilder:
         metadata.setdefault("scene_duration_seconds", self.scene_duration_seconds)
         metadata.setdefault("segment_duration_seconds", self.segment_duration_seconds)
         metadata.setdefault("clip_duration_seconds", self.clip_duration_seconds)
+        metadata.setdefault("min_visual_span_seconds", self.min_visual_span_seconds)
         metadata.setdefault("node_count", len(nodes))
         return VideoMemory(
             video_id=artifacts.video_id,
