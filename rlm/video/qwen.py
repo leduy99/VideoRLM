@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from rlm.clients.transformers_local import TransformersClient
@@ -52,7 +53,18 @@ class LocalModelConfig:
     model_kwargs: dict[str, Any] | None = None
 
     def resolved_model_path(self) -> str:
-        return self.model_path or self.model_name
+        if self.model_path:
+            candidate = Path(self.model_path)
+            if not candidate.exists():
+                return self.model_name
+            if candidate.is_dir():
+                for child in candidate.iterdir():
+                    if child.name.startswith("."):
+                        continue
+                    return self.model_path
+                return self.model_name
+            return self.model_path
+        return self.model_name
 
     def download(self) -> str:
         path = download_snapshot(self.model_name, local_dir=self.model_path)
