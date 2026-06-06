@@ -1,0 +1,10 @@
+{
+  "name": "vrrqa",
+  "instructions": [
+    "Treat VRR-QA as visual implicit-relation multiple choice, not open-ended VQA.",
+    "Ground every answer in visible entities, spatial relations, viewpoint, motion, temporal order, and object continuity.",
+    "For relation questions, first localize the target entities and then compare all options against the same evidence.",
+    "Do not use outside commonsense as the deciding evidence when the relation is not visible.",
+    "Return one valid option letter only."
+  ]
+}

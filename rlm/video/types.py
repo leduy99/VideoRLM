@@ -1,14 +1,16 @@
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from rlm.core.types import UsageSummary
 
-VideoNodeLevel = Literal["video", "scene", "segment", "clip"]
+VideoNodeLevel = Literal["video", "scene", "segment", "event", "clip"]
 Modality = Literal["speech", "visual", "ocr", "audio", "cross_modal"]
 ActionType = Literal["SEARCH", "OPEN", "SPLIT", "MERGE", "STOP"]
 FrontierStatus = Literal["unopened", "opened", "expanded", "exhausted"]
 SlotRole = Literal["core", "support", "background", "noise"]
 SlotStatus = Literal["missing", "filled", "background_only"]
+EventStatus = Literal["missing", "localized"]
 
 
 @dataclass
@@ -133,6 +135,434 @@ class AudioEvent:
 
 
 @dataclass
+class RawTemporalEvent:
+    event_id: str
+    time_span: TimeSpan
+    modality: str
+    event_type: str
+    text: str | None = None
+    bbox: list[float] | None = None
+    screen_region: str | None = None
+    confidence: float = 1.0
+    section_id: str | None = None
+    source_node_id: str | None = None
+    linked_events: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def start(self) -> float:
+        return self.time_span.start
+
+    @property
+    def end(self) -> float:
+        return self.time_span.end
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "start": self.time_span.start,
+            "end": self.time_span.end,
+            "modality": self.modality,
+            "event_type": self.event_type,
+            "text": self.text,
+            "bbox": list(self.bbox) if self.bbox is not None else None,
+            "screen_region": self.screen_region,
+            "confidence": self.confidence,
+            "section_id": self.section_id,
+            "source_node_id": self.source_node_id,
+            "linked_events": list(self.linked_events),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RawTemporalEvent":
+        if "time_span" in data:
+            time_span = TimeSpan.from_dict(data["time_span"])
+        else:
+            time_span = TimeSpan(start=float(data["start"]), end=float(data["end"]))
+        bbox = data.get("bbox")
+        return cls(
+            event_id=data["event_id"],
+            time_span=time_span,
+            modality=str(data["modality"]),
+            event_type=str(data["event_type"]),
+            text=data.get("text"),
+            bbox=[float(item) for item in bbox] if isinstance(bbox, list) else None,
+            screen_region=data.get("screen_region"),
+            confidence=float(data.get("confidence", 1.0)),
+            section_id=data.get("section_id"),
+            source_node_id=data.get("source_node_id"),
+            linked_events=list(data.get("linked_events", [])),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class SectionNode:
+    section_id: str
+    ordinal: int
+    time_span: TimeSpan
+    labels: list[str] = field(default_factory=list)
+    evidence_events: list[str] = field(default_factory=list)
+    dominant_modalities: list[str] = field(default_factory=list)
+    confidence: float = 1.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "section_id": self.section_id,
+            "ordinal": self.ordinal,
+            "start": self.time_span.start,
+            "end": self.time_span.end,
+            "labels": list(self.labels),
+            "evidence_events": list(self.evidence_events),
+            "dominant_modalities": list(self.dominant_modalities),
+            "confidence": self.confidence,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SectionNode":
+        if "time_span" in data:
+            time_span = TimeSpan.from_dict(data["time_span"])
+        else:
+            time_span = TimeSpan(start=float(data["start"]), end=float(data["end"]))
+        return cls(
+            section_id=data["section_id"],
+            ordinal=int(data.get("ordinal", 0)),
+            time_span=time_span,
+            labels=list(data.get("labels", [])),
+            evidence_events=list(data.get("evidence_events", [])),
+            dominant_modalities=list(data.get("dominant_modalities", [])),
+            confidence=float(data.get("confidence", 1.0)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class CodeSnapshot:
+    snapshot_id: str
+    timestamp: float
+    section_id: str | None = None
+    active_lines: list[str] = field(default_factory=list)
+    variables: dict[str, Any] = field(default_factory=dict)
+    derived_from_events: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "timestamp": self.timestamp,
+            "section_id": self.section_id,
+            "active_lines": list(self.active_lines),
+            "variables": dict(self.variables),
+            "derived_from_events": list(self.derived_from_events),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CodeSnapshot":
+        return cls(
+            snapshot_id=data["snapshot_id"],
+            timestamp=float(data["timestamp"]),
+            section_id=data.get("section_id"),
+            active_lines=list(data.get("active_lines", [])),
+            variables=dict(data.get("variables", {})),
+            derived_from_events=list(data.get("derived_from_events", [])),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class OperatorEvent:
+    operator: str
+    operator_class: str
+    first_seen: float
+    section_id: str | None = None
+    source: list[str] = field(default_factory=list)
+    context: str = ""
+    event_ids: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operator": self.operator,
+            "operator_class": self.operator_class,
+            "first_seen": self.first_seen,
+            "section_id": self.section_id,
+            "source": list(self.source),
+            "context": self.context,
+            "event_ids": list(self.event_ids),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "OperatorEvent":
+        return cls(
+            operator=data["operator"],
+            operator_class=str(data.get("operator_class", "comparison")),
+            first_seen=float(data.get("first_seen", 0.0)),
+            section_id=data.get("section_id"),
+            source=list(data.get("source", [])),
+            context=str(data.get("context", "")),
+            event_ids=list(data.get("event_ids", [])),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class TemporalLink:
+    source: str
+    relation: str
+    target: str
+    confidence: float = 1.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "relation": self.relation,
+            "target": self.target,
+            "confidence": self.confidence,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TemporalLink":
+        return cls(
+            source=data["source"],
+            relation=data["relation"],
+            target=data["target"],
+            confidence=float(data.get("confidence", 1.0)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class CrossModalTemporalIndex:
+    sections: list[SectionNode] = field(default_factory=list)
+    asr_events: list[RawTemporalEvent] = field(default_factory=list)
+    ocr_events: list[RawTemporalEvent] = field(default_factory=list)
+    code_line_events: list[RawTemporalEvent] = field(default_factory=list)
+    terminal_events: list[RawTemporalEvent] = field(default_factory=list)
+    visual_anchor_events: list[RawTemporalEvent] = field(default_factory=list)
+    audio_events: list[RawTemporalEvent] = field(default_factory=list)
+    code_snapshots: list[CodeSnapshot] = field(default_factory=list)
+    operator_events: list[OperatorEvent] = field(default_factory=list)
+    temporal_links: list[TemporalLink] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def all_events(self) -> list[RawTemporalEvent]:
+        return sorted(
+            [
+                *self.asr_events,
+                *self.ocr_events,
+                *self.code_line_events,
+                *self.terminal_events,
+                *self.visual_anchor_events,
+                *self.audio_events,
+            ],
+            key=lambda item: (item.time_span.start, item.event_id),
+        )
+
+    def resolve_section(self, query: str) -> SectionNode | None:
+        query_tokens = _temporal_index_tokens(query)
+        if not query_tokens:
+            return None
+        scored: list[tuple[float, float, SectionNode]] = []
+        for section in self.sections:
+            text = " ".join([section.section_id, *section.labels])
+            section_tokens = _temporal_index_tokens(text)
+            overlap = len(query_tokens & section_tokens)
+            score = float(overlap)
+            lowered = query.lower()
+            if "comparison" in lowered and "comparison_section" == section.section_id:
+                score += 3.0
+            if "arithmetic" in lowered and "arithmetic_section" == section.section_id:
+                score += 3.0
+            if "assignment" in lowered and "assignment_section" == section.section_id:
+                score += 3.0
+            if "third segment" in lowered and "third_segment" in section.labels:
+                score += 3.0
+            if "second half" in lowered and "second_half" in section.labels:
+                score += 3.0
+            if score > 0:
+                scored.append((score, -section.time_span.duration, section))
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (-item[0], item[1], item[2].time_span.start))
+        return scored[0][2]
+
+    def find_events(
+        self,
+        *,
+        modality: str | None = None,
+        event_type: str | None = None,
+        text_query: str | None = None,
+        section_id: str | None = None,
+        before: float | None = None,
+        after: float | None = None,
+        screen_region: str | None = None,
+        limit: int | None = None,
+    ) -> list[RawTemporalEvent]:
+        query_tokens = _temporal_index_tokens(text_query or "")
+        events: list[tuple[float, RawTemporalEvent]] = []
+        for event in self.all_events():
+            if modality and event.modality != modality:
+                continue
+            if event_type and event.event_type != event_type:
+                continue
+            if section_id and event.section_id != section_id:
+                continue
+            if before is not None and event.time_span.start >= before:
+                continue
+            if after is not None and event.time_span.end <= after:
+                continue
+            if screen_region and event.screen_region != screen_region:
+                continue
+            score = 1.0
+            if query_tokens:
+                text_tokens = _temporal_index_tokens(event.text or "")
+                overlap = len(query_tokens & text_tokens)
+                if overlap <= 0:
+                    continue
+                score += float(overlap)
+            events.append((score, event))
+        events.sort(key=lambda item: (-item[0], item[1].time_span.start, item[1].event_id))
+        selected = [event for _, event in events]
+        return selected[:limit] if limit is not None else selected
+
+    def get_code_snapshot(
+        self,
+        time_or_section: float | str | None = None,
+    ) -> CodeSnapshot | None:
+        if not self.code_snapshots:
+            return None
+        if isinstance(time_or_section, str):
+            matching = [
+                snapshot
+                for snapshot in self.code_snapshots
+                if snapshot.section_id == time_or_section
+            ]
+            if matching:
+                return max(matching, key=lambda item: item.timestamp)
+        if isinstance(time_or_section, int | float):
+            before = [
+                snapshot
+                for snapshot in self.code_snapshots
+                if snapshot.timestamp <= float(time_or_section)
+            ]
+            if before:
+                return max(before, key=lambda item: item.timestamp)
+        return max(self.code_snapshots, key=lambda item: item.timestamp)
+
+    def evaluate_code(
+        self,
+        target_variable: str,
+        time_or_section: float | str | None = None,
+    ) -> Any | None:
+        snapshot = self.get_code_snapshot(time_or_section)
+        if snapshot is None:
+            return None
+        return snapshot.variables.get(target_variable)
+
+    def list_operators(
+        self,
+        *,
+        section_id: str | None = None,
+        operator_class: str | None = None,
+    ) -> list[str]:
+        ordered: list[str] = []
+        for event in sorted(self.operator_events, key=lambda item: item.first_seen):
+            if section_id and event.section_id != section_id:
+                continue
+            if operator_class and event.operator_class != operator_class:
+                continue
+            if event.operator not in ordered:
+                ordered.append(event.operator)
+        return ordered
+
+    def extract_terminal_output(
+        self,
+        *,
+        section_id: str | None = None,
+        time_window: TimeSpan | None = None,
+    ) -> list[str]:
+        outputs: list[str] = []
+        for event in self.terminal_events:
+            if section_id and event.section_id != section_id:
+                continue
+            if time_window and not event.time_span.overlaps(time_window):
+                continue
+            text = (event.text or "").strip()
+            if text and text not in outputs:
+                outputs.append(text)
+        return outputs
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sections": [item.to_dict() for item in self.sections],
+            "asr_events": [item.to_dict() for item in self.asr_events],
+            "ocr_events": [item.to_dict() for item in self.ocr_events],
+            "code_line_events": [item.to_dict() for item in self.code_line_events],
+            "terminal_events": [item.to_dict() for item in self.terminal_events],
+            "visual_anchor_events": [
+                item.to_dict() for item in self.visual_anchor_events
+            ],
+            "audio_events": [item.to_dict() for item in self.audio_events],
+            "code_snapshots": [item.to_dict() for item in self.code_snapshots],
+            "operator_events": [item.to_dict() for item in self.operator_events],
+            "temporal_links": [item.to_dict() for item in self.temporal_links],
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CrossModalTemporalIndex":
+        return cls(
+            sections=[SectionNode.from_dict(item) for item in data.get("sections", [])],
+            asr_events=[
+                RawTemporalEvent.from_dict(item) for item in data.get("asr_events", [])
+            ],
+            ocr_events=[
+                RawTemporalEvent.from_dict(item) for item in data.get("ocr_events", [])
+            ],
+            code_line_events=[
+                RawTemporalEvent.from_dict(item)
+                for item in data.get("code_line_events", [])
+            ],
+            terminal_events=[
+                RawTemporalEvent.from_dict(item)
+                for item in data.get("terminal_events", [])
+            ],
+            visual_anchor_events=[
+                RawTemporalEvent.from_dict(item)
+                for item in data.get("visual_anchor_events", [])
+            ],
+            audio_events=[
+                RawTemporalEvent.from_dict(item) for item in data.get("audio_events", [])
+            ],
+            code_snapshots=[
+                CodeSnapshot.from_dict(item) for item in data.get("code_snapshots", [])
+            ],
+            operator_events=[
+                OperatorEvent.from_dict(item) for item in data.get("operator_events", [])
+            ],
+            temporal_links=[
+                TemporalLink.from_dict(item) for item in data.get("temporal_links", [])
+            ],
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+def _temporal_index_tokens(text: str) -> set[str]:
+    return set(
+        token
+        for token in re.findall(r"[a-z0-9_]+", text.lower().replace("-", "_"))
+        if len(token) > 1
+    )
+
+
+@dataclass
 class VideoNode:
     node_id: str
     level: VideoNodeLevel
@@ -195,6 +625,7 @@ class VideoMemory:
     video_id: str
     root_id: str
     nodes: dict[str, VideoNode]
+    cross_modal_index: CrossModalTemporalIndex | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def get_node(self, node_id: str) -> VideoNode:
@@ -213,6 +644,9 @@ class VideoMemory:
             "video_id": self.video_id,
             "root_id": self.root_id,
             "nodes": {node_id: node.to_dict() for node_id, node in self.nodes.items()},
+            "cross_modal_index": (
+                self.cross_modal_index.to_dict() if self.cross_modal_index is not None else None
+            ),
             "metadata": dict(self.metadata),
         }
 
@@ -225,6 +659,11 @@ class VideoMemory:
                 node_id: VideoNode.from_dict(node_data)
                 for node_id, node_data in data.get("nodes", {}).items()
             },
+            cross_modal_index=(
+                CrossModalTemporalIndex.from_dict(data["cross_modal_index"])
+                if data.get("cross_modal_index") is not None
+                else None
+            ),
             metadata=dict(data.get("metadata", {})),
         )
 
@@ -500,6 +939,126 @@ class Evidence:
 
 
 @dataclass
+class EventInterval:
+    time_span: TimeSpan
+    evidence_id: str
+    source_node_id: str
+    confidence: float
+    match_score: float
+    detail: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "time_span": self.time_span.to_dict(),
+            "evidence_id": self.evidence_id,
+            "source_node_id": self.source_node_id,
+            "confidence": self.confidence,
+            "match_score": self.match_score,
+            "detail": self.detail,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EventInterval":
+        return cls(
+            time_span=TimeSpan.from_dict(data["time_span"]),
+            evidence_id=data["evidence_id"],
+            source_node_id=data["source_node_id"],
+            confidence=float(data["confidence"]),
+            match_score=float(data.get("match_score", data.get("confidence", 0.0))),
+            detail=data.get("detail", ""),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class EventMemoryEvent:
+    event_id: str
+    phrase: str
+    source: str = "question"
+    option_letter: str | None = None
+    status: EventStatus = "missing"
+    intervals: list[EventInterval] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "phrase": self.phrase,
+            "source": self.source,
+            "option_letter": self.option_letter,
+            "status": self.status,
+            "intervals": [interval.to_dict() for interval in self.intervals],
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EventMemoryEvent":
+        return cls(
+            event_id=data["event_id"],
+            phrase=data["phrase"],
+            source=data.get("source", "question"),
+            option_letter=data.get("option_letter"),
+            status=data.get("status", "missing"),
+            intervals=[
+                EventInterval.from_dict(item) for item in data.get("intervals", [])
+            ],
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class EventMemory:
+    task_name: str
+    question: str
+    mode: str | None = None
+    events: dict[str, EventMemoryEvent] = field(default_factory=dict)
+    relations: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_name": self.task_name,
+            "question": self.question,
+            "mode": self.mode,
+            "events": {
+                event_id: event.to_dict() for event_id, event in self.events.items()
+            },
+            "relations": [dict(relation) for relation in self.relations],
+            "metadata": dict(self.metadata),
+            "localized_event_count": self.localized_event_count,
+            "missing_event_ids": self.missing_event_ids,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EventMemory":
+        return cls(
+            task_name=data["task_name"],
+            question=data["question"],
+            mode=data.get("mode"),
+            events={
+                event_id: EventMemoryEvent.from_dict(event_data)
+                for event_id, event_data in data.get("events", {}).items()
+            },
+            relations=[dict(item) for item in data.get("relations", [])],
+            metadata=dict(data.get("metadata", {})),
+        )
+
+    @property
+    def localized_event_count(self) -> int:
+        return sum(1 for event in self.events.values() if event.status == "localized")
+
+    @property
+    def missing_event_ids(self) -> list[str]:
+        return [
+            event.event_id
+            for event in self.events.values()
+            if event.status != "localized"
+        ]
+
+
+@dataclass
 class BudgetState:
     steps_used: int = 0
     steps_remaining: int = 0
@@ -610,6 +1169,7 @@ class ControllerState:
     frontier: list[FrontierItem] = field(default_factory=list)
     evidence_ledger: list[Evidence] = field(default_factory=list)
     evidence_board: EvidenceBoard | None = None
+    event_memory: EventMemory | None = None
     action_history: list[dict[str, Any]] = field(default_factory=list)
     budget: BudgetState = field(default_factory=BudgetState)
     global_context: dict[str, Any] = field(default_factory=dict)
@@ -625,6 +1185,7 @@ class ControllerState:
             "frontier": [item.to_dict() for item in self.frontier],
             "evidence_ledger": [item.to_dict() for item in self.evidence_ledger],
             "evidence_board": self.evidence_board.to_dict() if self.evidence_board else None,
+            "event_memory": self.event_memory.to_dict() if self.event_memory else None,
             "action_history": list(self.action_history),
             "budget": self.budget.to_dict(),
             "global_context": dict(self.global_context),
@@ -648,6 +1209,11 @@ class ControllerState:
             evidence_board=(
                 EvidenceBoard.from_dict(data["evidence_board"])
                 if data.get("evidence_board") is not None
+                else None
+            ),
+            event_memory=(
+                EventMemory.from_dict(data["event_memory"])
+                if data.get("event_memory") is not None
                 else None
             ),
             action_history=list(data.get("action_history", [])),

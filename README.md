@@ -41,7 +41,7 @@ You can try out RLMs quickly by installing from PyPi:
 pip install rlms
 ```
 
-For the full `VideoRLM` stack in this repo, use the repo-root [`environment.yml`](environment.yml) and see the verified setup guide at [`docs/video_rlm_setup_and_usage.md`](docs/video_rlm_setup_and_usage.md).
+For the full `VideoRLM` stack in this repo, use the repo-root [`environment.yml`](environment.yml), see the verified setup guide at [`docs/video_rlm_setup_and_usage.md`](docs/video_rlm_setup_and_usage.md), and see the current runtime pipeline at [`docs/videorlm_current_pipeline.md`](docs/videorlm_current_pipeline.md).
 
 The default RLM client uses a REPL environment that runs on the host process through Python `exec` calls. It uses the same virtual environment as the host process (i.e. it will have access to the same dependencies), but with some limitations in its available global modules. As an example, we can call RLM completions using GPT-5-nano:
 ```python
@@ -163,3 +163,5 @@ You'll have the option to select saved `.jsonl` files
 <p align="center">
   <img src="media/visualizer.png" alt="RLM Visualizer Example" width="800"/>
 </p>
+
+

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import defaultdict
-from typing import Any
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from rlm.video.index import STOPWORDS, TOKEN_PATTERN, SearchHit, VideoMemoryIndex
+from rlm.video.question_router import evidence_matches_route, route_from_metadata, route_question
 from rlm.video.types import (
     ControllerState,
     Evidence,
@@ -154,6 +158,203 @@ SPEECH_ROUTE_PHRASES = {
     "what does she say",
     "what does he say",
 }
+SPATIAL_RELATION_TERMS = {
+    "above",
+    "across",
+    "behind",
+    "below",
+    "beside",
+    "closer",
+    "depth",
+    "direction",
+    "farther",
+    "facing",
+    "front",
+    "left",
+    "near",
+    "nearest",
+    "next",
+    "right",
+    "side",
+    "toward",
+    "towards",
+    "under",
+    "viewpoint",
+}
+SPATIAL_RELATION_PHRASES = {
+    "in front of",
+    "to the left",
+    "to the right",
+    "on the left",
+    "on the right",
+    "same side",
+    "opposite side",
+    "relative position",
+    "spatial relation",
+    "depth relation",
+    "which direction",
+    "where is",
+    "where are",
+}
+CO_VISIBLE_RELATION_TERMS = {
+    "above",
+    "behind",
+    "below",
+    "beside",
+    "closer",
+    "depth",
+    "farther",
+    "facing",
+    "front",
+    "left",
+    "near",
+    "nearest",
+    "next",
+    "right",
+    "side",
+    "toward",
+    "towards",
+    "under",
+    "viewpoint",
+}
+CO_VISIBLE_RELATION_PHRASES = {
+    "in front of",
+    "in reference to",
+    "with reference to",
+    "relative to",
+    "with respect to",
+    "compared to",
+    "to the left",
+    "to the right",
+    "on the left",
+    "on the right",
+    "same side",
+    "opposite side",
+    "spatial relation",
+    "depth relation",
+}
+RELATION_NEGATIVE_PHRASES = {
+    "cannot determine the relation",
+    "cannot see both",
+    "can't determine the relation",
+    "can't see both",
+    "do not see both",
+    "does not show both",
+    "not clearly visible together",
+    "not in the same frame",
+    "not in the same shot",
+    "not shown together",
+    "not visible together",
+    "no frame showing both",
+    "no same-frame evidence",
+    "relation is not visible",
+    "separate frames",
+}
+RELATION_POSITIVE_PHRASES = {
+    "both are visible",
+    "both visible",
+    "co-visible",
+    "in the same frame",
+    "in the same shot",
+    "left of",
+    "right of",
+    "above",
+    "below",
+    "in front of",
+    "behind",
+    "facing",
+    "toward",
+    "towards",
+    "closer",
+    "farther",
+    "near",
+    "next to",
+    "beside",
+    "under",
+    "visible together",
+}
+
+RelationEvidenceStatus = Literal["supported", "unsupported", "unknown"]
+TEMPORAL_AFTER_TERMS = {"after", "afterward", "afterwards", "following", "later", "next"}
+TEMPORAL_BEFORE_TERMS = {"before", "earlier", "previous", "previously", "prior"}
+CAUSAL_TERMS = {"because", "cause", "caused", "causal", "effect", "imply", "why"}
+ACTION_TERMS = {
+    "add",
+    "carry",
+    "close",
+    "drink",
+    "enter",
+    "fix",
+    "hold",
+    "lift",
+    "move",
+    "open",
+    "pick",
+    "place",
+    "pour",
+    "put",
+    "reach",
+    "serve",
+    "stand",
+    "take",
+    "walk",
+}
+ACTOR_TERMS = {"actor", "child", "man", "person", "people", "presenter", "speaker", "woman"}
+PLACE_TERMS = {
+    "bedroom",
+    "desk",
+    "home",
+    "kitchen",
+    "office",
+    "outdoor",
+    "room",
+    "screen",
+    "shop",
+    "stage",
+    "street",
+    "table",
+}
+COGNITIVE_QUERY_EXCLUDE_TERMS = (
+    ACTOR_TERMS
+    | PLACE_TERMS
+    | ACTION_TERMS
+    | TEMPORAL_AFTER_TERMS
+    | TEMPORAL_BEFORE_TERMS
+    | CAUSAL_TERMS
+    | {"answer", "choice", "option", "question", "true", "false", "yes", "no"}
+)
+
+
+@dataclass
+class CognitiveQueryFrame:
+    actors: set[str] = field(default_factory=set)
+    places: set[str] = field(default_factory=set)
+    objects: set[str] = field(default_factory=set)
+    actions: set[str] = field(default_factory=set)
+    spoken_topics: set[str] = field(default_factory=set)
+    ocr_entities: set[str] = field(default_factory=set)
+    temporal_relation: str | None = None
+    requires_visual: bool = False
+    requires_speech: bool = False
+    requires_ocr: bool = False
+    requires_temporal_order: bool = False
+    causal: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "actors": sorted(self.actors),
+            "places": sorted(self.places),
+            "objects": sorted(self.objects),
+            "actions": sorted(self.actions),
+            "spoken_topics": sorted(self.spoken_topics),
+            "ocr_entities": sorted(self.ocr_entities),
+            "temporal_relation": self.temporal_relation,
+            "requires_visual": self.requires_visual,
+            "requires_speech": self.requires_speech,
+            "requires_ocr": self.requires_ocr,
+            "requires_temporal_order": self.requires_temporal_order,
+            "causal": self.causal,
+        }
 
 
 def build_question_spec(
@@ -163,7 +364,11 @@ def build_question_spec(
 ) -> QuestionSpec:
     del dialogue_context
     tokens = _tokenize(question)
-    preferred_modality = _infer_preferred_modality(question, task_type)
+    question_route = route_question(question, task_type)
+    preferred_modality = question_route.preferred_modality or _infer_preferred_modality(
+        question,
+        task_type,
+    )
     question_type = "generic"
     slots: list[EvidenceSlotSpec]
     answer_policy = "answer_only_if_required_slots_filled"
@@ -265,7 +470,11 @@ def build_question_spec(
         required_slots=slots,
         preferred_modality=preferred_modality,
         answer_policy=answer_policy,
-        metadata={"question": question, "task_type": task_type},
+        metadata={
+            "question": question,
+            "task_type": task_type,
+            "question_route": question_route.to_dict(),
+        },
     )
 
 
@@ -279,6 +488,79 @@ def infer_question_modality(question: str) -> Modality:
     if _has_route_signal(lowered, tokens, SPEECH_ROUTE_TERMS, SPEECH_ROUTE_PHRASES):
         return "speech"
     return "speech"
+
+
+def is_spatial_relation_question(question: str) -> bool:
+    lowered = question.lower()
+    tokens = _tokenize(question)
+    return bool(tokens & SPATIAL_RELATION_TERMS) or any(
+        phrase in lowered for phrase in SPATIAL_RELATION_PHRASES
+    )
+
+
+def requires_co_visible_relation(question: str) -> bool:
+    question_stem = _question_stem_without_options(question)
+    lowered = question_stem.lower()
+    tokens = _tokenize(question_stem)
+    return bool(tokens & CO_VISIBLE_RELATION_TERMS) or any(
+        phrase in lowered for phrase in CO_VISIBLE_RELATION_PHRASES
+    )
+
+
+def relation_evidence_status(item: Evidence) -> RelationEvidenceStatus:
+    co_visible = _metadata_bool(item.metadata.get("vrrqa_co_visible"))
+    if co_visible is False:
+        return "unsupported"
+
+    has_co_visible_frame = co_visible is True or _metadata_positive_count(
+        item.metadata.get("vrrqa_co_visible_frame_count")
+    )
+    co_visible_frame_indices = item.metadata.get("vrrqa_co_visible_frame_indices")
+    if isinstance(co_visible_frame_indices, list) and co_visible_frame_indices:
+        has_co_visible_frame = True
+
+    relation_supported = _metadata_bool(item.metadata.get("vrrqa_relation_supported"))
+    if relation_supported is True:
+        return "supported" if has_co_visible_frame else "unknown"
+    if relation_supported is False:
+        return "unsupported"
+
+    relation_text = " ".join(
+        str(part)
+        for part in (
+            item.metadata.get("vrrqa_visible_relation"),
+            item.metadata.get("vrrqa_spatial_relation"),
+            item.metadata.get("vrrqa_evidence"),
+            item.detail,
+            item.claim,
+        )
+        if part
+    )
+    lowered = relation_text.lower()
+    if any(phrase in lowered for phrase in RELATION_NEGATIVE_PHRASES):
+        return "unsupported"
+    if has_co_visible_frame and any(phrase in lowered for phrase in RELATION_POSITIVE_PHRASES):
+        return "supported"
+    return "unknown"
+
+
+def _metadata_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "supported"}:
+            return True
+        if normalized in {"false", "no", "0", "unsupported"}:
+            return False
+    return None
+
+
+def _metadata_positive_count(value: Any) -> bool:
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def build_evidence_board(question_spec: QuestionSpec) -> EvidenceBoard:
@@ -339,6 +621,11 @@ def search_v2(
     selected_modality = modality or _preferred_modality(question_spec, target_slot)
     selected_modality = _resolve_available_modality(selected_modality, state)
     search_modalities = _search_modalities(selected_modality, state.question)
+    query_frame = _build_cognitive_query_frame(
+        question=state.question,
+        queries=queries,
+        selected_modality=selected_modality,
+    )
 
     for query in queries:
         for current_modality in search_modalities:
@@ -348,15 +635,25 @@ def search_v2(
                 top_k=max(top_k * 2, 8),
             )
             for hit in hits:
+                adjusted_score, cognitive_breakdown = _adjust_search_score(
+                    hit,
+                    state,
+                    target_slot,
+                    query_frame=query_frame,
+                    index=index,
+                )
                 candidate = SearchHit(
                     node_id=hit.node_id,
                     time_span=hit.time_span,
                     level=hit.level,
-                    score=_adjust_search_score(hit, state, target_slot),
-                    reason=hit.reason,
+                    score=adjusted_score,
+                    reason=_append_cognitive_reason(hit.reason, cognitive_breakdown),
                     modality=hit.modality,
                     matched_terms=hit.matched_terms,
-                    score_breakdown=dict(hit.score_breakdown),
+                    score_breakdown={
+                        **dict(hit.score_breakdown),
+                        **cognitive_breakdown,
+                    },
                 )
                 current = hits_by_node.get(candidate.node_id)
                 if current is None or candidate.score > current.score:
@@ -383,6 +680,7 @@ def search_v2(
         "searched_modalities": search_modalities,
         "hit_count": len(frontier),
         "query_sources": dict(query_sources),
+        "cognitive_query_frame": query_frame.to_dict(),
     }
 
 
@@ -433,6 +731,21 @@ def _temporally_redundant_index(
 
 
 def _prefer_more_specific_hit(candidate: SearchHit, current: SearchHit) -> bool:
+    candidate_situation = float(candidate.score_breakdown.get("cognitive_situation") or 0.0)
+    current_situation = float(current.score_breakdown.get("cognitive_situation") or 0.0)
+    if (
+        current.level == "event"
+        and current_situation > 0.0
+        and candidate.level == "clip"
+        and candidate.score <= current.score
+    ):
+        return False
+    if (
+        candidate.level == "event"
+        and candidate_situation > 0.0
+        and candidate.score >= (current.score * 0.9)
+    ):
+        return True
     candidate_rank = _window_level_rank(candidate.level)
     current_rank = _window_level_rank(current.level)
     return candidate_rank < current_rank and candidate.score >= (current.score * 0.85)
@@ -441,9 +754,10 @@ def _prefer_more_specific_hit(candidate: SearchHit, current: SearchHit) -> bool:
 def _window_level_rank(level: str) -> int:
     return {
         "clip": 0,
-        "segment": 1,
-        "scene": 2,
-        "video": 3,
+        "event": 1,
+        "segment": 2,
+        "scene": 3,
+        "video": 4,
     }.get(level, 4)
 
 
@@ -454,6 +768,7 @@ def open_v2(
     node_id: str,
     modality: Modality,
     evidence_items: list[Evidence],
+    evidence_classifier: Callable[..., dict[str, Any] | None] | None = None,
 ) -> tuple[list[Evidence], dict[str, Any]]:
     if question_spec is None:
         return evidence_items, {
@@ -472,10 +787,93 @@ def open_v2(
     duplicate_count = 0
     filled_slots: set[str] = set()
     background_only = True
+    requires_relation_evidence = (
+        modality == "visual"
+        and state.task_type == "multiple_choice_visual_qa"
+        and requires_co_visible_relation(state.question)
+    )
+    question_route = route_from_metadata(question_spec.metadata) or route_question(
+        state.question,
+        state.task_type,
+    )
 
     for item in evidence_items:
         slot_name, slot_score = _best_slot_match(item, question_spec, target_slot)
         role = _classify_slot_role(slot_name, slot_score, item, question_spec, target_slot)
+        heuristic_slot_name = slot_name
+        heuristic_slot_score = slot_score
+        heuristic_role = role
+        classifier_metadata: dict[str, Any] = {}
+        if evidence_classifier is not None:
+            classification = evidence_classifier(
+                item=item,
+                question_spec=question_spec,
+                target_slot=target_slot,
+                state=state,
+                heuristic_slot=heuristic_slot_name,
+                heuristic_role=heuristic_role,
+                heuristic_score=heuristic_slot_score,
+            )
+            if classification is not None:
+                slot_name = classification["slot"]
+                role = classification["role"]
+                classifier_metadata = {
+                    "classifier_backend": "controller",
+                    "classifier_confidence": classification.get("confidence", 0.0),
+                    "classifier_reason": classification.get("reason", ""),
+                    "classifier_answer_span": classification.get("answer_span", ""),
+                    "heuristic_slot": heuristic_slot_name,
+                    "heuristic_role": heuristic_role,
+                    "heuristic_slot_score": heuristic_slot_score,
+                }
+                answer_span = str(classification.get("answer_span") or "").strip()
+                if answer_span:
+                    item.metadata["answer_span"] = answer_span
+                    item.metadata["ocr_exact_answer_candidate"] = True
+        if (
+            role != "core"
+            and item.modality == "ocr"
+            and item.metadata.get("ocr_exact_answer_candidate")
+            and slot_name == target_slot
+        ):
+            role = "core"
+            classifier_metadata["ocr_core_promoted_reason"] = "exact_answer_candidate"
+        if (
+            role == "core"
+            and item.modality == "ocr"
+            and item.metadata.get("ocr_requires_exact_answer_span")
+            and (
+                not str(item.metadata.get("answer_span") or "").strip()
+                or not item.metadata.get("ocr_exact_answer_candidate")
+            )
+        ):
+            role = "support"
+            classifier_metadata["ocr_core_downgraded_reason"] = "missing_exact_answer_span"
+        if role == "core" and _ocr_code_evidence_blocked_for_screen_text_question(
+            state.question,
+            item,
+        ):
+            role = "support"
+            classifier_metadata["ocr_core_downgraded_reason"] = (
+                "code_evidence_not_allowed_for_screen_text_question"
+            )
+        if role == "core" and _ocr_comparison_assignment_blocked_for_operator_count_question(
+            state.question,
+            item,
+        ):
+            role = "support"
+            classifier_metadata["ocr_core_downgraded_reason"] = (
+                "comparison_assignment_not_operator_count"
+            )
+        if (
+            role == "core"
+            and question_route.label != "generic"
+            and not evidence_matches_route(item, question_route)
+        ):
+            role = "support"
+            classifier_metadata["route_core_downgraded_reason"] = (
+                "evidence_kind_not_compatible_with_question_route"
+            )
         claim_hash = _claim_hash(item.claim)
         if _is_duplicate_evidence(state, item, slot_name, claim_hash):
             duplicate_count += 1
@@ -484,6 +882,16 @@ def open_v2(
         answers_question = role == "core"
         relevance = min(1.0, 0.35 + slot_score)
         novelty = _estimate_novelty(state, node_id, modality, target_slot)
+        relation_status = relation_evidence_status(item) if requires_relation_evidence else None
+        relation_rejection_reason: str | None = None
+        if requires_relation_evidence and role == "core" and relation_status != "supported":
+            answers_question = False
+            relation_rejection_reason = (
+                "missing_co_visible_relation"
+                if relation_status == "unknown"
+                else "unsupported_co_visible_relation"
+            )
+            role = "support" if relation_status == "unknown" else "background"
         item.metadata.update(
             {
                 "slot": slot_name,
@@ -493,8 +901,15 @@ def open_v2(
                 "novelty": round(novelty, 4),
                 "target_slot": target_slot,
                 "claim_hash": claim_hash,
+                "question_route": question_route.label,
+                **classifier_metadata,
             }
         )
+        if relation_status is not None:
+            item.metadata["relation_evidence_status"] = relation_status
+        if relation_rejection_reason is not None:
+            item.metadata["relation_evidence_rejected"] = True
+            item.metadata["relation_evidence_rejection_reason"] = relation_rejection_reason
         if role != "noise":
             classified.append(item)
         if role == "core":
@@ -545,15 +960,23 @@ def update_evidence_board(
     target_slot = metadata.get("target_slot")
     modality = metadata.get("modality")
     if observation.kind == "open" and observation.node_id and modality:
-        board.opened_targets.append(
-            OpenedTarget(
-                node_id=observation.node_id,
+        add_opened_target(
+            board,
+            node_id=observation.node_id,
+            modality=modality,
+            target_slot=target_slot,
+            result=metadata.get("result", "unknown"),
+            step_index=step_index,
+        )
+        for node_id in graph_expansion_covered_node_ids(observation):
+            add_opened_target(
+                board,
+                node_id=node_id,
                 modality=modality,
                 target_slot=target_slot,
-                result=metadata.get("result", "unknown"),
+                result="graph_expansion_covered",
                 step_index=step_index,
             )
-        )
     if target_slot:
         hinted_queries = [query for query in metadata.get("suggested_queries", []) if query]
         if hinted_queries:
@@ -682,7 +1105,51 @@ def is_reopen_blocked(
     return False
 
 
-def _adjust_search_score(hit: SearchHit, state: ControllerState, target_slot: str | None) -> float:
+def add_opened_target(
+    board: EvidenceBoard,
+    *,
+    node_id: str,
+    modality: Modality,
+    target_slot: str | None,
+    result: str,
+    step_index: int,
+) -> None:
+    if is_reopen_blocked(board, node_id, modality, target_slot):
+        return
+    board.opened_targets.append(
+        OpenedTarget(
+            node_id=node_id,
+            modality=modality,
+            target_slot=target_slot,
+            result=result,
+            step_index=step_index,
+        )
+    )
+
+
+def graph_expansion_covered_node_ids(observation: Observation) -> list[str]:
+    covered: list[str] = []
+    for item in observation.evidence:
+        metadata = item.metadata
+        if not metadata.get("vrrqa_graph_expansion_applied"):
+            continue
+        node_ids = metadata.get("vrrqa_graph_expansion_node_ids", [])
+        if not isinstance(node_ids, list):
+            continue
+        for node_id in node_ids:
+            if isinstance(node_id, str) and node_id and node_id not in covered:
+                covered.append(node_id)
+    return covered
+
+
+def _adjust_search_score(
+    hit: SearchHit,
+    state: ControllerState,
+    target_slot: str | None,
+    *,
+    query_frame: CognitiveQueryFrame,
+    index: VideoMemoryIndex,
+) -> tuple[float, dict[str, float]]:
     score = hit.score
     if state.evidence_board and is_reopen_blocked(
         state.evidence_board,
@@ -701,7 +1168,254 @@ def _adjust_search_score(hit: SearchHit, state: ControllerState, target_slot: st
         slot_tokens = _tokenize(target_slot.replace("_", " "))
         overlap_bonus = len(slot_tokens & set(hit.matched_terms)) * 0.08
         score += overlap_bonus
-    return round(score, 4)
+    node = index.memory.get_node(hit.node_id)
+    situation_score = _situation_model_score(node.metadata.get("event_schema"), query_frame)
+    boundary_score = _event_boundary_anchor_score(node.metadata)
+    memorability_score = min(1.0, float(node.metadata.get("memorability_prior") or 0.0))
+    temporal_score = _cognitive_temporal_relation_score(node.metadata, query_frame)
+    graph_score = _cognitive_graph_neighbor_score(node.metadata, query_frame)
+    weighted_cognitive_score = _weighted_cognitive_stage1_score(
+        hit=hit,
+        situation_score=situation_score,
+        temporal_score=temporal_score,
+        boundary_score=boundary_score,
+        memorability_score=memorability_score,
+        graph_score=graph_score,
+    )
+    cognitive_bonus = (
+        (0.15 * situation_score)
+        + (0.10 * temporal_score)
+        + (0.05 * boundary_score)
+        + (0.05 * memorability_score)
+        + (0.05 * graph_score)
+    )
+    score = max(score + cognitive_bonus, weighted_cognitive_score)
+    return round(score, 4), {
+        "cognitive_situation": round(situation_score, 4),
+        "cognitive_temporal": round(temporal_score, 4),
+        "cognitive_boundary": round(boundary_score, 4),
+        "cognitive_memorability": round(memorability_score, 4),
+        "cognitive_graph": round(graph_score, 4),
+        "cognitive_bonus": round(cognitive_bonus, 4),
+        "cognitive_weighted_stage1": round(weighted_cognitive_score, 4),
+    }
+
+
+def _append_cognitive_reason(reason: str, breakdown: dict[str, float]) -> str:
+    bonus = breakdown.get("cognitive_bonus", 0.0)
+    if bonus <= 0:
+        return reason
+    strongest = [
+        name.removeprefix("cognitive_")
+        for name, value in sorted(
+            breakdown.items(),
+            key=lambda item: -item[1],
+        )
+        if name != "cognitive_bonus" and value > 0
+    ][:3]
+    suffix = f"cognitive_bonus={bonus:.3f}"
+    if strongest:
+        suffix += f" via {', '.join(strongest)}"
+    return f"{reason}; {suffix}"
+
+
+def _build_cognitive_query_frame(
+    *,
+    question: str,
+    queries: list[str],
+    selected_modality: Modality,
+) -> CognitiveQueryFrame:
+    text = " ".join([question, *queries])
+    lowered = text.lower()
+    tokens = _tokenize(text)
+    actions = {
+        token
+        for token in tokens
+        if token in ACTION_TERMS or token.endswith("ing") or token.endswith("ed")
+    }
+    actors = tokens & ACTOR_TERMS
+    places = tokens & PLACE_TERMS
+    objects = {
+        token
+        for token in tokens
+        if token not in COGNITIVE_QUERY_EXCLUDE_TERMS
+        and token not in actions
+        and len(token) > 2
+    }
+    temporal_relation = None
+    if tokens & TEMPORAL_AFTER_TERMS:
+        temporal_relation = "after"
+    elif tokens & TEMPORAL_BEFORE_TERMS:
+        temporal_relation = "before"
+    elif {"first", "beginning", "earliest", "initial"} & tokens:
+        temporal_relation = "first"
+    elif {"last", "final", "ending", "end"} & tokens:
+        temporal_relation = "last"
+    requires_visual = selected_modality in {"visual", "cross_modal", "ocr"} or _has_route_signal(
+        lowered,
+        tokens,
+        VISUAL_ROUTE_TERMS,
+        VISUAL_ROUTE_PHRASES,
+    )
+    requires_speech = selected_modality in {"speech", "cross_modal"} or _has_route_signal(
+        lowered,
+        tokens,
+        SPEECH_ROUTE_TERMS,
+        SPEECH_ROUTE_PHRASES,
+    )
+    requires_ocr = selected_modality in {"ocr", "cross_modal"} or _has_route_signal(
+        lowered,
+        tokens,
+        VISUAL_ROUTE_TERMS,
+        {"what is written", "what's written", "read visible text"},
+    )
+    causal = bool(tokens & CAUSAL_TERMS)
+    return CognitiveQueryFrame(
+        actors=actors,
+        places=places,
+        objects=objects,
+        actions=actions,
+        spoken_topics=objects if requires_speech else set(),
+        ocr_entities=objects if requires_ocr else set(),
+        temporal_relation=temporal_relation,
+        requires_visual=requires_visual,
+        requires_speech=requires_speech,
+        requires_ocr=requires_ocr,
+        requires_temporal_order=temporal_relation is not None,
+        causal=causal,
+    )
+
+
+def _situation_model_score(schema: Any, query_frame: CognitiveQueryFrame) -> float:
+    if not isinstance(schema, dict):
+        return 0.0
+    component_scores = [
+        _set_match_score(query_frame.actors, _schema_tokens(schema, "actors")),
+        _set_match_score(query_frame.places, _schema_tokens(schema, "place")),
+        _set_match_score(query_frame.objects, _schema_tokens(schema, "objects")),
+        _set_match_score(query_frame.actions, _schema_tokens(schema, "actions")),
+        _set_match_score(query_frame.spoken_topics, _schema_tokens(schema, "spoken_topics")),
+        _set_match_score(query_frame.ocr_entities, _schema_tokens(schema, "ocr_entities")),
+    ]
+    positive_scores = [score for score in component_scores if score > 0]
+    if not positive_scores:
+        return 0.0
+    return round(sum(positive_scores) / len(positive_scores), 4)
+
+
+def _schema_tokens(schema: dict[str, Any], key: str) -> set[str]:
+    value = schema.get(key)
+    texts: list[str] = []
+    if isinstance(value, list):
+        texts.extend(str(item) for item in value)
+    elif isinstance(value, str):
+        texts.append(value)
+    return _tokenize(" ".join(texts))
+
+
+def _set_match_score(query_terms: set[str], node_terms: set[str]) -> float:
+    if not query_terms or not node_terms:
+        return 0.0
+    return min(1.0, len(query_terms & node_terms) / max(len(query_terms), 1))
+
+
+def _event_boundary_anchor_score(metadata: dict[str, Any]) -> float:
+    boundary_scores = [
+        float(item.get("score") or 0.0)
+        for item in metadata.get("event_boundary_scores", [])
+        if isinstance(item, dict)
+    ]
+    anchor_scores = [
+        float(item.get("event_boundary_score") or item.get("score") or 0.0)
+        for item in metadata.get("cognitive_anchor_frames", [])
+        if isinstance(item, dict)
+    ]
+    peaks = metadata.get("event_boundary_peak_timestamps", [])
+    peak_bonus = 0.2 if isinstance(peaks, list) and peaks else 0.0
+    return round(min(1.0, max([0.0, *boundary_scores, *anchor_scores]) + peak_bonus), 4)
+
+
+def _weighted_cognitive_stage1_score(
+    *,
+    hit: SearchHit,
+    situation_score: float,
+    temporal_score: float,
+    boundary_score: float,
+    memorability_score: float,
+    graph_score: float,
+) -> float:
+    breakdown = hit.score_breakdown
+    lexical_audio_ocr_score = _normalized_score(
+        max(
+            float(breakdown.get("lexical", 0.0) or 0.0),
+            float(breakdown.get("temporal", 0.0) or 0.0),
+            float(breakdown.get("combined", 0.0) or 0.0),
+            hit.score,
+        )
+    )
+    siglip_image_text_score = _normalized_score(
+        max(
+            float(breakdown.get("semantic", 0.0) or 0.0),
+            float(breakdown.get("frame_similarity", 0.0) or 0.0),
+            float(breakdown.get("semantic_frame_similarity", 0.0) or 0.0),
+        )
+    )
+    return round(
+        (0.35 * lexical_audio_ocr_score)
+        + (0.25 * siglip_image_text_score)
+        + (0.15 * situation_score)
+        + (0.10 * temporal_score)
+        + (0.05 * boundary_score)
+        + (0.05 * memorability_score)
+        + (0.05 * graph_score),
+        4,
+    )
+
+
+def _normalized_score(value: float) -> float:
+    if value <= 0.0:
+        return 0.0
+    if value <= 1.0:
+        return value
+    return 1.0 - (1.0 / (1.0 + value))
+
+
+def _cognitive_temporal_relation_score(
+    metadata: dict[str, Any],
+    query_frame: CognitiveQueryFrame,
+) -> float:
+    if not query_frame.requires_temporal_order:
+        return 0.0
+    if query_frame.temporal_relation == "after":
+        return 1.0 if metadata.get("previous_cognitive_event_id") else 0.35
+    if query_frame.temporal_relation == "before":
+        return 1.0 if metadata.get("next_cognitive_event_id") else 0.35
+    if query_frame.temporal_relation in {"first", "last"}:
+        return 0.4 if metadata.get("cognitive_event") else 0.0
+    return 0.0
+
+
+def _cognitive_graph_neighbor_score(
+    metadata: dict[str, Any],
+    query_frame: CognitiveQueryFrame,
+) -> float:
+    if not (query_frame.requires_temporal_order or query_frame.causal):
+        return 0.0
+    neighbor_keys = (
+        "cognitive_event_neighbor_ids",
+        "same_actor_event_ids",
+        "same_object_event_ids",
+        "same_place_event_ids",
+        "same_topic_event_ids",
+        "cause_effect_event_ids",
+        "caused_by_event_ids",
+        "goal_continuation_event_ids",
+        "goal_predecessor_event_ids",
+    )
+    neighbor_count = sum(
+        len(metadata.get(key, [])) for key in neighbor_keys if isinstance(metadata.get(key), list)
+    )
+    return round(min(1.0, neighbor_count / 4.0), 4)
 
 
 def _preferred_modality(question_spec: QuestionSpec | None, target_slot: str | None) -> Modality:
@@ -912,6 +1626,90 @@ def _classify_slot_role(
     return "background"
 
 
+OCR_CODE_EVIDENCE_KINDS = {
+    "assignment_count",
+    "assignment_count_partial",
+    "code_line",
+    "comparison_assignments",
+    "comparison_operator_count",
+    "computed_expression_value",
+    "computed_output_value",
+    "computed_variable_value",
+    "target_assignment",
+}
+
+
+def _ocr_code_evidence_blocked_for_screen_text_question(
+    question: str,
+    item: Evidence,
+) -> bool:
+    if item.modality != "ocr":
+        return False
+    if not _is_header_sign_title_question(question):
+        return False
+    if _question_explicitly_asks_for_code(question):
+        return False
+    kind = str(item.metadata.get("ocr_evidence_kind") or "")
+    if kind in OCR_CODE_EVIDENCE_KINDS:
+        return True
+    evidence_text = " ".join(part for part in (item.claim, item.detail) if part)
+    return bool(
+        re.search(
+            r"\b[A-Za-z_]\w*\s*=\s*[^=\n]+(?:==|!=|>=|<=|>|<|\+|\-|\*|/)?",
+            evidence_text,
+        )
+    )
+
+
+def _is_header_sign_title_question(question: str) -> bool:
+    lowered = question.lower()
+    return any(
+        cue in lowered
+        for cue in (
+            "header",
+            "label",
+            "sign",
+            "title",
+            "what is written",
+            "what's written",
+            "what text",
+            "what does the door",
+            "what does the sign",
+            "laboratory door",
+        )
+    )
+
+
+def _question_explicitly_asks_for_code(question: str) -> bool:
+    lowered = question.lower()
+    explicit_code_cues = (
+        "assignment",
+        "boolean",
+        "calculate",
+        "code line",
+        "data type",
+        "expression",
+        "operator",
+        "output",
+        "python script",
+        "result",
+        "script",
+        "shell",
+        "variable",
+    )
+    return any(cue in lowered for cue in explicit_code_cues)
+
+
+def _ocr_comparison_assignment_blocked_for_operator_count_question(
+    question: str,
+    item: Evidence,
+) -> bool:
+    lowered = question.lower()
+    if not ("how many" in lowered and "comparison" in lowered and "operator" in lowered):
+        return False
+    return str(item.metadata.get("ocr_evidence_kind") or "") == "comparison_assignments"
+
+
 def _is_duplicate_evidence(
     state: ControllerState,
     item: Evidence,
@@ -970,6 +1768,17 @@ def _tokenize(text: str) -> set[str]:
         for token in (match.group(0).lower() for match in TOKEN_PATTERN.finditer(text))
         if (token not in STOPWORDS or token in CONTROL_QUERY_TOKENS) and len(token) > 1
     }
+
+
+def _question_stem_without_options(question: str) -> str:
+    split_markers = ("options:", "choices:", "\noption a", "\na.", "\na)", "\na:")
+    lowered = question.lower()
+    split_at = len(question)
+    for marker in split_markers:
+        marker_index = lowered.find(marker)
+        if marker_index >= 0:
+            split_at = min(split_at, marker_index)
+    return question[:split_at].strip() or question
 
 
 def _search_queries_for_state(
@@ -1042,9 +1851,67 @@ def _reason_description(question: str) -> str:
 
 
 def _infer_preferred_modality(question: str, task_type: str | None) -> Modality:
+    question_route = route_question(question, task_type)
+    if question_route.preferred_modality is not None:
+        return question_route.preferred_modality
     lowered = question.lower()
     if task_type in {"multiple_choice_visual_qa", "vrrqa", "vrrqa_visual_only"}:
         return "visual"
+    audio_cues = (
+        "audio event",
+        "environment sound",
+        "mechanical sound",
+        "sound",
+        "ticking",
+        "noise",
+    )
+    if task_type == "agentic_task" and any(cue in lowered for cue in audio_cues):
+        return "audio"
+    speech_cues = (
+        "presenter say",
+        "presenter says",
+        "presenter said",
+        "presenter explain",
+        "presenter explains",
+        "speaker say",
+        "speaker says",
+        "speaker said",
+        "transcribe",
+        "translate",
+        "spoken",
+        "speech",
+    )
+    if task_type == "agentic_task" and any(cue in lowered for cue in speech_cues):
+        return "speech"
+    screen_text_cues = (
+        "arithmetic",
+        "assignment",
+        "boolean",
+        "code",
+        "code editor",
+        "comparison",
+        "declared",
+        "declaration",
+        "displayed",
+        "editor",
+        "expression",
+        "header",
+        "label",
+        "operator",
+        "output",
+        "python script",
+        "result",
+        "screen",
+        "script",
+        "shown",
+        "sign",
+        "shell",
+        "type",
+        "variable",
+        "visible",
+    )
+    if task_type == "agentic_task" and any(cue in lowered for cue in screen_text_cues):
+        return "ocr"
     visual_cues = (
         "stare",
         "doorway",

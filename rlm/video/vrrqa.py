@@ -15,6 +15,11 @@ from rlm.video.controller import VideoRLM
 from rlm.video.longshot import VIDEO_EXTENSIONS
 from rlm.video.media import extract_video_segment, probe_media_duration
 from rlm.video.memory import VideoMemoryBuilder
+from rlm.video.prompt_plugins import (
+    BenchmarkPromptPlugin,
+    prompt_plugin_context,
+    render_prompt_plugin_section,
+)
 from rlm.video.types import TimeSpan, VideoMemory
 
 VRRQA_DATASET_PATH = "ucf-crcv/ImplicitQA"
@@ -219,6 +224,7 @@ class VRRQABenchmarkRunner:
         skip_unavailable_videos: bool = False,
         single_window_memory: bool = True,
         force_choice_finalizer: bool = True,
+        prompt_plugin: BenchmarkPromptPlugin | None = None,
     ):
         self.video_rlm = video_rlm
         self.memory_builder = memory_builder
@@ -233,6 +239,7 @@ class VRRQABenchmarkRunner:
         self.skip_unavailable_videos = skip_unavailable_videos
         self.single_window_memory = single_window_memory
         self.force_choice_finalizer = force_choice_finalizer
+        self.prompt_plugin = prompt_plugin
         self._memory_cache: dict[str, VideoMemory] = {}
 
         for directory in (
@@ -373,6 +380,7 @@ class VRRQABenchmarkRunner:
             memory,
             task_type="multiple_choice_visual_qa",
             progress_callback=progress_callback,
+            **self._prompt_plugin_run_kwargs(sample),
         )
         options = non_null_options(sample)
         predicted_choice = parse_choice_prediction(result.answer, options)
@@ -420,7 +428,12 @@ class VRRQABenchmarkRunner:
         controller_client = getattr(self.video_rlm, "controller_client", None)
         if controller_client is None:
             raise ValueError("VRR-QA forced-choice finalizer requires video_rlm.controller_client")
-        prompt = build_vrrqa_forced_choice_prompt(sample, options, result)
+        prompt = build_vrrqa_forced_choice_prompt(
+            sample,
+            options,
+            result,
+            prompt_plugin=self._prompt_plugin_payload(sample),
+        )
         finalizer_prediction = controller_client.completion(prompt).strip()
         predicted_choice = parse_choice_prediction(finalizer_prediction, options)
         fallback_choice = False
@@ -433,6 +446,19 @@ class VRRQABenchmarkRunner:
             "forced_choice_used": True,
             "forced_choice_fallback": fallback_choice,
         }
+
+    def _prompt_plugin_run_kwargs(self, sample: dict[str, Any]) -> dict[str, Any]:
+        context = prompt_plugin_context(self.prompt_plugin, sample)
+        if context is None:
+            return {}
+        return {"global_context_overrides": context}
+
+    def _prompt_plugin_payload(self, sample: dict[str, Any]) -> dict[str, Any] | None:
+        context = prompt_plugin_context(self.prompt_plugin, sample)
+        if context is None:
+            return None
+        payload = context.get("benchmark_prompt_plugin")
+        return payload if isinstance(payload, dict) else None
 
     def _load_or_build_memory(
         self,
@@ -870,21 +896,29 @@ def build_vrrqa_forced_choice_prompt(
     sample: dict[str, Any],
     options: dict[str, str],
     result,
+    prompt_plugin: dict[str, Any] | None = None,
 ) -> str:
     option_lines = [f"{letter}. {text}" for letter, text in options.items()]
     evidence_lines = _vrrqa_evidence_lines(result)
     trace_lines = _vrrqa_trace_lines(result)
+    plugin_section = render_prompt_plugin_section(prompt_plugin)
     sections = [
         "You are a strict multiple-choice evaluator for VRR-QA.",
         "Choose the best option from the listed choices using the available evidence.",
         "Return only one option letter. Do not explain.",
-        "",
-        f"Question: {sample['question_text']}",
-        "Options:",
-        *option_lines,
-        "",
-        f"Initial VideoRLM answer: {result.answer}",
     ]
+    if plugin_section:
+        sections.extend(["", plugin_section])
+    sections.extend(
+        [
+            "",
+            f"Question: {sample['question_text']}",
+            "Options:",
+            *option_lines,
+            "",
+            f"Initial VideoRLM answer: {result.answer}",
+        ]
+    )
     if evidence_lines:
         sections.extend(["", "Collected evidence:", *evidence_lines])
     if trace_lines:

@@ -190,6 +190,41 @@ def probe_media_duration(media_path: str | Path, ffprobe_bin: str = "ffprobe") -
     return float(duration_text)
 
 
+def _probe_video_stream_duration(media_path: str | Path, ffprobe_bin: str = "ffprobe") -> float | None:
+    _require_executable(ffprobe_bin)
+    media = Path(media_path)
+    command = [
+        ffprobe_bin,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(media),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    duration_text = result.stdout.strip()
+    if not duration_text:
+        return None
+    first_value = duration_text.splitlines()[0].strip()
+    if not first_value or first_value == "N/A":
+        return None
+    duration = float(first_value)
+    if duration <= 0:
+        return None
+    return duration
+
+
+def _probe_frame_extraction_duration(media_path: str | Path, ffprobe_bin: str) -> float:
+    stream_duration = _probe_video_stream_duration(media_path, ffprobe_bin=ffprobe_bin)
+    if stream_duration is not None:
+        return stream_duration
+    return probe_media_duration(media_path, ffprobe_bin=ffprobe_bin)
+
+
 def extract_frame(
     media_path: str | Path,
     timestamp_seconds: float,
@@ -242,7 +277,7 @@ def _extract_frame_command(
         command.extend(["-ss", f"{timestamp_seconds:.3f}"])
     command.extend(["-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1"])
     if width is not None:
-        command.extend(["-vf", f"scale={width}:-1"])
+        command.extend(["-vf", f"scale={width}:-2"])
     command.extend(["-update", "1", "-q:v", "2", str(output)])
     return command
 
@@ -360,7 +395,7 @@ def _clamp_timestamps_for_media_duration(
     if not timestamps:
         return []
     try:
-        duration = probe_media_duration(media_path, ffprobe_bin=ffprobe_bin)
+        duration = _probe_frame_extraction_duration(media_path, ffprobe_bin=ffprobe_bin)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
         return list(timestamps)
     if duration <= 0:
@@ -409,7 +444,7 @@ def _extract_frames_for_timestamps_sequence(
     fps = 1.0 / step
     filters = [f"fps=fps={fps:.8f}"]
     if width is not None:
-        filters.append(f"scale={width}:-1")
+        filters.append(f"scale={width}:-2")
     command = [
         ffmpeg_bin,
         "-hide_banner",
@@ -533,7 +568,7 @@ def _run_frame_extraction_batch(
         relative_timestamp = max(0.0, timestamp - seek_start)
         command.extend(["-map", "0:v:0", "-ss", f"{relative_timestamp:.3f}"])
         if width is not None:
-            command.extend(["-vf", f"scale={width}:-1"])
+            command.extend(["-vf", f"scale={width}:-2"])
         command.extend(["-frames:v", "1", "-update", "1", str(output_path)])
 
     subprocess.run(command, check=True, capture_output=True)
@@ -579,7 +614,7 @@ def detect_scene_boundary_timestamps(
     if sample_rate is not None:
         filters.append(f"fps=fps={sample_rate:.6f}")
     if width is not None:
-        filters.append(f"scale={width}:-1")
+        filters.append(f"scale={width}:-2")
     filters.append(f"select=gt(scene\\,{threshold:.3f})")
     filters.append("showinfo")
     command.extend(["-vf", ",".join(filters), "-f", "null", "-"])

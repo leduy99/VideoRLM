@@ -34,11 +34,52 @@ TASK_CATEGORIES = {
         "cross_modal_verification",
         "audio_visual_alignment",
     ],
+    "Agentic Tasks": [],
 }
 
 TASK_REMAP = {"motion_analysis": "compositional_reasoning"}
+AGENTIC_TASK_KEYWORDS = (
+    "agent",
+    "api",
+    "browser",
+    "computer",
+    "gui",
+    "navigation",
+    "planning",
+    "search",
+    "tool",
+)
+OTHER_TASK_CATEGORY = "Other Tasks"
 
 _BOOLEAN_PATTERN = re.compile(r'"criteria_met"\s*:\s*(true|false)', re.IGNORECASE)
+ANSWER_ONLY_CRITERION_DESCRIPTION = (
+    "The model's final answer is semantically correct for the user question when compared "
+    "with the ground truth answer."
+)
+OFFICIAL_LONGSHOT_JUDGE_PROMPT_TEMPLATE = """You are an expert evaluator specializing in video content analysis and multimodal understanding.
+
+Your task is to evaluate the Model Response against the **single evaluation criterion** provided, using the Ground Truth Response as a reference.
+
+Ground Truth Response:
+
+{ground_truth_response}
+
+Model Response:
+
+{model_response}
+
+Evaluation Criterion:
+
+{criterion_description}
+
+Instructions:
+
+- Evaluate ONLY the provided criterion in this assessment.
+- Compare the Model Response to the Ground Truth Response and determine if the criterion is satisfied.
+
+- If the Model Response satisfies the criterion, set "criteria_met" to true; otherwise, set it to false.
+
+- Focus on video content understanding, temporal relationships, and multimodal analysis. /no_think"""
 
 
 @dataclass
@@ -80,28 +121,48 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
 
 def build_official_criterion_prompt(
     *,
+    user_question: str | None = None,
     ground_truth_response: str,
     model_response: str,
     criterion_description: str,
 ) -> str:
-    return f"""You are an expert evaluator specializing in video content analysis and multimodal understanding.
+    del user_question
+    return OFFICIAL_LONGSHOT_JUDGE_PROMPT_TEMPLATE.format(
+        ground_truth_response=ground_truth_response,
+        model_response=model_response,
+        criterion_description=criterion_description,
+    )
 
-Your task is to evaluate the Model Response against the **single evaluation criterion** provided, using the Ground Truth Response as a reference.
 
-Ground Truth Response:
+def build_answer_only_prompt(
+    *,
+    user_question: str | None = None,
+    ground_truth_response: str,
+    model_response: str,
+) -> str:
+    question_block = f"\nUser Question:\n{user_question}\n" if user_question else ""
+    return f"""You are an expert evaluator specializing in video question answering.
+
+Judge only whether the Model Final Answer is semantically correct.
+Use the Ground Truth Answer as the reference and the User Question to resolve ambiguity.
+{question_block}
+
+Ground Truth Answer:
 {ground_truth_response}
 
-Model Response:
+Model Final Answer:
 {model_response}
 
-Evaluation Criterion:
-{criterion_description}
-
 Instructions:
-- Evaluate ONLY the provided criterion in this assessment.
-- Compare the Model Response to the Ground Truth Response and determine if the criterion is satisfied.
-- If the Model Response satisfies the criterion, set "criteria_met" to true; otherwise, set it to false.
-- Focus on video content understanding, temporal relationships, and multimodal analysis. /no_think
+- Evaluate only final-answer correctness.
+- Ignore whether the model used the right tool, followed a tool-call format, cited
+  evidence, or satisfied process-specific criteria.
+- Accept concise answers when they directly satisfy the user question, including
+  equivalent numeric values, boolean values, symbols, code expressions, and short
+  answer spans contained in or implied by the ground-truth answer.
+- Accept paraphrases and answers with harmless extra wording.
+- Mark false if the final answer contradicts, omits, or materially weakens the
+  ground-truth answer. /no_think
 
 Return strict JSON exactly like {{"criteria_met": true}} or {{"criteria_met": false}}."""
 
@@ -160,6 +221,23 @@ def build_local_judge(
     )
 
 
+def judge_boolean_prompt(
+    *,
+    judge_client: BaseLM,
+    prompt: str,
+) -> tuple[bool | None, str | None, str]:
+    completion = ""
+    last_error: Exception | None = None
+    for _attempt in range(3):
+        try:
+            completion = judge_client.completion(prompt)
+            return parse_criteria_met(completion), None, completion
+        except Exception as exc:
+            last_error = exc
+    assert last_error is not None
+    return None, str(last_error), completion[:1000]
+
+
 def evaluate_predictions_official_style(
     config: LongShOTOfficialEvalConfig,
     *,
@@ -180,13 +258,26 @@ def evaluate_predictions_official_style(
 
     completed_ids = set()
     if config.eval_path.exists():
-        completed_ids = {row.get("sample_id") for row in load_jsonl(config.eval_path)}
+        existing_rows = load_jsonl(config.eval_path)
+        incompatible_ids = [
+            row.get("sample_id")
+            for row in existing_rows
+            if row.get("evaluation_mode") == "answer_only"
+        ]
+        if incompatible_ids:
+            raise ValueError(
+                "Existing eval JSONL is answer-only. Use a different --eval-output "
+                f"or remove the old file first: {config.eval_path}"
+            )
+        completed_ids = {row.get("sample_id") for row in existing_rows}
 
     evaluated_samples = 0
     evaluated_turns = 0
     evaluated_criteria = 0
 
-    remaining_samples = [sample for sample in predictions if sample.get("sample_id") not in completed_ids]
+    remaining_samples = [
+        sample for sample in predictions if sample.get("sample_id") not in completed_ids
+    ]
 
     for index, sample in enumerate(remaining_samples, start=1):
         sample_id = sample.get("sample_id")
@@ -194,30 +285,30 @@ def evaluate_predictions_official_style(
             f"[official-eval] {index}/{len(remaining_samples)} "
             f"sample_id={sample_id} task={sample.get('task')}"
         )
+        sample["evaluation_mode"] = "official_criteria"
 
+        current_user_question = ""
         for turn in sample.get("conversations", []):
+            if turn.get("role") == "user":
+                current_user_question = str(turn.get("content", ""))
+                continue
             if turn.get("role") != "assistant" or "candidate_response" not in turn:
                 continue
             evaluated_turns += 1
             for criterion in turn.get("criteria", []):
                 prompt = build_official_criterion_prompt(
+                    user_question=current_user_question,
                     ground_truth_response=str(turn.get("content", "")),
                     model_response=str(turn.get("candidate_response", "")),
                     criterion_description=str(criterion.get("description", "")),
                 )
-                completion = ""
-                last_error: Exception | None = None
-                for _attempt in range(3):
-                    try:
-                        completion = judge_client.completion(prompt)
-                        criterion["criteria_met"] = parse_criteria_met(completion)
-                        last_error = None
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                if last_error is not None:
-                    criterion["criteria_met"] = None
-                    criterion["evaluation_error"] = str(last_error)
+                criteria_met, evaluation_error, completion = judge_boolean_prompt(
+                    judge_client=judge_client,
+                    prompt=prompt,
+                )
+                criterion["criteria_met"] = criteria_met
+                if evaluation_error is not None:
+                    criterion["evaluation_error"] = evaluation_error
                     criterion["evaluation_raw"] = completion[:1000]
                 criterion["evaluation_model"] = config.judge_model_name
                 evaluated_criteria += 1
@@ -256,30 +347,148 @@ def evaluate_predictions_official_style(
     )
 
 
+def evaluate_predictions_answer_only(
+    config: LongShOTOfficialEvalConfig,
+    *,
+    judge: BaseLM | None = None,
+) -> LongShOTOfficialEvalResult:
+    predictions = load_jsonl(config.predictions_path)
+    if config.sample_limit is not None:
+        predictions = predictions[: config.sample_limit]
+
+    judge_client = judge or build_local_judge(
+        model_name=config.judge_model_name,
+        model_path=config.judge_model_path,
+        device=config.judge_device,
+        torch_dtype=config.torch_dtype,
+        attn_implementation=config.attn_implementation,
+        max_new_tokens=config.max_new_tokens,
+    )
+
+    completed_ids = set()
+    if config.eval_path.exists():
+        existing_rows = load_jsonl(config.eval_path)
+        incompatible_ids = [
+            row.get("sample_id")
+            for row in existing_rows
+            if row.get("evaluation_mode") != "answer_only"
+        ]
+        if incompatible_ids:
+            raise ValueError(
+                "Existing eval JSONL is not answer-only. Use a different --eval-output "
+                f"or remove the old file first: {config.eval_path}"
+            )
+        completed_ids = {row.get("sample_id") for row in existing_rows}
+
+    evaluated_samples = 0
+    evaluated_turns = 0
+    evaluated_criteria = 0
+
+    remaining_samples = [
+        sample for sample in predictions if sample.get("sample_id") not in completed_ids
+    ]
+
+    for index, sample in enumerate(remaining_samples, start=1):
+        sample_id = sample.get("sample_id")
+        print(
+            f"[answer-only-eval] {index}/{len(remaining_samples)} "
+            f"sample_id={sample_id} task={sample.get('task')}"
+        )
+        sample["evaluation_mode"] = "answer_only"
+
+        current_user_question = ""
+        for turn in sample.get("conversations", []):
+            if turn.get("role") == "user":
+                current_user_question = str(turn.get("content", ""))
+                continue
+            if turn.get("role") != "assistant":
+                continue
+            if "candidate_response" not in turn:
+                turn["criteria"] = []
+                continue
+
+            evaluated_turns += 1
+            ignored_criteria_count = len(turn.get("criteria", []))
+            criterion: dict[str, Any] = {
+                "name": "answer_correctness",
+                "description": ANSWER_ONLY_CRITERION_DESCRIPTION,
+                "is_penalty": False,
+                "weight": 1.0,
+                "evaluation_mode": "answer_only",
+            }
+            prompt = build_answer_only_prompt(
+                user_question=current_user_question,
+                ground_truth_response=str(turn.get("content", "")),
+                model_response=str(turn.get("candidate_response", "")),
+            )
+            criteria_met, evaluation_error, completion = judge_boolean_prompt(
+                judge_client=judge_client,
+                prompt=prompt,
+            )
+            criterion["criteria_met"] = criteria_met
+            if evaluation_error is not None:
+                criterion["evaluation_error"] = evaluation_error
+                criterion["evaluation_raw"] = completion[:1000]
+            criterion["evaluation_model"] = config.judge_model_name
+            turn["answer_only_ignored_criteria_count"] = ignored_criteria_count
+            turn["criteria"] = [criterion]
+            evaluated_criteria += 1
+
+        append_jsonl(config.eval_path, sample)
+        evaluated_samples += 1
+
+    summary = calculate_official_scores(load_jsonl(config.eval_path))
+    write_score_report(
+        score_path=config.score_path,
+        model_name=config.predictions_path.stem,
+        summary=summary,
+    )
+    write_summary_json(
+        summary_path=config.summary_path,
+        summary=summary,
+        extra={
+            "predictions_path": str(config.predictions_path),
+            "eval_path": str(config.eval_path),
+            "evaluation_mode": "answer_only",
+            "judge_model_name": config.judge_model_name,
+            "judge_model_path": config.judge_model_path,
+            "judge_device": config.judge_device,
+            "evaluated_samples_this_run": evaluated_samples,
+            "evaluated_turns_this_run": evaluated_turns,
+            "evaluated_criteria_this_run": evaluated_criteria,
+        },
+    )
+    return LongShOTOfficialEvalResult(
+        evaluated_samples=evaluated_samples,
+        evaluated_turns=evaluated_turns,
+        evaluated_criteria=evaluated_criteria,
+        task_accuracies=summary["task_accuracies"],
+        task_counts=summary["task_counts"],
+        category_averages=summary["category_averages"],
+        overall_accuracy=summary["overall_accuracy"],
+    )
+
+
 def calculate_official_scores(eval_results: list[dict[str, Any]]) -> dict[str, Any]:
     task_performance: dict[str, dict[str, float | int]] = {}
+    task_categories: dict[str, str] = {}
 
     for result in eval_results:
-        task_type = TASK_REMAP.get(result.get("task", "unknown_task"), result.get("task", "unknown_task"))
+        task_type = normalize_task_name(result.get("task", "unknown_task"))
+        task_categories[task_type] = task_category(task_type)
         performance = task_performance.setdefault(
             task_type,
             {"score_obtained": 0.0, "score_total": 0.0, "count": 0},
         )
-        obtained_score = 0.0
-        max_score = 0.0
+        criteria: list[dict[str, Any]] = []
 
         for turn in result.get("conversations", []):
             if turn.get("role") != "assistant":
                 continue
-            for criterion in turn.get("criteria", []):
-                weight = float(criterion.get("weight", 0))
-                if criterion.get("criteria_met") and not criterion.get("is_penalty"):
-                    obtained_score += weight
-                if weight > 0:
-                    max_score += weight
+            criteria.extend(turn.get("criteria", []))
 
-        performance["score_obtained"] += obtained_score
-        performance["score_total"] += max_score
+        performance["score_obtained"] += normalized_criteria_score(criteria)
+        performance["score_total"] += 1.0
         performance["count"] += 1
 
     task_accuracies: dict[str, float] = {}
@@ -295,8 +504,20 @@ def calculate_official_scores(eval_results: list[dict[str, Any]]) -> dict[str, A
         else:
             task_accuracies[task_type] = 0.0
 
-    for category, tasks in TASK_CATEGORIES.items():
-        values = [task_accuracies[task] for task in tasks if task in task_accuracies]
+    category_tasks: dict[str, list[str]] = {}
+    for task_type in sorted(task_accuracies):
+        category_tasks.setdefault(
+            task_categories.get(task_type, OTHER_TASK_CATEGORY),
+            [],
+        ).append(task_type)
+
+    ordered_categories = list(TASK_CATEGORIES)
+    ordered_categories.extend(
+        category for category in sorted(category_tasks) if category not in TASK_CATEGORIES
+    )
+    for category in ordered_categories:
+        tasks = category_tasks.get(category, [])
+        values = [task_accuracies[task] for task in tasks]
         if values:
             category_averages[category] = sum(values) / len(values)
 
@@ -308,7 +529,53 @@ def calculate_official_scores(eval_results: list[dict[str, Any]]) -> dict[str, A
         "task_counts": task_counts,
         "category_averages": category_averages,
         "overall_accuracy": overall_accuracy,
+        "task_categories": task_categories,
+        "category_tasks": category_tasks,
     }
+
+
+def normalize_task_name(task_type: Any) -> str:
+    task = str(task_type or "unknown_task")
+    return TASK_REMAP.get(task, task)
+
+
+def task_category(task_type: str) -> str:
+    for category, tasks in TASK_CATEGORIES.items():
+        if task_type in tasks:
+            return category
+    lowered = task_type.lower()
+    if any(keyword in lowered for keyword in AGENTIC_TASK_KEYWORDS):
+        return "Agentic Tasks"
+    return OTHER_TASK_CATEGORY
+
+
+def criterion_score_components(criteria: list[dict[str, Any]]) -> tuple[float, float]:
+    obtained_score = 0.0
+    max_score = 0.0
+    for criterion in criteria:
+        weight = float(criterion.get("weight", 0.0))
+        weight_magnitude = abs(weight)
+        if weight_magnitude == 0:
+            continue
+
+        is_penalty = bool(criterion.get("is_penalty")) or weight < 0
+        criteria_met = criterion.get("criteria_met") is True
+        if is_penalty:
+            if criteria_met:
+                obtained_score -= weight_magnitude
+            continue
+
+        max_score += weight_magnitude
+        if criteria_met:
+            obtained_score += weight_magnitude
+    return obtained_score, max_score
+
+
+def normalized_criteria_score(criteria: list[dict[str, Any]]) -> float:
+    obtained_score, max_score = criterion_score_components(criteria)
+    if max_score <= 0:
+        return 0.0
+    return max(0.0, min(1.0, obtained_score / max_score))
 
 
 def write_score_report(*, score_path: Path, model_name: str, summary: dict[str, Any]) -> None:
@@ -320,7 +587,15 @@ def write_score_report(*, score_path: Path, model_name: str, summary: dict[str, 
         handle.write(f"  Model:  {model_name}\n")
         handle.write(f"  Date:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
-        for category, tasks in TASK_CATEGORIES.items():
+        category_tasks = summary.get("category_tasks", {})
+        ordered_categories = list(TASK_CATEGORIES)
+        ordered_categories.extend(
+            category for category in sorted(category_tasks) if category not in TASK_CATEGORIES
+        )
+        for category in ordered_categories:
+            tasks = category_tasks.get(category, [])
+            if not tasks:
+                continue
             handle.write("-" * 60 + "\n")
             handle.write(f"  {category}\n")
             handle.write("-" * 60 + "\n")

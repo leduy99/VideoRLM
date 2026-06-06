@@ -3,6 +3,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any, Literal
 
 from rlm.clients import get_client
@@ -12,25 +13,41 @@ from rlm.video.adapters import (
     EmbeddingProvider,
     ImageTextEmbeddingProvider,
     SpeechRecognizer,
+    VideoWindowEmbeddingProvider,
     VisualSummarizer,
+)
+from rlm.video.event_memory import (
+    build_event_memory_from_global_context,
+    event_match_score,
+    event_memory_metrics,
+    update_event_memory_from_observation,
 )
 from rlm.video.evidence_pipeline import (
     build_evidence_board,
     build_question_spec,
     build_slot_queries,
+    graph_expansion_covered_node_ids,
+    is_reopen_blocked,
+    relation_evidence_status,
+    requires_co_visible_relation,
     search_v2,
     select_target_slot,
     update_evidence_board,
 )
 from rlm.video.index import STOPWORDS, TOKEN_PATTERN, VideoMemoryIndex
 from rlm.video.logger import VideoRLMLogger
+from rlm.video.prompt_plugins import render_prompt_plugin_section
 from rlm.video.prompts import build_controller_prompt
+from rlm.video.question_router import evidence_matches_route, route_from_metadata, route_question
+from rlm.video.rerankers import VideoWindowReranker
 from rlm.video.tools import VideoToolExecutor
 from rlm.video.types import (
     BudgetState,
     ControllerAction,
     ControllerState,
+    Evidence,
     FrontierItem,
+    TimeSpan,
     TraceStep,
     VideoMemory,
     VideoRLMResult,
@@ -53,10 +70,19 @@ class VideoRLM:
         search_mode: Literal["lexical", "graph"] = "lexical",
         embedding_provider: EmbeddingProvider | None = None,
         image_text_embedding_provider: ImageTextEmbeddingProvider | None = None,
+        video_window_embedding_provider: VideoWindowEmbeddingProvider | None = None,
+        enable_video_window_reranking: bool = False,
+        video_window_rerank_candidate_count: int = 24,
+        video_window_rerank_weight: float = 0.75,
+        video_window_rerank_window_seconds: float | None = None,
+        video_window_rerank_min_score: float | None = None,
         speech_refiner: SpeechRecognizer | None = None,
         visual_refiner: VisualSummarizer | None = None,
         enable_vrrqa_graph_refinement_expansion: bool = True,
         vrrqa_graph_refinement_neighbor_count: int = 1,
+        enable_vrrqa_visual_answer_verifier: bool = True,
+        vrrqa_visual_verifier_frame_count: int = 8,
+        enable_controller_evidence_classifier: bool = False,
     ):
         if search_mode not in {"lexical", "graph"}:
             raise ValueError(f"Unsupported search mode: {search_mode}")
@@ -77,10 +103,36 @@ class VideoRLM:
         self.search_mode = search_mode
         self.embedding_provider = embedding_provider
         self.image_text_embedding_provider = image_text_embedding_provider
+        self.video_window_embedding_provider = video_window_embedding_provider
+        self.enable_video_window_reranking = enable_video_window_reranking
+        self.video_window_rerank_candidate_count = video_window_rerank_candidate_count
+        self.video_window_rerank_weight = video_window_rerank_weight
+        self.video_window_rerank_window_seconds = video_window_rerank_window_seconds
+        self.video_window_rerank_min_score = video_window_rerank_min_score
         self.speech_refiner = speech_refiner
         self.visual_refiner = visual_refiner
         self.enable_vrrqa_graph_refinement_expansion = enable_vrrqa_graph_refinement_expansion
         self.vrrqa_graph_refinement_neighbor_count = vrrqa_graph_refinement_neighbor_count
+        self.enable_vrrqa_visual_answer_verifier = enable_vrrqa_visual_answer_verifier
+        self.vrrqa_visual_verifier_frame_count = vrrqa_visual_verifier_frame_count
+        self.enable_controller_evidence_classifier = enable_controller_evidence_classifier
+
+    def _video_window_reranking_enabled(self) -> bool:
+        return (
+            self.enable_video_window_reranking
+            and self.video_window_embedding_provider is not None
+        )
+
+    def _build_video_window_reranker(self) -> VideoWindowReranker | None:
+        if not self._video_window_reranking_enabled():
+            return None
+        return VideoWindowReranker(
+            embedding_provider=self.video_window_embedding_provider,
+            candidate_count=self.video_window_rerank_candidate_count,
+            stage2_weight=self.video_window_rerank_weight,
+            window_seconds=self.video_window_rerank_window_seconds,
+            min_stage2_score=self.video_window_rerank_min_score,
+        )
 
     def run(
         self,
@@ -89,6 +141,7 @@ class VideoRLM:
         dialogue_context: list[dict[str, str]] | None = None,
         task_type: str | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        global_context_overrides: dict[str, Any] | None = None,
     ) -> VideoRLMResult:
         start_time = time.perf_counter()
         index = VideoMemoryIndex(
@@ -110,6 +163,9 @@ class VideoRLM:
                 self.enable_vrrqa_graph_refinement_expansion
             ),
             vrrqa_graph_refinement_neighbor_count=self.vrrqa_graph_refinement_neighbor_count,
+            video_window_reranker=self._build_video_window_reranker(),
+            evidence_classifier_client=self.controller_client,
+            enable_controller_evidence_classifier=self.enable_controller_evidence_classifier,
             progress_callback=progress_callback,
         )
         state = self._build_initial_state(
@@ -118,6 +174,7 @@ class VideoRLM:
             index=index,
             dialogue_context=dialogue_context or [],
             task_type=task_type,
+            global_context_overrides=global_context_overrides,
         )
 
         if self.logger:
@@ -130,11 +187,19 @@ class VideoRLM:
                     "search_top_k": self.search_top_k,
                     "search_mode": self.search_mode,
                     "semantic_frame_embeddings": self.image_text_embedding_provider is not None,
+                    "video_window_reranking": self._video_window_reranking_enabled(),
+                    "controller_evidence_classifier": (
+                        self.enable_controller_evidence_classifier
+                    ),
                     "hybrid_speech_refinement": self.enable_hybrid_speech_refinement,
                     "speech_refinement": self.speech_refiner is not None,
                     "visual_refinement": self.visual_refiner is not None,
                     "vrrqa_graph_refinement_expansion": (
                         self.enable_vrrqa_graph_refinement_expansion
+                    ),
+                    "vrrqa_visual_answer_verifier": (
+                        self.enable_vrrqa_visual_answer_verifier
+                        and self.visual_refiner is not None
                     ),
                 }
             )
@@ -142,10 +207,15 @@ class VideoRLM:
         trace_steps: list[dict[str, Any]] = []
         answer: str | None = None
         consecutive_empty_open_steps = 0
+        self._notify_progress_status(progress_callback, "controller ready")
 
         while state.budget.steps_remaining > 0:
             if self._should_use_multiple_choice_final_step(state):
                 previous_state = copy.deepcopy(state.to_dict())
+                self._notify_progress_status(
+                    progress_callback,
+                    "controller final choice generation",
+                )
                 answer, raw_response = self._multiple_choice_completion_from_state(state)
                 action = ControllerAction(
                     action_type="STOP",
@@ -153,6 +223,10 @@ class VideoRLM:
                     evidence_ids=self._final_answer_evidence_ids(state),
                 )
                 observation = tools.execute(action, state)
+                if not observation.metadata.get("stop_rejected"):
+                    verified_ids = observation.metadata.get("verified_evidence_ids")
+                    if isinstance(verified_ids, list):
+                        action.evidence_ids = [str(item) for item in verified_ids]
                 state = self._apply_observation(state, action, observation)
                 next_state = state.to_dict()
                 trace_step = TraceStep(
@@ -166,18 +240,71 @@ class VideoRLM:
                 trace_steps.append(trace_step.to_dict())
                 if self.logger:
                     self.logger.log_step(trace_step)
+                if observation.metadata.get("stop_rejected"):
+                    answer = None
+                    self._notify_progress_status(
+                        progress_callback,
+                        "controller stop rejected by answer verifier",
+                    )
+                    continue
                 break
 
             prompt = build_controller_prompt(
                 state,
                 max_frontier_items=self.max_frontier_items,
             )
+            self._notify_progress_status(
+                progress_callback,
+                f"controller step {state.budget.steps_used + 1}/{self.max_steps} generating action",
+            )
             raw_response = self.controller_client.completion(prompt)
+            self._notify_progress_status(
+                progress_callback,
+                f"controller step {state.budget.steps_used + 1}/{self.max_steps} parsing action",
+            )
             action = self._parse_action(raw_response, state)
             if action.target_slot is None:
                 action.target_slot = select_target_slot(state.question_spec, state.evidence_board)
+            forced_final_answer: str | None = None
+            if self._should_force_multiple_choice_finalization(state, action):
+                self._notify_progress_status(
+                    progress_callback,
+                    "controller forced final choice generation",
+                )
+                completion = self._multiple_choice_completion_from_state(state)
+                if completion is not None:
+                    forced_final_answer, finalizer_response = completion
+                    raw_response = json.dumps(
+                        {
+                            "source": "loop_control_finalization",
+                            "original_controller_response": raw_response,
+                            "finalizer_response": finalizer_response,
+                        },
+                        ensure_ascii=True,
+                    )
+                    action = ControllerAction(
+                        action_type="STOP",
+                        target_slot=select_target_slot(
+                            state.question_spec,
+                            state.evidence_board,
+                        ),
+                        evidence_ids=self._final_answer_evidence_ids(state),
+                        answer=forced_final_answer,
+                    )
             previous_state = copy.deepcopy(state.to_dict())
+            self._notify_progress_status(
+                progress_callback,
+                f"controller executing {action.action_type.lower()}",
+            )
             observation = tools.execute(action, state)
+            if action.action_type == "STOP" and not observation.metadata.get("stop_rejected"):
+                verified_ids = observation.metadata.get("verified_evidence_ids")
+                if isinstance(verified_ids, list):
+                    action.evidence_ids = [str(item) for item in verified_ids]
+            self._notify_progress_status(
+                progress_callback,
+                f"controller applying {action.action_type.lower()} result",
+            )
             state = self._apply_observation(state, action, observation)
             next_state = state.to_dict()
 
@@ -194,7 +321,43 @@ class VideoRLM:
                 self.logger.log_step(trace_step)
 
             if action.action_type == "STOP":
-                answer = self._answer_from_stop_action(action, state)
+                if observation.metadata.get("stop_rejected"):
+                    self._notify_progress_status(
+                        progress_callback,
+                        "controller stop rejected by answer verifier",
+                    )
+                    continue
+                self._notify_progress_status(progress_callback, "controller finalizing answer")
+                answer = forced_final_answer or self._answer_from_stop_action(action, state)
+                break
+            filled_slot_answer = self._filled_required_slots_answer_from_state(state)
+            if filled_slot_answer is not None:
+                answer, evidence_ids = filled_slot_answer
+                for evidence in state.evidence_ledger:
+                    if evidence.evidence_id in set(evidence_ids):
+                        evidence.used_in_final_answer = True
+                state.global_context["early_stop"] = {
+                    "source": "filled_required_slots_answer_span",
+                    "evidence_ids": evidence_ids,
+                    "steps_used": state.budget.steps_used,
+                }
+                self._notify_progress_status(
+                    progress_callback,
+                    "controller filled-slot early stop",
+                )
+                break
+            grounded_completion = self._grounded_multiple_choice_completion_from_state(state)
+            if grounded_completion is not None:
+                answer, raw_grounded_response = grounded_completion
+                state.global_context["early_stop"] = {
+                    "source": "grounded_multiple_choice_completion",
+                    "response": raw_grounded_response,
+                    "steps_used": state.budget.steps_used,
+                }
+                self._notify_progress_status(
+                    progress_callback,
+                    "controller grounded early stop",
+                )
                 break
             if action.action_type == "OPEN" and not observation.evidence:
                 consecutive_empty_open_steps += 1
@@ -208,8 +371,10 @@ class VideoRLM:
                 break
 
         if answer is None:
+            self._notify_progress_status(progress_callback, "controller fallback answer")
             answer = self._fallback_answer_from_state(state)
 
+        self._notify_progress_status(progress_callback, "controller done")
         usage = self.controller_client.get_usage_summary()
         return VideoRLMResult(
             answer=answer,
@@ -219,6 +384,15 @@ class VideoRLM:
             execution_time=time.perf_counter() - start_time,
         )
 
+    def _notify_progress_status(
+        self,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+        status: str,
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback({"phase": "controller", "event": "status", "status": status})
+
     def _build_initial_state(
         self,
         question: str,
@@ -226,6 +400,7 @@ class VideoRLM:
         index: VideoMemoryIndex,
         dialogue_context: list[dict[str, str]],
         task_type: str | None,
+        global_context_overrides: dict[str, Any] | None = None,
     ) -> ControllerState:
         clean_question = _clean_controller_question(question, task_type)
         answer_options = _extract_multiple_choice_options(question)
@@ -234,6 +409,14 @@ class VideoRLM:
             task_type=task_type,
             dialogue_context=dialogue_context,
         )
+        route_context = (global_context_overrides or {}).get("longshot")
+        question_route = route_question(clean_question, task_type, route_context)
+        question_spec.metadata["question_route"] = question_route.to_dict()
+        if question_route.preferred_modality is not None:
+            question_spec.preferred_modality = question_route.preferred_modality
+            for slot in question_spec.required_slots:
+                if slot.preferred_modality is None or slot.slot == "main_claim":
+                    slot.preferred_modality = question_route.preferred_modality
         evidence_board = build_evidence_board(question_spec)
         scene_summaries = []
         for node in memory.top_level_nodes()[:6]:
@@ -251,6 +434,7 @@ class VideoRLM:
         )
         global_context = {
             "video_id": memory.video_id,
+            "source_video_path": memory.metadata.get("source_video_path"),
             "video_length_seconds": memory.metadata.get("duration_seconds"),
             "node_count": len(memory.nodes),
             "available_modalities": self._available_modalities(memory),
@@ -270,13 +454,24 @@ class VideoRLM:
                 "no_progress_rate": 0.0,
                 "tokens_per_step": 0.0,
             },
+            "question_route": question_route.to_dict(),
         }
+        if global_context_overrides:
+            global_context.update(global_context_overrides)
+        if global_context.get("benchmark") == "timelogic":
+            global_context["timelogic_temporal_sweep_candidates"] = (
+                _timelogic_temporal_sweep_candidates(memory)
+            )
+        event_memory = build_event_memory_from_global_context(global_context)
+        if event_memory is not None:
+            global_context["event_memory_metrics"] = event_memory_metrics(event_memory)
         state = ControllerState(
             question=question,
             task_type=task_type,
             dialogue_context=dialogue_context,
             question_spec=question_spec,
             evidence_board=evidence_board,
+            event_memory=event_memory,
             budget=budget,
             global_context=global_context,
         )
@@ -288,29 +483,78 @@ class VideoRLM:
             top_k=self.max_frontier_items,
         )
         if not frontier:
-            frontier = [
-                FrontierItem(
-                    node_id=node.node_id,
-                    time_span=node.time_span,
-                    level=node.level,
-                    score=0.1,
-                    why_candidate=f"Top-level node {node.node_id}",
-                    recommended_modalities=["visual", "speech"],
-                )
-                for node in memory.top_level_nodes()
-            ]
+            frontier = self._fallback_initial_frontier(memory, task_type)
         state.frontier = frontier[: self.max_frontier_items]
         return state
+
+    def _fallback_initial_frontier(
+        self,
+        memory: VideoMemory,
+        task_type: str | None,
+    ) -> list[FrontierItem]:
+        if task_type == "multiple_choice_visual_qa":
+            candidates = [
+                node
+                for node in memory.nodes.values()
+                if node.level == "clip" and node.visual_summary.strip()
+            ]
+            if not candidates:
+                candidates = [
+                    node
+                    for node in memory.nodes.values()
+                    if node.level != "video" and node.visual_summary.strip()
+                ]
+            selected_nodes = _select_temporally_diverse_initial_nodes(
+                candidates,
+                self.max_frontier_items,
+            )
+            if selected_nodes:
+                return [
+                    FrontierItem(
+                        node_id=node.node_id,
+                        time_span=node.time_span,
+                        level=node.level,
+                        score=round(0.32 - min(index * 0.02, 0.12), 4),
+                        why_candidate=(
+                            "Initial temporal visual fallback after search found no candidates"
+                        ),
+                        recommended_modalities=["visual"],
+                    )
+                    for index, node in enumerate(selected_nodes)
+                ]
+        return [
+            FrontierItem(
+                node_id=node.node_id,
+                time_span=node.time_span,
+                level=node.level,
+                score=0.1,
+                why_candidate=f"Top-level node {node.node_id}",
+                recommended_modalities=["visual", "speech"],
+            )
+            for node in memory.top_level_nodes()
+        ]
 
     def _answer_from_stop_action(
         self,
         action: ControllerAction,
         state: ControllerState,
     ) -> str:
+        if action.answer:
+            options = _extract_multiple_choice_options(state.question)
+            if options:
+                visual_verifier = self._visual_answer_verification_from_state(state, options)
+                if visual_verifier is not None:
+                    verified_answer, verifier_metadata = visual_verifier
+                    if verified_answer is not None:
+                        return verified_answer
+                parsed_answer = _parse_multiple_choice_letter(action.answer, options)
+                if parsed_answer is not None:
+                    return parsed_answer
+            return action.answer.strip()
         multiple_choice_answer = self._multiple_choice_answer_from_state(state)
         if multiple_choice_answer is not None:
             return multiple_choice_answer
-        return action.answer or self._fallback_answer_from_state(state)
+        return self._fallback_answer_from_state(state)
 
     def _apply_observation(
         self,
@@ -338,8 +582,13 @@ class VideoRLM:
         if action.action_type == "SEARCH":
             state.frontier = self._merge_frontier(state.frontier, observation.frontier)
         elif action.action_type == "OPEN":
-            state.frontier = self._set_frontier_status(state.frontier, action.node_id, "opened")
-            state.frontier = self._remove_frontier_node(state.frontier, action.node_id)
+            covered_node_ids = self._covered_open_node_ids(action, observation)
+            state.frontier = self._set_frontier_status_many(
+                state.frontier,
+                covered_node_ids,
+                "opened",
+            )
+            state.frontier = self._remove_frontier_nodes(state.frontier, covered_node_ids)
             state.evidence_ledger.extend(observation.evidence)
             if observation.frontier:
                 state.frontier = self._merge_frontier(state.frontier, observation.frontier)
@@ -349,10 +598,14 @@ class VideoRLM:
         elif action.action_type == "MERGE":
             state.evidence_ledger.extend(observation.evidence)
         elif action.action_type == "STOP":
-            selected = set(action.evidence_ids)
-            for evidence in state.evidence_ledger:
-                if evidence.evidence_id in selected:
-                    evidence.used_in_final_answer = True
+            verification = observation.metadata.get("answer_verification")
+            if isinstance(verification, dict):
+                state.global_context["last_stop_verification"] = verification
+            if not observation.metadata.get("stop_rejected"):
+                selected = set(action.evidence_ids)
+                for evidence in state.evidence_ledger:
+                    if evidence.evidence_id in selected:
+                        evidence.used_in_final_answer = True
 
         progress_made = bool(observation.metadata.get("progress_made"))
         if progress_made:
@@ -363,6 +616,16 @@ class VideoRLM:
                 state.evidence_board.no_progress_count += 1
 
         state.global_context["evidence_metrics"] = self._build_evidence_metrics(state)
+        if state.event_memory is not None:
+            event_updates = update_event_memory_from_observation(
+                state.event_memory,
+                observation,
+            )
+            if event_updates:
+                state.no_progress_steps = 0
+            state.global_context["event_memory_metrics"] = event_memory_metrics(
+                state.event_memory
+            )
 
         return state
 
@@ -407,6 +670,33 @@ class VideoRLM:
         if not node_id:
             return frontier
         return [item for item in frontier if item.node_id != node_id]
+
+    def _set_frontier_status_many(
+        self,
+        frontier: list[FrontierItem],
+        node_ids: set[str],
+        status: str,
+    ) -> list[FrontierItem]:
+        updated = []
+        for item in frontier:
+            if item.node_id in node_ids:
+                item.status = status
+            updated.append(item)
+        return updated
+
+    def _remove_frontier_nodes(
+        self,
+        frontier: list[FrontierItem],
+        node_ids: set[str],
+    ) -> list[FrontierItem]:
+        if not node_ids:
+            return frontier
+        return [item for item in frontier if item.node_id not in node_ids]
+
+    def _covered_open_node_ids(self, action: ControllerAction, observation) -> set[str]:
+        covered = {action.node_id} if action.node_id else set()
+        covered.update(graph_expansion_covered_node_ids(observation))
+        return covered
 
     def _parse_action(
         self, raw_response: str, state: ControllerState | None = None
@@ -498,6 +788,9 @@ class VideoRLM:
         state: ControllerState,
     ) -> dict[str, Any]:
         action_type = payload.get("action_type")
+        if action_type == "STOP":
+            followup = self._event_memory_followup_payload(state)
+            return followup or payload
         if action_type == "SPLIT":
             self._repair_node_id_payload(payload, state)
             return payload
@@ -514,24 +807,30 @@ class VideoRLM:
             self._resolve_available_modality(current_modality, state) if current_modality else None
         )
         if action_type == "SEARCH":
-            if self._should_open_frontier_instead_of_search(state):
-                payload["action_type"] = "OPEN"
-                payload["node_id"] = state.frontier[0].node_id
-                payload["query"] = None
-                resolved_modality = self._resolve_available_modality(
-                    state.frontier[0].recommended_modalities[0]
-                    if state.frontier[0].recommended_modalities
-                    else preferred_modality,
-                    state,
-                )
-                payload["modality"] = resolved_modality
-                payload["target_slot"] = target_slot
-                self._repair_node_id_payload(payload, state)
-                return payload
             if not payload.get("query"):
                 payload["query"] = self._default_search_query(state, target_slot)
             else:
                 payload["query"] = self._clean_search_query(str(payload["query"]), state)
+            frontier_candidate = self._next_frontier_open_candidate(
+                state,
+                target_slot,
+                preferred_modality,
+            )
+            if (
+                self._should_open_frontier_instead_of_search(state)
+                or (
+                    state.evidence_ledger
+                    and self._is_timelogic_repeated_search_payload(state, payload)
+                )
+            ) and frontier_candidate is not None:
+                item, item_modality = frontier_candidate
+                payload["action_type"] = "OPEN"
+                payload["node_id"] = item.node_id
+                payload["query"] = None
+                payload["modality"] = item_modality
+                payload["target_slot"] = target_slot
+                self._repair_node_id_payload(payload, state)
+                return payload
             if resolved_modality is None or self._should_override_open_modality(
                 current_modality=resolved_modality,
                 preferred_modality=preferred_modality,
@@ -550,6 +849,204 @@ class VideoRLM:
         if action_type == "OPEN":
             self._repair_node_id_payload(payload, state)
         return payload
+
+    def _event_memory_followup_payload(self, state: ControllerState) -> dict[str, Any] | None:
+        event_memory = state.event_memory
+        if event_memory is None or event_memory.task_name != "timelogic":
+            return None
+        missing_event_ids = self._blocking_timelogic_missing_event_ids(state)
+        if state.budget.steps_remaining <= 0 or not missing_event_ids:
+            return None
+
+        target_slot = select_target_slot(state.question_spec, state.evidence_board)
+        if event_memory.mode == "mc":
+            for event_id in missing_event_ids:
+                event = event_memory.events[event_id]
+                if event.source != "option":
+                    continue
+                if self._event_search_count(state, event.phrase) >= 1:
+                    continue
+                return {
+                    "action_type": "SEARCH",
+                    "query": event.phrase,
+                    "modality": self._resolve_available_modality("visual", state),
+                    "node_id": None,
+                    "target_slot": target_slot,
+                    "evidence_ids": [],
+                    "answer": None,
+                    "rationale": "search option event",
+                }
+
+        if event_memory.mode == "bool" and self._timelogic_missing_search_count(
+            state,
+            missing_event_ids,
+        ) >= 2:
+            sweep_payload = self._timelogic_temporal_sweep_payload(
+                state,
+                target_slot=target_slot,
+                reason="sweep missing event",
+            )
+            if sweep_payload is not None:
+                return sweep_payload
+
+        for item in state.frontier:
+            if item.status == "unopened":
+                modality = (
+                    item.recommended_modalities[0]
+                    if item.recommended_modalities
+                    else "visual"
+                )
+                return {
+                    "action_type": "OPEN",
+                    "query": None,
+                    "modality": self._resolve_available_modality(modality, state),
+                    "node_id": item.node_id,
+                    "target_slot": target_slot,
+                    "evidence_ids": [],
+                    "answer": None,
+                    "rationale": "localize missing event",
+                }
+
+        for event_id in missing_event_ids:
+            event = event_memory.events[event_id]
+            if self._event_search_count(state, event.phrase) >= 2:
+                continue
+            return {
+                "action_type": "SEARCH",
+                "query": event.phrase,
+                "modality": self._resolve_available_modality("visual", state),
+                "node_id": None,
+                "target_slot": target_slot,
+                "evidence_ids": [],
+                "answer": None,
+                "rationale": "search missing event",
+            }
+        return None
+
+    def _timelogic_missing_search_count(
+        self,
+        state: ControllerState,
+        missing_event_ids: list[str],
+    ) -> int:
+        event_memory = state.event_memory
+        if event_memory is None:
+            return 0
+        return sum(
+            self._event_search_count(state, event_memory.events[event_id].phrase)
+            for event_id in missing_event_ids
+            if event_id in event_memory.events
+        )
+
+    def _timelogic_temporal_sweep_payload(
+        self,
+        state: ControllerState,
+        *,
+        target_slot: str | None,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        candidate = self._timelogic_temporal_sweep_candidate(state, target_slot)
+        if candidate is None:
+            return None
+        return {
+            "action_type": "OPEN",
+            "query": None,
+            "modality": self._resolve_available_modality("visual", state),
+            "node_id": candidate["node_id"],
+            "target_slot": target_slot,
+            "evidence_ids": [],
+            "answer": None,
+            "rationale": reason,
+        }
+
+    def _timelogic_temporal_sweep_candidate(
+        self,
+        state: ControllerState,
+        target_slot: str | None,
+    ) -> dict[str, Any] | None:
+        candidates = state.global_context.get("timelogic_temporal_sweep_candidates")
+        if not isinstance(candidates, list):
+            return None
+        opened_node_ids = {
+            str(action.get("node_id"))
+            for action in state.action_history
+            if action.get("action_type") == "OPEN" and action.get("node_id")
+        }
+        opened_midpoints = [
+            (evidence.time_span.start + evidence.time_span.end) / 2.0
+            for evidence in state.evidence_ledger
+            if evidence.modality == "visual"
+        ]
+        scored: list[tuple[float, float, dict[str, Any]]] = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("node_id") or "")
+            if not node_id or node_id in opened_node_ids:
+                continue
+            if is_reopen_blocked(
+                state.evidence_board,
+                node_id,
+                "visual",
+                target_slot,
+            ):
+                continue
+            try:
+                start = float(item["start"])
+                end = float(item["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            midpoint = (start + end) / 2.0
+            if opened_midpoints:
+                diversity = min(abs(midpoint - opened) for opened in opened_midpoints)
+            else:
+                diversity = midpoint
+            scored.append((diversity, -start, item))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        return scored[0][2]
+
+    def _blocking_timelogic_missing_event_ids(self, state: ControllerState) -> list[str]:
+        event_memory = state.event_memory
+        if event_memory is None or event_memory.task_name != "timelogic":
+            return []
+        if event_memory.mode == "mc":
+            target_missing = [
+                event.event_id
+                for event in event_memory.events.values()
+                if event.source != "option" and event.status != "localized"
+            ]
+            if target_missing:
+                return target_missing
+            has_localized_option = any(
+                event.source == "option" and event.status == "localized"
+                for event in event_memory.events.values()
+            )
+            if not has_localized_option:
+                return [
+                    event.event_id
+                    for event in event_memory.events.values()
+                    if event.source == "option"
+                ]
+            return [
+                event.event_id
+                for event in event_memory.events.values()
+                if event.source == "option"
+                and event.status != "localized"
+                and self._event_search_count(state, event.phrase) == 0
+            ]
+        return event_memory.missing_event_ids
+
+    def _event_search_count(self, state: ControllerState, phrase: str) -> int:
+        normalized_phrase = " ".join(phrase.lower().split())
+        count = 0
+        for action in state.action_history:
+            if action.get("action_type") != "SEARCH":
+                continue
+            query = " ".join(str(action.get("query") or "").lower().split())
+            if query == normalized_phrase or event_match_score(phrase, query) >= 0.67:
+                count += 1
+        return count
 
     def _default_search_query(self, state: ControllerState, target_slot: str | None) -> str:
         question = _clean_controller_question(state.question, state.task_type)
@@ -573,14 +1070,68 @@ class VideoRLM:
             return False
         if not state.frontier:
             return False
-        if state.evidence_ledger:
+        if state.evidence_ledger and not self._blocking_timelogic_missing_event_ids(state):
             return False
         if not state.action_history:
             return False
         last_action = state.action_history[-1]
         if last_action.get("action_type") != "SEARCH":
             return False
-        return any(item.status == "unopened" for item in state.frontier)
+        target_slot = select_target_slot(state.question_spec, state.evidence_board)
+        preferred_modality = self._preferred_search_modality(state, target_slot)
+        return (
+            self._next_frontier_open_candidate(state, target_slot, preferred_modality)
+            is not None
+        )
+
+    def _is_timelogic_repeated_search_payload(
+        self,
+        state: ControllerState,
+        payload: dict[str, Any],
+    ) -> bool:
+        if state.event_memory is None or state.event_memory.task_name != "timelogic":
+            return False
+        query = " ".join(str(payload.get("query") or "").split())
+        if not query:
+            return False
+        return any(
+            action.get("action_type") == "SEARCH"
+            and event_match_score(query, str(action.get("query") or "")) >= 0.67
+            for action in state.action_history
+        )
+
+    def _next_frontier_open_candidate(
+        self,
+        state: ControllerState,
+        target_slot: str | None,
+        preferred_modality: str,
+        *,
+        exclude_node_ids: set[str] | None = None,
+    ) -> tuple[FrontierItem, str] | None:
+        excluded = exclude_node_ids or set()
+        for item in state.frontier:
+            if item.status != "unopened" or item.node_id in excluded:
+                continue
+            current_modality = (
+                item.recommended_modalities[0]
+                if item.recommended_modalities
+                else preferred_modality
+            )
+            resolved_modality = self._resolve_available_modality(current_modality, state)
+            if self._should_override_open_modality(
+                current_modality=resolved_modality,
+                preferred_modality=preferred_modality,
+            ):
+                resolved_modality = preferred_modality
+            if is_reopen_blocked(
+                state.evidence_board,
+                item.node_id,
+                resolved_modality,
+                target_slot,
+            ):
+                continue
+            return item, resolved_modality
+        return None
 
     def _repair_node_id_payload(
         self,
@@ -589,10 +1140,56 @@ class VideoRLM:
     ) -> None:
         node_id = payload.get("node_id")
         frontier_ids = state.frontier_ids()
+        target_slot = payload.get("target_slot") or select_target_slot(
+            state.question_spec,
+            state.evidence_board,
+        )
+        preferred_modality = self._preferred_search_modality(state, target_slot)
+        current_modality = payload.get("modality")
+        resolved_modality = (
+            self._resolve_available_modality(current_modality, state)
+            if current_modality
+            else preferred_modality
+        )
+        if self._should_override_open_modality(
+            current_modality=resolved_modality,
+            preferred_modality=preferred_modality,
+        ):
+            resolved_modality = preferred_modality
         if node_id in frontier_ids:
+            if not is_reopen_blocked(
+                state.evidence_board,
+                str(node_id),
+                resolved_modality,
+                target_slot,
+            ):
+                payload["modality"] = resolved_modality
+                return
+            candidate = self._next_frontier_open_candidate(
+                state,
+                target_slot,
+                resolved_modality,
+                exclude_node_ids={str(node_id)},
+            )
+            if candidate is not None:
+                item, item_modality = candidate
+                payload["node_id"] = item.node_id
+                payload["modality"] = item_modality
+                return
             return
         if state.frontier:
+            candidate = self._next_frontier_open_candidate(
+                state,
+                target_slot,
+                resolved_modality,
+            )
+            if candidate is not None:
+                item, item_modality = candidate
+                payload["node_id"] = item.node_id
+                payload["modality"] = item_modality
+                return
             payload["node_id"] = state.frontier[0].node_id
+            payload["modality"] = resolved_modality
             return
         payload["action_type"] = "SEARCH"
         payload["node_id"] = None
@@ -661,11 +1258,53 @@ class VideoRLM:
         multiple_choice_answer = self._multiple_choice_answer_from_state(state)
         if multiple_choice_answer is not None:
             return multiple_choice_answer
+        filled_slot_answer = self._filled_required_slots_answer_from_state(state)
+        if filled_slot_answer is not None:
+            answer, _ = filled_slot_answer
+            return answer
         if state.evidence_board is not None and state.evidence_board.missing_required_slots:
             return self._diagnostic_abstain_from_state(state)
         if state.evidence_ledger:
             return self._synthesize_answer_from_evidence(state)
         return "Controller exhausted its budget before collecting grounded evidence."
+
+    def _filled_required_slots_answer_from_state(
+        self,
+        state: ControllerState,
+    ) -> tuple[str, list[str]] | None:
+        board = state.evidence_board
+        if board is None or board.missing_required_slots:
+            return None
+        required_slots = (
+            [slot.slot for slot in state.question_spec.required_slots if slot.required]
+            if state.question_spec is not None
+            else ["main_claim"]
+        )
+        if any(not board.is_slot_filled(slot_name) for slot_name in required_slots):
+            return None
+
+        route = (
+            route_from_metadata(state.global_context)
+            or route_from_metadata(state.question_spec.metadata if state.question_spec else None)
+            or route_question(state.question, state.task_type)
+        )
+        core_ids = set(board.core_evidence_ids)
+        compatible_core_evidence = [
+            item
+            for item in state.evidence_ledger
+            if item.evidence_id in core_ids
+            and item.metadata.get("role") == "core"
+            and evidence_matches_route(item, route)
+            and str(item.metadata.get("answer_span") or "").strip()
+        ]
+        if not compatible_core_evidence:
+            return None
+        compatible_core_evidence.sort(
+            key=lambda item: (-item.confidence, item.time_span.start, item.evidence_id)
+        )
+        answer = str(compatible_core_evidence[0].metadata.get("answer_span") or "").strip()
+        evidence_ids = [item.evidence_id for item in compatible_core_evidence]
+        return answer, evidence_ids
 
     def _synthesize_answer_from_evidence(self, state: ControllerState) -> str:
         multiple_choice_answer = self._multiple_choice_answer_from_state(state)
@@ -717,11 +1356,87 @@ class VideoRLM:
         return self.controller_client.completion(prompt).strip()
 
     def _should_use_multiple_choice_final_step(self, state: ControllerState) -> bool:
+        if self._has_timelogic_missing_event_work(state):
+            return False
         return (
             state.task_type == "multiple_choice_visual_qa"
             and state.budget.steps_remaining == 1
             and bool(state.evidence_ledger)
             and bool(_extract_multiple_choice_options(state.question))
+        )
+
+    def _has_timelogic_missing_event_work(self, state: ControllerState) -> bool:
+        if state.task_type != "multiple_choice_visual_qa":
+            return False
+        event_memory = state.event_memory
+        if event_memory is None or event_memory.task_name != "timelogic":
+            return False
+        missing_event_ids = self._blocking_timelogic_missing_event_ids(state)
+        if not missing_event_ids:
+            return False
+        if state.budget.steps_remaining <= 0:
+            return False
+        target_slot = select_target_slot(state.question_spec, state.evidence_board)
+        if self._timelogic_temporal_sweep_candidate(state, target_slot) is not None:
+            return True
+        return any(
+            self._event_search_count(state, event_memory.events[event_id].phrase) < 2
+            for event_id in missing_event_ids
+            if event_id in event_memory.events
+        )
+
+    def _should_force_multiple_choice_finalization(
+        self,
+        state: ControllerState,
+        action: ControllerAction,
+    ) -> bool:
+        if state.task_type != "multiple_choice_visual_qa":
+            return False
+        if not _extract_multiple_choice_options(state.question):
+            return False
+        visual_evidence_count = sum(
+            1 for evidence in state.evidence_ledger if evidence.modality == "visual"
+        )
+        if visual_evidence_count == 0:
+            return False
+        duplicate_open = (
+            action.action_type == "OPEN"
+            and action.node_id
+            and action.modality
+            and is_reopen_blocked(
+                state.evidence_board,
+                action.node_id,
+                action.modality,
+                action.target_slot,
+            )
+        )
+        if duplicate_open:
+            return True
+        if action.action_type == "SEARCH" and self._is_timelogic_repeated_search(state, action):
+            return True
+        if (
+            state.event_memory is not None
+            and state.event_memory.task_name == "timelogic"
+            and self._blocking_timelogic_missing_event_ids(state)
+            and state.budget.steps_remaining > 1
+        ):
+            return False
+        return action.action_type == "SEARCH" and visual_evidence_count >= 2
+
+    def _is_timelogic_repeated_search(
+        self,
+        state: ControllerState,
+        action: ControllerAction,
+    ) -> bool:
+        if state.event_memory is None or state.event_memory.task_name != "timelogic":
+            return False
+        query = " ".join(str(action.query or "").split())
+        if not query:
+            return False
+        return any(
+            previous.get("action_type") == "SEARCH"
+            and event_match_score(query, str(previous.get("query") or "")) >= 0.67
+            for previous in state.action_history
         )
 
     def _multiple_choice_answer_from_state(self, state: ControllerState) -> str | None:
@@ -730,6 +1445,35 @@ class VideoRLM:
             return None
         answer, _raw_response = completion
         return answer
+
+    def _grounded_multiple_choice_completion_from_state(
+        self,
+        state: ControllerState,
+    ) -> tuple[str, str] | None:
+        if state.task_type != "multiple_choice_visual_qa":
+            return None
+        options = _extract_multiple_choice_options(state.question)
+        if not options:
+            return None
+
+        timelogic_symbolic = self._timelogic_symbolic_completion_from_state(state, options)
+        if timelogic_symbolic is not None:
+            return timelogic_symbolic
+
+        evidence_best_option, evidence_metadata = self._best_verified_option_from_evidence(
+            state,
+            options,
+        )
+        if evidence_best_option is None:
+            return None
+        return evidence_best_option, json.dumps(
+            {
+                "source": "grounded_evidence_to_option_entailment",
+                "best_option": evidence_best_option,
+                **evidence_metadata,
+            },
+            ensure_ascii=True,
+        )
 
     def _multiple_choice_completion_from_state(
         self,
@@ -740,27 +1484,54 @@ class VideoRLM:
         options = _extract_multiple_choice_options(state.question)
         if not options:
             return None
-        evidence_best_option = self._best_verified_option_from_evidence(state, options)
+        timelogic_symbolic = self._timelogic_symbolic_completion_from_state(state, options)
+        if timelogic_symbolic is not None:
+            return timelogic_symbolic
+        visual_verifier = self._visual_answer_verification_from_state(state, options)
+        if visual_verifier is not None:
+            verified_answer, verifier_metadata = visual_verifier
+            if verified_answer is not None:
+                return verified_answer, json.dumps(
+                    {
+                        "source": "visual_answer_verifier",
+                        "best_option": verified_answer,
+                        **verifier_metadata,
+                    },
+                    ensure_ascii=True,
+                )
+        evidence_best_option, evidence_metadata = self._best_verified_option_from_evidence(
+            state,
+            options,
+        )
         if evidence_best_option is not None:
             return evidence_best_option, json.dumps(
                 {
-                    "source": "vrrqa_visual_verification",
+                    "source": "evidence_to_option_entailment",
                     "best_option": evidence_best_option,
+                    **evidence_metadata,
                 }
             )
 
-        evidence_lines = []
+        visual_evidence_lines = []
         for item in sorted(
-            state.evidence_ledger,
+            [evidence for evidence in state.evidence_ledger if evidence.modality == "visual"],
             key=lambda evidence: (-evidence.confidence, evidence.time_span.start),
         )[:8]:
-            evidence_lines.append(
+            visual_evidence_lines.append(
                 json.dumps(
                     {
+                        "evidence_id": item.evidence_id,
+                        "source_node_id": item.source_node_id,
                         "slot": item.metadata.get("slot"),
                         "role": item.metadata.get("role"),
-                        "modality": item.modality,
                         "time_span": item.time_span.to_dict(),
+                        "relation_evidence_status": item.metadata.get(
+                            "relation_evidence_status"
+                        ),
+                        "co_visible": item.metadata.get("vrrqa_co_visible"),
+                        "relation_supported": item.metadata.get("vrrqa_relation_supported"),
+                        "visible_relation": item.metadata.get("vrrqa_visible_relation"),
+                        "spatial_relation": item.metadata.get("vrrqa_spatial_relation"),
                         "detail": _focus_evidence_detail(item.detail or item.claim, state.question),
                     },
                     ensure_ascii=True,
@@ -768,44 +1539,351 @@ class VideoRLM:
             )
 
         option_lines = [f"{letter}. {text}" for letter, text in options.items()]
-        prompt = "\n".join(
-            [
-                "You are answering a VRR-QA multiple-choice question.",
-                "Return exactly one option letter from the valid choices. Do not explain.",
-                "If the evidence is incomplete or ambiguous, still choose the best-supported option.",
-                "",
-                f"Question: {_strip_options_from_question(state.question)}",
-                "Options:",
-                *option_lines,
-                "",
-                "Evidence:",
-                *(evidence_lines or ["No direct evidence was collected."]),
-                "",
-                f"Valid answer letters: {', '.join(options)}",
-                "Final answer letter:",
-            ]
+        prompt = _build_vrrqa_visual_reasoning_prompt(
+            question_text=_strip_options_from_question(state.question),
+            option_lines=option_lines,
+            visual_evidence_lines=visual_evidence_lines,
+            prompt_plugin=state.global_context.get("benchmark_prompt_plugin"),
         )
         response = self.controller_client.completion(prompt).strip()
         parsed = _parse_multiple_choice_letter(response, options)
         return parsed or sorted(options)[0], response
 
+    def _timelogic_symbolic_completion_from_state(
+        self,
+        state: ControllerState,
+        options: dict[str, str],
+    ) -> tuple[str, str] | None:
+        event_memory = state.event_memory
+        if event_memory is None or event_memory.task_name != "timelogic":
+            return None
+        if not event_memory.relations:
+            return None
+
+        if event_memory.mode == "bool":
+            verdicts = [
+                self._evaluate_timelogic_relation(event_memory, relation)
+                for relation in event_memory.relations
+            ]
+            if any(verdict is None for verdict in verdicts):
+                return None
+            answer_text = "yes" if all(verdicts) else "no"
+            choice = _choice_for_option_text(options, answer_text)
+            if choice is None:
+                return None
+            return choice, json.dumps(
+                {
+                    "source": "timelogic_symbolic_event_memory",
+                    "verdicts": verdicts,
+                    "answer": answer_text,
+                },
+                ensure_ascii=True,
+            )
+
+        if event_memory.mode == "mc":
+            target_relations = [
+                relation
+                for relation in event_memory.relations
+                if not self._relation_mentions_option(relation)
+            ]
+            target_verdicts = [
+                self._evaluate_timelogic_relation(event_memory, relation)
+                for relation in target_relations
+            ]
+            if any(verdict is False for verdict in target_verdicts):
+                return None
+
+            supported: list[str] = []
+            for letter in sorted(options):
+                option_event_id = f"option_{letter}"
+                option_relations = [
+                    relation
+                    for relation in event_memory.relations
+                    if relation.get("left") == option_event_id
+                    or relation.get("right") == option_event_id
+                ]
+                if not option_relations:
+                    continue
+                option_verdicts = [
+                    self._evaluate_timelogic_relation(event_memory, relation)
+                    for relation in option_relations
+                ]
+                if option_verdicts and all(verdict is True for verdict in option_verdicts):
+                    supported.append(letter)
+            if len(supported) != 1:
+                return None
+            return supported[0], json.dumps(
+                {
+                    "source": "timelogic_symbolic_event_memory",
+                    "best_option": supported[0],
+                },
+                ensure_ascii=True,
+            )
+        return None
+
+    def _relation_mentions_option(self, relation: dict[str, Any]) -> bool:
+        return str(relation.get("left", "")).startswith("option_") or str(
+            relation.get("right", "")
+        ).startswith("option_")
+
+    def _evaluate_timelogic_relation(
+        self,
+        event_memory,
+        relation: dict[str, Any],
+    ) -> bool | None:
+        left = event_memory.events.get(str(relation.get("left")))
+        right = event_memory.events.get(str(relation.get("right")))
+        if left is None or right is None:
+            return None
+        left_intervals = left.intervals
+        right_intervals = right.intervals
+        operator = str(relation.get("operator") or "").lower()
+        if operator == "imply":
+            if left_intervals and not right_intervals:
+                return False
+            if not left_intervals:
+                return None
+            return bool(right_intervals)
+        if not left_intervals or not right_intervals:
+            return None
+        if operator == "before":
+            if relation.get("quantifier") == "always":
+                return max(item.time_span.end for item in left_intervals) <= min(
+                    item.time_span.start for item in right_intervals
+                )
+            return min(item.time_span.start for item in left_intervals) <= min(
+                item.time_span.start for item in right_intervals
+            )
+        if operator == "overlap":
+            return any(
+                left_interval.time_span.overlaps(right_interval.time_span)
+                for left_interval in left_intervals
+                for right_interval in right_intervals
+            )
+        if operator == "disjoint":
+            return not any(
+                left_interval.time_span.overlaps(right_interval.time_span)
+                for left_interval in left_intervals
+                for right_interval in right_intervals
+            )
+        return None
+
+    def _visual_answer_verification_from_state(
+        self,
+        state: ControllerState,
+        options: dict[str, str],
+    ) -> tuple[str | None, dict[str, Any]] | None:
+        if not self.enable_vrrqa_visual_answer_verifier:
+            return None
+        if self.visual_refiner is None:
+            return None
+        if state.task_type != "multiple_choice_visual_qa":
+            return None
+        source_video_path = state.global_context.get("source_video_path")
+        if not source_video_path:
+            return None
+
+        evidence = self._visual_verifier_evidence(state)
+        if not evidence:
+            return None
+        evidence_ids = [item.evidence_id for item in evidence]
+        cache_key = "|".join(evidence_ids)
+        cached = state.global_context.get("vrrqa_visual_answer_verifier")
+        if isinstance(cached, dict) and cached.get("cache_key") == cache_key:
+            answer = cached.get("answer")
+            metadata = dict(cached.get("metadata", {}))
+            return (answer if isinstance(answer, str) else None), metadata
+
+        prompt = _build_vrrqa_visual_answer_verifier_prompt(
+            question_text=_strip_options_from_question(state.question),
+            option_lines=[f"{letter}. {text}" for letter, text in options.items()],
+            visual_evidence_lines=[
+                json.dumps(
+                    {
+                        "evidence_id": item.evidence_id,
+                        "source_node_id": item.source_node_id,
+                        "time_span": item.time_span.to_dict(),
+                        "relation_evidence_status": item.metadata.get(
+                            "relation_evidence_status"
+                        ),
+                        "co_visible": item.metadata.get("vrrqa_co_visible"),
+                        "co_visible_frame_count": item.metadata.get(
+                            "vrrqa_co_visible_frame_count"
+                        ),
+                        "relation_supported": item.metadata.get("vrrqa_relation_supported"),
+                        "visible_relation": item.metadata.get("vrrqa_visible_relation"),
+                        "spatial_relation": item.metadata.get("vrrqa_spatial_relation"),
+                        "detail": _focus_evidence_detail(item.detail or item.claim, state.question),
+                    },
+                    ensure_ascii=True,
+                )
+                for item in evidence
+            ],
+            requires_co_visible_relation=requires_co_visible_relation(state.question),
+            prompt_plugin=state.global_context.get("benchmark_prompt_plugin"),
+        )
+        verification_span = _merge_evidence_spans(evidence)
+        metadata: dict[str, Any] = {
+            "attempted": True,
+            "evidence_ids": evidence_ids,
+            "verification_span": verification_span.to_dict(),
+        }
+        try:
+            with _temporary_component_prompt_override(
+                self.visual_refiner,
+                prompt,
+            ), _temporary_component_frame_count(
+                self.visual_refiner,
+                self.vrrqa_visual_verifier_frame_count,
+            ):
+                summaries = self.visual_refiner.summarize(
+                    str(source_video_path),
+                    [verification_span],
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
+            metadata.update(
+                {
+                    "answer": None,
+                    "reason": "visual_verifier_failed",
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+            state.global_context["vrrqa_visual_answer_verifier"] = {
+                "cache_key": cache_key,
+                "answer": None,
+                "metadata": metadata,
+            }
+            return None, metadata
+
+        if not summaries:
+            metadata.update({"answer": None, "reason": "empty_visual_verifier_response"})
+            state.global_context["vrrqa_visual_answer_verifier"] = {
+                "cache_key": cache_key,
+                "answer": None,
+                "metadata": metadata,
+            }
+            return None, metadata
+
+        summary = summaries[0]
+        metadata.update(
+            {
+                "reason": "visual_verifier_response",
+                "summary": summary.summary,
+                "summary_metadata": dict(summary.metadata),
+            }
+        )
+        answer = self._supported_visual_verifier_option(summary.metadata, options, state)
+        metadata["answer"] = answer
+        state.global_context["vrrqa_visual_answer_verifier"] = {
+            "cache_key": cache_key,
+            "answer": answer,
+            "metadata": metadata,
+        }
+        return answer, metadata
+
+    def _visual_verifier_evidence(
+        self,
+        state: ControllerState,
+        max_items: int = 3,
+    ) -> list[Evidence]:
+        visual_evidence = [item for item in state.evidence_ledger if item.modality == "visual"]
+        if not visual_evidence:
+            return []
+        allowed_ids: set[str] = set()
+        if state.evidence_board is not None:
+            allowed_ids = set(
+                state.evidence_board.core_evidence_ids + state.evidence_board.support_evidence_ids
+            )
+        filtered = [
+            item
+            for item in visual_evidence
+            if not allowed_ids or item.evidence_id in allowed_ids
+        ]
+        selected = sorted(
+            filtered or visual_evidence,
+            key=lambda item: (-item.confidence, item.time_span.start),
+        )
+        return selected[:max_items]
+
+    def _supported_visual_verifier_option(
+        self,
+        metadata: dict[str, Any],
+        options: dict[str, str],
+        state: ControllerState,
+    ) -> str | None:
+        if _metadata_bool(metadata.get("vrrqa_needs_more_evidence")) is True:
+            return None
+        best_option = metadata.get("vrrqa_best_option")
+        if isinstance(best_option, str):
+            best_option = best_option.strip().upper()[:1]
+        if not isinstance(best_option, str) or best_option not in options:
+            return None
+        if not _option_comparison_supports(metadata.get("vrrqa_option_comparison"), best_option):
+            return None
+        if requires_co_visible_relation(state.question):
+            relation_supported = _metadata_bool(metadata.get("vrrqa_relation_supported"))
+            if relation_supported is not True:
+                return None
+            if not _metadata_has_co_visible_frame(metadata):
+                return None
+        return best_option
+
     def _best_verified_option_from_evidence(
         self,
         state: ControllerState,
         options: dict[str, str],
-    ) -> str | None:
-        verified: list[tuple[float, float, str]] = []
+    ) -> tuple[str | None, dict[str, Any]]:
+        verified: list[tuple[float, float, str, str]] = []
+        aggregate_scores = {letter: 0.0 for letter in options}
         valid_choices = set(options)
+        if _has_duplicate_option_text(options):
+            return None, {"reason": "duplicate_option_text"}
+        requires_relation_evidence = requires_co_visible_relation(state.question)
         for item in state.evidence_ledger:
+            if requires_relation_evidence and item.modality == "visual":
+                relation_status = relation_evidence_status(item)
+                if relation_status != "supported":
+                    continue
             best_option = item.metadata.get("vrrqa_best_option")
-            if not isinstance(best_option, str) or best_option not in valid_choices:
-                continue
-            score = _verified_option_score(best_option, item.metadata.get("vrrqa_option_scores"))
-            verified.append((score, item.confidence, best_option))
+            source = item.evidence_id
+            if isinstance(best_option, str):
+                best_option = best_option.strip().upper()[:1]
+            if isinstance(best_option, str) and best_option in valid_choices:
+                score = _verified_option_score(
+                    best_option,
+                    item.metadata.get("vrrqa_option_scores"),
+                )
+                weighted_score = max(0.0, score) * max(item.confidence, 0.1)
+                aggregate_scores[best_option] += weighted_score
+                verified.append((score, item.confidence, best_option, source))
+
+            text_choice = _evidence_text_choice(item, options)
+            if text_choice is not None:
+                aggregate_scores[text_choice] += 0.35 * max(item.confidence, 0.1)
+                verified.append((0.35, item.confidence, text_choice, source))
         if not verified:
-            return None
-        verified.sort(reverse=True)
-        return verified[0][2]
+            return None, {"reason": "no_verified_option"}
+
+        ranked = sorted(
+            aggregate_scores.items(),
+            key=lambda pair: (-pair[1], pair[0]),
+        )
+        best_letter, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+        if best_score < 0.45 or best_score - second_score < 0.18:
+            return None, {
+                "reason": "weak_or_low_margin_entailment",
+                "option_scores": aggregate_scores,
+            }
+        supporting_evidence_ids = [
+            evidence_id
+            for _score, _confidence, letter, evidence_id in verified
+            if letter == best_letter
+        ]
+        return best_letter, {
+            "option_scores": aggregate_scores,
+            "supporting_evidence_ids": supporting_evidence_ids[:4],
+        }
 
     def _final_answer_evidence_ids(self, state: ControllerState, max_items: int = 4) -> list[str]:
         if state.evidence_board is not None:
@@ -958,6 +2036,254 @@ def _focus_evidence_detail(detail: str, question: str, max_chars: int = 1200) ->
     return best_snippet[:max_chars]
 
 
+def _select_temporally_diverse_initial_nodes(nodes: list[Any], limit: int) -> list[Any]:
+    if not nodes or limit <= 0:
+        return []
+    ordered = sorted(nodes, key=lambda node: (node.time_span.start, node.node_id))
+    if len(ordered) <= limit:
+        return ordered
+    if limit == 1:
+        return [ordered[0]]
+
+    selected_indices: list[int] = []
+    step = (len(ordered) - 1) / float(limit - 1)
+    for position in range(limit):
+        index = int(round(position * step))
+        if index not in selected_indices:
+            selected_indices.append(index)
+    for index in range(len(ordered)):
+        if len(selected_indices) >= limit:
+            break
+        if index not in selected_indices:
+            selected_indices.append(index)
+    selected_indices.sort()
+    return [ordered[index] for index in selected_indices[:limit]]
+
+
+def _timelogic_temporal_sweep_candidates(
+    memory: VideoMemory,
+    limit: int = 80,
+) -> list[dict[str, Any]]:
+    candidates = [
+        node
+        for node in memory.nodes.values()
+        if node.level == "clip" and node.visual_summary.strip()
+    ]
+    candidates = sorted(candidates, key=lambda node: (node.time_span.start, node.node_id))
+    return [
+        {
+            "node_id": node.node_id,
+            "start": node.time_span.start,
+            "end": node.time_span.end,
+        }
+        for node in candidates[:limit]
+    ]
+
+
+def _build_vrrqa_visual_reasoning_prompt(
+    *,
+    question_text: str,
+    option_lines: list[str],
+    visual_evidence_lines: list[str],
+    prompt_plugin: dict[str, Any] | None = None,
+) -> str:
+    plugin_section = render_prompt_plugin_section(prompt_plugin)
+    plugin_lines = ["", plugin_section] if plugin_section else []
+    return "\n".join(
+        [
+            "You are answering a VRR-QA multiple-choice question.",
+            *plugin_lines,
+            "",
+            "Focus on visual implicit reasoning across the video. Pay special attention to:",
+            "- spatial relations: left/right, above/below, near/far, in front/behind",
+            "- viewpoint and visibility",
+            "- motion direction and trajectory",
+            "- temporal order of events",
+            "- entity continuity across frames",
+            "- physical context and implied relationships",
+            "",
+            "Use only the visual evidence provided. Do not use audio, subtitles, or outside knowledge.",
+            "",
+            "First analyze the relevant visual evidence:",
+            "1. Identify the important entities.",
+            "2. Describe their spatial relationships.",
+            "3. Describe any motion, trajectory, or temporal ordering.",
+            "4. Explain what relation must be inferred.",
+            "5. Compare each answer option against the evidence.",
+            "",
+            "For spatial/depth/viewpoint/facing questions, treat evidence as sufficient only when "
+            "the target entities are co-visible in at least one visual frame or keyframe. If the "
+            "evidence says the entities are not visible together, do not choose an option from "
+            "that unsupported relation.",
+            "",
+            "Question:",
+            question_text,
+            "",
+            "Options:",
+            *option_lines,
+            "",
+            "Visual evidence:",
+            *(visual_evidence_lines or ["No direct visual evidence was collected."]),
+            "",
+            "Return your answer in this exact format:",
+            "Reasoning: <concise reasoning>",
+            "Answer: <single option letter>",
+        ]
+    )
+
+
+def _build_vrrqa_visual_answer_verifier_prompt(
+    *,
+    question_text: str,
+    option_lines: list[str],
+    visual_evidence_lines: list[str],
+    requires_co_visible_relation: bool,
+    prompt_plugin: dict[str, Any] | None = None,
+) -> str:
+    relation_requirement = []
+    if requires_co_visible_relation:
+        relation_requirement = [
+            "This question requires a spatial/depth/viewpoint/facing relation.",
+            "Only frames where the target entities are co-visible may vote for the relation.",
+            "If no co-visible frame supports an option, set best_option to null, "
+            "relation_supported to false, and needs_more_evidence to true.",
+        ]
+    plugin_section = render_prompt_plugin_section(prompt_plugin)
+    plugin_lines = ["", plugin_section] if plugin_section else []
+    return "\n".join(
+        [
+            "You are the final visual verifier for a VRR-QA multiple-choice answer.",
+            *plugin_lines,
+            "The images are ordered frames/keyframes sampled from the selected evidence span. "
+            "Use the frame order as temporal order and preserve the original visual layout.",
+            "Use only visible image evidence. Do not use audio, subtitles, captions, or outside "
+            "knowledge.",
+            "",
+            "Required analysis:",
+            "1. Identify the exact target entities from the question.",
+            "2. For each plausible visible candidate, explain why it matches or does not match.",
+            "3. For each frame/keyframe, report whether the target entities are visible and "
+            "co-visible.",
+            "4. For spatial/depth/facing questions, vote only from co-visible frames.",
+            "5. Compare every option as supported, contradicted, or not_enough_evidence.",
+            "",
+            *relation_requirement,
+            "",
+            "Return strict JSON only with these keys:",
+            "`best_option`, `option_scores`, `target_entities`, `candidate_entities`, "
+            "`entity_grounding`, `frame_observations`, `co_visible_frame_indices`, "
+            "`relation_votes`, `vote_counts`, `aggregated_relation`, `entities_visible`, "
+            "`co_visible`, `relation_supported`, `visible_relation`, `spatial_relation`, "
+            "`motion_trajectory`, `temporal_order`, `entity_continuity`, `physical_context`, "
+            "`inferred_relation`, `option_comparison`, `verifier_verdict`, "
+            "`needs_more_evidence`, `evidence`, `summary`, `frame_timeline`, `tags`, "
+            "`entities`.",
+            "`best_option` must be one option letter only if exactly one option is supported; "
+            "otherwise use null.",
+            "`option_comparison` must map each option letter to an object with `verdict` "
+            "(`supported`, `contradicted`, or `not_enough_evidence`) and `reason`.",
+            "`frame_observations` must include one concise object per input frame with "
+            "`frame_index`, `target_entities_visible`, `co_visible`, `entity_grounding`, "
+            "`relation`, `motion`, and `option_support`.",
+            "",
+            "Question:",
+            question_text,
+            "",
+            "Options:",
+            *option_lines,
+            "",
+            "Previously selected visual evidence records:",
+            *(visual_evidence_lines or ["No prior visual evidence records were selected."]),
+        ]
+    )
+
+
+def _merge_evidence_spans(evidence: list[Evidence]) -> TimeSpan:
+    if not evidence:
+        raise ValueError("Cannot merge empty evidence spans")
+    return TimeSpan(
+        start=min(item.time_span.start for item in evidence),
+        end=max(item.time_span.end for item in evidence),
+    )
+
+
+def _metadata_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "supported"}:
+            return True
+        if normalized in {"false", "no", "0", "unsupported"}:
+            return False
+    return None
+
+
+def _metadata_has_co_visible_frame(metadata: dict[str, Any]) -> bool:
+    if _metadata_bool(metadata.get("vrrqa_co_visible")) is True:
+        return True
+    try:
+        if int(metadata.get("vrrqa_co_visible_frame_count", 0)) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    indices = metadata.get("vrrqa_co_visible_frame_indices")
+    return isinstance(indices, list) and bool(indices)
+
+
+def _option_comparison_supports(option_comparison: Any, option: str) -> bool:
+    if not isinstance(option_comparison, dict):
+        return True
+    value = option_comparison.get(option)
+    if value is None:
+        value = option_comparison.get(option.lower())
+    if isinstance(value, str):
+        return value.strip().lower().startswith("support")
+    if isinstance(value, dict):
+        verdict = str(value.get("verdict") or value.get("status") or "").strip().lower()
+        return verdict.startswith("support")
+    return False
+
+
+@contextmanager
+def _temporary_component_prompt_override(component: Any, prompt: str | None):
+    if component is None or prompt is None or not hasattr(component, "prompt_override"):
+        yield
+        return
+
+    original = component.prompt_override
+    component.prompt_override = prompt
+    try:
+        yield
+    finally:
+        component.prompt_override = original
+
+
+@contextmanager
+def _temporary_component_frame_count(component: Any, frame_count: int):
+    if component is None or frame_count <= 0:
+        yield
+        return
+
+    originals: list[tuple[str, Any]] = []
+    for attribute in ("frame_count", "pitome_max_selected_frames"):
+        if not hasattr(component, attribute):
+            continue
+        original = getattr(component, attribute)
+        originals.append((attribute, original))
+        if attribute == "frame_count":
+            current = original if isinstance(original, int) and original > 0 else 0
+            setattr(component, attribute, max(current, frame_count))
+        elif original is not None:
+            current = original if isinstance(original, int) and original > 0 else 0
+            setattr(component, attribute, max(current, frame_count))
+    try:
+        yield
+    finally:
+        for attribute, original in originals:
+            setattr(component, attribute, original)
+
+
 MULTIPLE_CHOICE_OPTION_PATTERN = re.compile(r"^\s*([A-Z])\.\s+(.+?)\s*$")
 MULTIPLE_CHOICE_LETTER_PATTERN = re.compile(
     r"^\s*(?:OPTION\s*)?([A-Z])(?:[\).:]|\s|$)"
@@ -1028,6 +2354,57 @@ def _parse_multiple_choice_letter(response: str, options: dict[str, str]) -> str
         letter
         for letter, option_text in options.items()
         if _normalize_choice_text(option_text) and _normalize_choice_text(option_text) in response_text
+    ]
+    if len(contained) == 1:
+        return contained[0]
+    return None
+
+
+def _choice_for_option_text(options: dict[str, str], expected_text: str) -> str | None:
+    expected = _normalize_choice_text(expected_text)
+    for letter, option_text in options.items():
+        if _normalize_choice_text(option_text) == expected:
+            return letter
+    return None
+
+
+def _has_duplicate_option_text(options: dict[str, str]) -> bool:
+    normalized = [_normalize_choice_text(text) for text in options.values()]
+    normalized = [text for text in normalized if text]
+    return len(normalized) != len(set(normalized))
+
+
+def _evidence_text_choice(item: Evidence, options: dict[str, str]) -> str | None:
+    text = " ".join(
+        str(part)
+        for part in (
+            item.metadata.get("vrrqa_evidence"),
+            item.metadata.get("vrrqa_visible_relation"),
+            item.metadata.get("vrrqa_spatial_relation"),
+            item.detail,
+            item.claim,
+        )
+        if part
+    )
+    explicit_match = re.search(
+        r"\b(?:best\s+option|selected\s+option|final\s+answer|answer|choice)\s*"
+        r"(?:is|=|:)?\s*\(?([A-Z])\)?\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if explicit_match is not None:
+        letter = explicit_match.group(1).upper()
+        if letter in options:
+            return letter
+
+    lowered = text.lower()
+    if not any(cue in lowered for cue in ("best option", "answer", "therefore", "supports")):
+        return None
+    evidence_text = _normalize_choice_text(text)
+    contained = [
+        letter
+        for letter, option_text in options.items()
+        if _normalize_choice_text(option_text) and _normalize_choice_text(option_text) in evidence_text
     ]
     if len(contained) == 1:
         return contained[0]

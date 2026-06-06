@@ -448,6 +448,24 @@ class VideoMemoryIndex:
             edge_weight = 0.3 + (similarity * 0.2)
             neighbors.append((neighbor_id, edge_weight, f"semantic-frame-edge:{similarity:.2f}"))
 
+        for neighbor_id in node.metadata.get("cognitive_event_neighbor_ids", []):
+            if neighbor_id in self.memory.nodes:
+                neighbors.append((str(neighbor_id), 0.42, "cognitive-event-neighbor"))
+
+        for key, weight, reason in (
+            ("same_actor_event_ids", 0.38, "same-actor"),
+            ("same_object_event_ids", 0.36, "same-object"),
+            ("same_place_event_ids", 0.3, "same-place"),
+            ("same_topic_event_ids", 0.32, "same-topic"),
+            ("cause_effect_event_ids", 0.44, "cause-effect"),
+            ("caused_by_event_ids", 0.4, "caused-by"),
+            ("goal_continuation_event_ids", 0.34, "goal-continuation"),
+            ("goal_predecessor_event_ids", 0.32, "goal-predecessor"),
+        ):
+            for neighbor_id in node.metadata.get(key, []):
+                if neighbor_id in self.memory.nodes:
+                    neighbors.append((str(neighbor_id), weight, reason))
+
         return self._dedupe_graph_neighbors(neighbors, node_id)
 
     def _add_frame_similarity_candidates(
@@ -827,14 +845,10 @@ class VideoMemoryIndex:
         node_id: str,
     ) -> tuple[float, list[str]]:
         node = self.memory.get_node(node_id)
-        text = " ".join(
-            [
-                " ".join(item.text for item in node.ocr_spans),
-                " ".join(str(item) for item in node.metadata.get("visual_atoms", [])),
-                " ".join(str(item) for item in node.metadata.get("visual_keywords", [])),
-            ]
-        )
-        return self._lexical_score(query_lower, query_tokens, text)
+        units = self._ocr_text_units(node)
+        units.extend(str(item) for item in node.metadata.get("visual_atoms", []))
+        units.extend(str(item) for item in node.metadata.get("visual_keywords", []))
+        return self._max_unit_lexical_score(query_lower, query_tokens, units)
 
     def _nearby_audio_score(
         self,
@@ -885,6 +899,7 @@ class VideoMemoryIndex:
         if modality in GRAPH_MODALITIES:
             return {
                 "clip": 0.18,
+                "event": 0.14,
                 "segment": 0.06,
                 "scene": -0.04,
                 "video": -0.1,
@@ -894,9 +909,10 @@ class VideoMemoryIndex:
     def _graph_level_rank(self, level: VideoNodeLevel) -> int:
         return {
             "clip": 0,
-            "segment": 1,
-            "scene": 2,
-            "video": 3,
+            "event": 1,
+            "segment": 2,
+            "scene": 3,
+            "video": 4,
         }.get(level, 4)
 
     def _build_graph_reason(
@@ -932,17 +948,26 @@ class VideoMemoryIndex:
 
         best_hit: SearchHit | None = None
         for current_modality in modalities:
-            text = self._node_text(node, current_modality)
+            if current_modality == "ocr":
+                text = self._ocr_semantic_text(node)
+                lexical_score, overlap = self._ocr_lexical_score(query_lower, query_tokens, node)
+            else:
+                text = self._node_text(node, current_modality)
+                lexical_score, overlap = self._lexical_score(query_lower, query_tokens, text)
             if not text:
                 continue
 
-            lexical_score, overlap = self._lexical_score(query_lower, query_tokens, text)
             semantic_score = self._semantic_score(query, text)
             temporal_score = self._temporal_score(query_tokens, node.time_span)
-            if lexical_score <= 0 and semantic_score <= 0:
+            section_score = self._section_score(query_lower, query_tokens, node)
+            if lexical_score <= 0 and semantic_score <= 0 and section_score <= 0:
                 continue
 
-            score = self._combine_scores(lexical_score, semantic_score, temporal_score)
+            score = round(
+                self._combine_scores(lexical_score, semantic_score, temporal_score)
+                + section_score,
+                4,
+            )
             reason = self._build_reason(
                 modality=current_modality,
                 node_id=node.node_id,
@@ -950,6 +975,7 @@ class VideoMemoryIndex:
                 lexical_score=lexical_score,
                 semantic_score=semantic_score,
                 temporal_score=temporal_score,
+                section_score=section_score,
             )
             hit = SearchHit(
                 node_id=node.node_id,
@@ -963,6 +989,7 @@ class VideoMemoryIndex:
                     "lexical": lexical_score,
                     "semantic": semantic_score,
                     "temporal": temporal_score,
+                    "section": section_score,
                     "combined": score,
                 },
             )
@@ -981,13 +1008,127 @@ class VideoMemoryIndex:
                 " ".join(node.entities),
                 " ".join(str(item) for item in node.metadata.get("visual_keywords", [])),
                 " ".join(str(item) for item in node.metadata.get("visual_atoms", [])),
+                self._event_schema_text(node.metadata.get("event_schema")),
             ]
             return " ".join(part for part in parts if part)
         if modality == "ocr":
-            return " ".join(item.text for item in node.ocr_spans)
+            return self._ocr_semantic_text(node)
         if modality == "audio":
             return " ".join(item.label for item in node.audio_events)
         return ""
+
+    def _ocr_text_units(self, node) -> list[str]:
+        seen: set[str] = set()
+        units: list[str] = []
+        for span in node.ocr_spans:
+            for raw_line in re.split(r"[\n\r]+", span.text):
+                line = " ".join(raw_line.split()).strip()
+                if not line:
+                    continue
+                if len(line) > 260:
+                    units.extend(self._ocr_long_line_units(line))
+                    continue
+                key = self._ocr_unit_key(line)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                units.append(line)
+        return units
+
+    def _ocr_long_line_units(self, line: str) -> list[str]:
+        code_matches = [
+            " ".join(match.group(0).split())
+            for match in re.finditer(
+                r"\b[A-Za-z_]\w*\s*=\s*(?:[A-Za-z_]\w*|\d+(?:\.\d+)?)"
+                r"(?:\s*(?:==|!=|>=|<=|>|<|\+|\-|\*|/)\s*"
+                r"(?:[A-Za-z_]\w*|\d+(?:\.\d+)?))?",
+                line,
+            )
+        ]
+        if code_matches:
+            return code_matches
+        return [line[:260]]
+
+    def _ocr_unit_key(self, line: str) -> str:
+        return re.sub(r"\W+", "", line.casefold())
+
+    def _ocr_semantic_text(self, node) -> str:
+        return " ".join(self._ocr_text_units(node)[:60])
+
+    def _ocr_lexical_score(
+        self,
+        query_lower: str,
+        query_tokens: set[str],
+        node,
+    ) -> tuple[float, list[str]]:
+        units = self._ocr_text_units(node)
+        if not units:
+            return 0.0, []
+        unit_score, unit_overlap = self._max_unit_lexical_score(query_lower, query_tokens, units)
+        combined_tokens = set()
+        for unit in units:
+            combined_tokens.update(self._tokenize(unit))
+        coverage_overlap = sorted(query_tokens & combined_tokens)
+        coverage_score = 0.0
+        if coverage_overlap:
+            coverage_score = min(0.55, 0.55 * len(coverage_overlap) / max(len(query_tokens), 1))
+        score = max(unit_score, coverage_score)
+        total_chars = sum(len(unit) for unit in units)
+        length_penalty = min(0.18, max(0, total_chars - 1200) / 6000)
+        score = max(0.0, score - length_penalty)
+        overlap = unit_overlap if unit_score >= coverage_score else coverage_overlap
+        return round(score, 4), overlap
+
+    def _max_unit_lexical_score(
+        self,
+        query_lower: str,
+        query_tokens: set[str],
+        units: Iterable[str],
+    ) -> tuple[float, list[str]]:
+        best_score = 0.0
+        best_overlap: list[str] = []
+        for unit in units:
+            doc_tokens = self._tokenize(unit)
+            overlap = sorted(query_tokens & doc_tokens)
+            if not overlap:
+                continue
+            overlap_ratio = len(overlap) / max(len(query_tokens), 1)
+            phrase_bonus = 0.25 if query_lower in unit.lower() else 0.0
+            compactness_bonus = min(0.15, len(overlap) / max(len(doc_tokens), 1))
+            length_penalty = min(0.12, max(0, len(unit) - 180) / 1200)
+            score = min(1.0, overlap_ratio + phrase_bonus + compactness_bonus)
+            score = max(0.0, score - length_penalty)
+            if score > best_score:
+                best_score = score
+                best_overlap = overlap
+        return round(best_score, 4), best_overlap
+
+    def _event_schema_text(self, schema: Any) -> str:
+        if not isinstance(schema, dict):
+            return ""
+        parts: list[str] = []
+        for key in (
+            "place",
+            "actors",
+            "objects",
+            "actions",
+            "goals_or_intentions",
+            "goal_predecessors",
+            "goal_successors",
+            "causal_predecessors",
+            "causal_outcomes",
+            "spoken_topics",
+            "ocr_entities",
+            "visual_state",
+            "audio_state",
+            "event_type",
+        ):
+            value = schema.get(key)
+            if isinstance(value, list):
+                parts.extend(str(item) for item in value)
+            elif isinstance(value, str):
+                parts.append(value)
+        return " ".join(parts)
 
     def _lexical_score(
         self,
@@ -1034,6 +1175,7 @@ class VideoMemoryIndex:
         lexical_score: float,
         semantic_score: float,
         temporal_score: float,
+        section_score: float = 0.0,
     ) -> str:
         parts = []
         if overlap:
@@ -1042,6 +1184,8 @@ class VideoMemoryIndex:
             parts.append(f"semantic similarity {semantic_score:.2f}")
         if temporal_score > 0:
             parts.append(f"temporal prior {temporal_score:.2f}")
+        if section_score > 0:
+            parts.append(f"section prior {section_score:.2f}")
         if not parts:
             parts.append(f"Matched {modality} content")
         return f"{'; '.join(parts)} in node {node_id}"
@@ -1063,6 +1207,98 @@ class VideoMemoryIndex:
             return round(score * 0.3, 4)
 
         return 0.0
+
+    def _section_score(self, query_lower: str, query_tokens: set[str], node) -> float:
+        section_tags = set(self._node_section_tags(node))
+        if not section_tags:
+            return 0.0
+        score = 0.0
+        if "third segment" in query_lower and "third_segment" in section_tags:
+            score += 0.26
+        if "second segment" in query_lower and "second_segment" in section_tags:
+            score += 0.22
+        if "first segment" in query_lower and "first_segment" in section_tags:
+            score += 0.22
+        if "second half" in query_lower and "second_half" in section_tags:
+            score += 0.24
+        if "arithmetic" in query_tokens and "arithmetic_section" in section_tags:
+            score += 0.24
+        if "assignment" in query_tokens and "assignment_section" in section_tags:
+            score += 0.22
+        if "comparison" in query_tokens and "comparison_section" in section_tags:
+            score += 0.24
+        if ({"logical", "boolean"} & query_tokens) and "logical_evaluation_section" in section_tags:
+            score += 0.18
+        if "before" in query_tokens and "comparison" in query_tokens:
+            if "pre_comparison_section" in section_tags:
+                score += 0.18
+            if "comparison_section" in section_tags:
+                score -= 0.12
+        return round(max(0.0, min(score, 0.36)), 4)
+
+    def _node_section_tags(self, node) -> list[str]:
+        metadata_tags = [str(tag) for tag in node.metadata.get("section_tags", [])]
+        if metadata_tags:
+            return metadata_tags
+        tags: list[str] = []
+        duration = float(self.memory.metadata.get("duration_seconds") or 0.0)
+        if duration > 0:
+            midpoint = duration / 2.0
+            if node.time_span.end > midpoint:
+                tags.append("second_half")
+            if node.time_span.start < midpoint:
+                tags.append("first_half")
+            segment_duration = float(self.memory.metadata.get("segment_duration_seconds") or 0.0)
+            if segment_duration > 0 and node.level in {"segment", "event", "clip"}:
+                start_index = int(max(0.0, node.time_span.start) // segment_duration) + 1
+                end_time = max(node.time_span.start, min(duration, node.time_span.end) - 1e-6)
+                end_index = int(end_time // segment_duration) + 1
+                for index in range(max(1, start_index), max(start_index, end_index) + 1):
+                    tags.append(f"segment_{index}")
+                    ordinal = {
+                        1: "first_segment",
+                        2: "second_segment",
+                        3: "third_segment",
+                        4: "fourth_segment",
+                        5: "fifth_segment",
+                    }.get(index)
+                    if ordinal:
+                        tags.append(ordinal)
+        text = " ".join(
+            [
+                node.visual_summary,
+                " ".join(span.text for span in node.speech_spans),
+                " ".join(span.text for span in node.ocr_spans),
+            ]
+        )
+        lowered = text.lower()
+        if re.search(r"\b[A-Za-z_]\w*\s*=", text) or "python script" in lowered:
+            tags.append("code_section")
+        if "assignment operator" in lowered or "variables" in lowered or re.search(r"\b[x-z]\s*=", text):
+            tags.append("assignment_section")
+        if "arithmetic operator" in lowered or re.search(r"=\s*[^=<>!]*(?:\+|\-|\*|/)", text):
+            tags.append("arithmetic_section")
+        if "comparison operator" in lowered or any(
+            operator in text for operator in ("==", "!=", ">=", "<=", ">", "<")
+        ):
+            tags.append("comparison_section")
+        if any(
+            cue in lowered
+            for cue in ("equal to", "not equal", "greater than", "less than", "boolean")
+        ):
+            tags.append("logical_evaluation_section")
+        if ("assignment_section" in tags or "arithmetic_section" in tags) and (
+            "comparison_section" not in tags
+        ):
+            tags.append("pre_comparison_section")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            if tag in seen:
+                continue
+            seen.add(tag)
+            deduped.append(tag)
+        return deduped
 
     def _embed_cached(self, cache_key: tuple[str, str], text: str) -> list[float]:
         if cache_key not in self._embedding_cache:

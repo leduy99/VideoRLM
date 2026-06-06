@@ -66,6 +66,38 @@ def load_longshot_samples(
     return samples
 
 
+def _longshot_user_turn_context(turn: dict[str, Any]) -> dict[str, Any]:
+    return _drop_none_values(
+        {
+            "expected_modalities": turn.get("modalities"),
+            "required_tools": turn.get("required_tools"),
+            "difficulty": turn.get("difficulty"),
+            "conversation_role": turn.get("conversation_role"),
+        }
+    )
+
+
+def _longshot_global_context(
+    sample: dict[str, Any],
+    turn_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    context = _drop_none_values(
+        {
+            "sample_id": sample.get("sample_id"),
+            "video_id": sample.get("video_id"),
+            "task": sample.get("task"),
+            "sample_type": sample.get("sample_type"),
+            "scenario": sample.get("scenario"),
+            **(turn_context or {}),
+        }
+    )
+    return {"benchmark": "longshotbench", "longshot": context}
+
+
+def _drop_none_values(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value is not None}
+
+
 class LongShOTVideoResolver:
     def __init__(
         self,
@@ -367,6 +399,7 @@ class LongShOTBenchmarkRunner:
         dialogue_context: list[dict[str, str]] = []
         turn_results: list[dict[str, Any]] = []
         pending_question: str | None = None
+        pending_turn_context: dict[str, Any] | None = None
 
         for index, turn in enumerate(payload.get("conversations", [])):
             role = turn.get("role")
@@ -375,6 +408,7 @@ class LongShOTBenchmarkRunner:
 
             if role == "user":
                 pending_question = content
+                pending_turn_context = _longshot_user_turn_context(turn)
                 dialogue_context.append({"role": "user", "content": content})
                 self._log(f"user question queued={_truncate_for_log(content)}")
                 continue
@@ -412,6 +446,10 @@ class LongShOTBenchmarkRunner:
                 dialogue_context=list(dialogue_context),
                 task_type=payload.get("task"),
                 progress_callback=progress_callback,
+                global_context_overrides=_longshot_global_context(
+                    payload,
+                    pending_turn_context,
+                ),
             )
             self._log(
                 f"VideoRLM run done sample_id={sample_id} turn={index} "
@@ -438,6 +476,7 @@ class LongShOTBenchmarkRunner:
             assistant_history = content if self.history_mode == "gold" else result.answer
             dialogue_context.append({"role": "assistant", "content": assistant_history})
             pending_question = None
+            pending_turn_context = None
 
         payload["video_rlm_metadata"] = {
             "video_path": str(video_path) if video_path is not None else None,

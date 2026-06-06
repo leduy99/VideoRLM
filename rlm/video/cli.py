@@ -11,10 +11,15 @@ from rlm.video.longshot import (
 )
 from rlm.video.longshot_official_eval import (
     LongShOTOfficialEvalConfig,
+    evaluate_predictions_answer_only,
     evaluate_predictions_official_style,
 )
 from rlm.video.memory import VideoMemoryBuilder
-from rlm.video.qwen import QwenLocalVideoStackConfig, QwenVideoStackConfig
+from rlm.video.qwen import (
+    OpenAICompatibleModelConfig,
+    QwenLocalVideoStackConfig,
+    QwenVideoStackConfig,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -214,6 +219,11 @@ def build_parser() -> argparse.ArgumentParser:
     official_eval.add_argument("--attn-implementation")
     official_eval.add_argument("--max-new-tokens", type=int, default=96)
     official_eval.add_argument("--sample-limit", type=int)
+    official_eval.add_argument(
+        "--answer-only",
+        action="store_true",
+        help="Judge only final-answer correctness instead of every official rubric criterion.",
+    )
 
     return parser
 
@@ -397,9 +407,14 @@ def _cmd_eval_longshot_official(args: argparse.Namespace) -> int:
         max_new_tokens=args.max_new_tokens,
         sample_limit=args.sample_limit,
     )
-    result = evaluate_predictions_official_style(config)
+    if args.answer_only:
+        result = evaluate_predictions_answer_only(config)
+        mode = "answer-only"
+    else:
+        result = evaluate_predictions_official_style(config)
+        mode = "official-style"
     print(
-        "Saved official-style eval to "
+        f"Saved {mode} eval to "
         f"{config.eval_path} with overall accuracy {result.overall_accuracy * 100:.2f}%"
     )
     return 0
@@ -473,16 +488,90 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
             "semantic_frame_embedding_torch_dtype",
             "float32",
         ),
+        video_window_embedding_model=(
+            getattr(args, "video_window_reranker_repo", None)
+            if getattr(args, "enable_video_window_reranking", False)
+            else None
+        ),
+        video_window_embedding_device=getattr(
+            args,
+            "video_window_reranker_device",
+            "cuda:0",
+        ),
+        video_window_embedding_torch_dtype=getattr(
+            args,
+            "video_window_reranker_torch_dtype",
+            "float32",
+        ),
         torch_dtype=args.torch_dtype,
         attn_implementation=args.attn_implementation,
     )
+    controller_model_path = getattr(args, "controller_model_path", None)
+    if controller_model_path:
+        config.controller.model_path = controller_model_path
+    controller_max_new_tokens = getattr(args, "controller_max_new_tokens", None)
+    if controller_max_new_tokens is not None:
+        config.controller.max_new_tokens = controller_max_new_tokens
+    if getattr(args, "controller_trust_remote_code", False):
+        config.controller.trust_remote_code = True
+    controller_api_base_url = getattr(args, "controller_api_base_url", None)
+    controller_api_model = getattr(args, "controller_api_model", None)
+    if controller_api_base_url or controller_api_model:
+        if not controller_api_base_url or not controller_api_model:
+            raise ValueError(
+                "--controller-api-base-url and --controller-api-model must be set together"
+            )
+        completion_kwargs = {}
+        controller_api_max_tokens = getattr(args, "controller_api_max_tokens", None)
+        if controller_api_max_tokens is not None:
+            completion_kwargs["max_tokens"] = controller_api_max_tokens
+        extra_client_kwargs = (
+            {"completion_kwargs": completion_kwargs} if completion_kwargs else None
+        )
+        config.api_controller = OpenAICompatibleModelConfig(
+            model_name=controller_api_model,
+            base_url=controller_api_base_url,
+            api_key=getattr(args, "controller_api_key", None),
+            timeout=getattr(args, "controller_api_timeout", 300.0),
+            extra_client_kwargs=extra_client_kwargs,
+        )
     semantic_model_path = getattr(args, "semantic_frame_embedding_model_path", None)
     if config.semantic_frame_embedding is not None and semantic_model_path:
         config.semantic_frame_embedding.model_path = semantic_model_path
+    video_window_model_path = getattr(args, "video_window_reranker_model_path", None)
+    if config.video_window_embedding is not None and video_window_model_path:
+        config.video_window_embedding.model_path = video_window_model_path
     config.semantic_frame_embedding_batch_size = getattr(
         args,
         "semantic_frame_embedding_batch_size",
         8,
+    )
+    config.enable_video_window_reranking = getattr(
+        args,
+        "enable_video_window_reranking",
+        False,
+    )
+    config.video_window_rerank_candidate_count = getattr(
+        args,
+        "video_window_rerank_candidate_count",
+        24,
+    )
+    config.video_window_rerank_weight = getattr(args, "video_window_rerank_weight", 0.75)
+    config.video_window_rerank_window_seconds = getattr(
+        args,
+        "video_window_rerank_window_seconds",
+        None,
+    )
+    config.video_window_rerank_min_score = getattr(args, "video_window_rerank_min_score", None)
+    config.video_window_embedding_frame_count = getattr(
+        args,
+        "video_window_reranker_frame_count",
+        8,
+    )
+    config.video_window_embedding_frame_size = getattr(
+        args,
+        "video_window_reranker_frame_size",
+        224,
     )
     config.ffmpeg_bin = getattr(args, "ffmpeg_bin", "ffmpeg")
     config.frame_count = getattr(args, "frame_count", 3)
@@ -503,6 +592,46 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     )
     config.lazy_speech_refinement = getattr(args, "lazy_speech_refinement", False)
     config.lazy_visual_refinement = getattr(args, "lazy_visual_refinement", False)
+    config.enable_paddle_ocr = getattr(args, "enable_paddle_ocr", False)
+    config.paddle_ocr_lang = getattr(args, "paddle_ocr_lang", "en")
+    config.paddle_ocr_version = getattr(args, "paddle_ocr_version", "PP-OCRv5")
+    config.paddle_ocr_device = getattr(args, "paddle_ocr_device", None)
+    config.paddle_ocr_window_seconds = getattr(args, "paddle_ocr_window_seconds", 45.0)
+    config.paddle_ocr_frame_count = getattr(args, "paddle_ocr_frame_count", 6)
+    config.paddle_ocr_frame_width = getattr(args, "paddle_ocr_frame_width", 960)
+    config.paddle_ocr_min_confidence = getattr(args, "paddle_ocr_min_confidence", 0.35)
+    config.paddle_ocr_enable_mkldnn = getattr(args, "paddle_ocr_enable_mkldnn", False)
+    config.paddle_ocr_cache_dir = getattr(args, "paddle_ocr_cache_dir", None)
+    config.paddle_ocr_frame_extraction_strategy = getattr(
+        args,
+        "paddle_ocr_frame_extraction_strategy",
+        "seek",
+    )
+    config.paddle_ocr_frame_extraction_workers = getattr(
+        args,
+        "paddle_ocr_frame_extraction_workers",
+        1,
+    )
+    config.paddle_ocr_text_detection_model_name = getattr(
+        args,
+        "paddle_ocr_text_detection_model_name",
+        None,
+    )
+    config.paddle_ocr_text_recognition_model_name = getattr(
+        args,
+        "paddle_ocr_text_recognition_model_name",
+        None,
+    )
+    config.paddle_ocr_text_recognition_batch_size = getattr(
+        args,
+        "paddle_ocr_text_recognition_batch_size",
+        None,
+    )
+    config.enable_controller_evidence_classifier = getattr(
+        args,
+        "enable_controller_evidence_classifier",
+        False,
+    )
     config.controller_enable_thinking = False
     config.verbose = getattr(args, "verbose", False)
     _apply_visual_preprocessing_args(config, args)
@@ -588,6 +717,12 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
         help="Use decoder keyframes only for faster PiToMe scene-boundary detection.",
     )
     parser.add_argument(
+        "--visual-index-batch-size",
+        type=int,
+        default=1,
+        help="Number of lazy visual-index spans to batch for semantic frame embedding.",
+    )
+    parser.add_argument(
         "--parent-visual-summary-mode",
         choices=["auto", "full", "compact"],
         default="auto",
@@ -634,6 +769,7 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
     scene_sample_rate = getattr(args, "pitome_scene_sample_rate", 1.0)
     config.pitome_scene_sample_rate = None if scene_sample_rate == 0 else scene_sample_rate
     config.pitome_scene_keyframes_only = getattr(args, "pitome_scene_keyframes_only", True)
+    config.visual_index_batch_size = getattr(args, "visual_index_batch_size", 1)
     parent_mode = getattr(args, "parent_visual_summary_mode", "auto")
     config.parent_visual_summary_mode = None if parent_mode == "auto" else parent_mode
     search_mode = getattr(args, "search_mode", "auto")
@@ -663,6 +799,17 @@ def _resolve_parent_visual_summary_mode(args: argparse.Namespace) -> str:
 
 def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--controller-repo", default="Qwen/Qwen3-8B")
+    parser.add_argument("--controller-model-path")
+    parser.add_argument("--controller-max-new-tokens", type=int)
+    parser.add_argument("--controller-trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--controller-api-base-url",
+        help="Use an OpenAI-compatible API controller instead of the local controller.",
+    )
+    parser.add_argument("--controller-api-key")
+    parser.add_argument("--controller-api-model")
+    parser.add_argument("--controller-api-max-tokens", type=int)
+    parser.add_argument("--controller-api-timeout", type=float, default=300.0)
     parser.add_argument("--visual-repo", default="Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--speech-repo", default="Qwen/Qwen3-ASR-0.6B")
     parser.add_argument("--forced-aligner-repo", default="Qwen/Qwen3-ForcedAligner-0.6B")
@@ -714,6 +861,41 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--enable-paddle-ocr",
+        action="store_true",
+        help="Run lightweight PaddleOCR over sampled video frames and index exact screen text.",
+    )
+    parser.add_argument("--paddle-ocr-lang", default="en")
+    parser.add_argument("--paddle-ocr-version", default="PP-OCRv5")
+    parser.add_argument("--paddle-ocr-device", default=None)
+    parser.add_argument("--paddle-ocr-window-seconds", type=float, default=45.0)
+    parser.add_argument("--paddle-ocr-frame-count", type=int, default=6)
+    parser.add_argument("--paddle-ocr-frame-width", type=int, default=960)
+    parser.add_argument("--paddle-ocr-min-confidence", type=float, default=0.35)
+    parser.add_argument(
+        "--paddle-ocr-enable-mkldnn",
+        action="store_true",
+        help="Enable Paddle MKLDNN/oneDNN for OCR. Disabled by default due runtime crashes.",
+    )
+    parser.add_argument("--paddle-ocr-cache-dir")
+    parser.add_argument(
+        "--paddle-ocr-frame-extraction-strategy",
+        choices=["auto", "batch", "seek", "sequence"],
+        default="seek",
+    )
+    parser.add_argument("--paddle-ocr-frame-extraction-workers", type=int, default=1)
+    parser.add_argument("--paddle-ocr-text-detection-model-name")
+    parser.add_argument("--paddle-ocr-text-recognition-model-name")
+    parser.add_argument("--paddle-ocr-text-recognition-batch-size", type=int)
+    parser.add_argument(
+        "--enable-controller-evidence-classifier",
+        action="store_true",
+        help=(
+            "Use the controller LLM to classify opened evidence as "
+            "core/support/background/noise before filling evidence slots."
+        ),
+    )
+    parser.add_argument(
         "--semantic-frame-embedding-repo",
         help=(
             "Optional local image-text embedding model for PiToMe selected frames, "
@@ -724,6 +906,28 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--semantic-frame-embedding-device", default="cpu")
     parser.add_argument("--semantic-frame-embedding-torch-dtype", default="float32")
     parser.add_argument("--semantic-frame-embedding-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--enable-video-window-reranking",
+        action="store_true",
+        help=(
+            "Enable stage-2 video-window reranking after SigLIP/semantic first-stage "
+            "retrieval."
+        ),
+    )
+    parser.add_argument(
+        "--video-window-reranker-repo",
+        default="OpenGVLab/InternVideo2-Stage2_6B",
+        help="Local InternVideo stage-2 embedding model used for window reranking.",
+    )
+    parser.add_argument("--video-window-reranker-model-path")
+    parser.add_argument("--video-window-reranker-device", default="cuda:0")
+    parser.add_argument("--video-window-reranker-torch-dtype", default="float32")
+    parser.add_argument("--video-window-reranker-frame-count", type=int, default=8)
+    parser.add_argument("--video-window-reranker-frame-size", type=int, default=224)
+    parser.add_argument("--video-window-rerank-candidate-count", type=int, default=24)
+    parser.add_argument("--video-window-rerank-weight", type=float, default=0.75)
+    parser.add_argument("--video-window-rerank-window-seconds", type=float)
+    parser.add_argument("--video-window-rerank-min-score", type=float)
 
 
 if __name__ == "__main__":

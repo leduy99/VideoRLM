@@ -3,11 +3,14 @@ from rlm.video.adapters import (
     CallableEmbeddingProvider,
     CallableOCRExtractor,
     CallableSpeechRecognizer,
+    CallableVideoWindowEmbeddingProvider,
     CallableVisualSummarizer,
+    GeminiVisualSummarizer,
     ImageTextEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
     OpenAICompatibleSpeechRecognizer,
     OpenAICompatibleVisualSummarizer,
+    VideoWindowEmbeddingProvider,
 )
 from rlm.video.artifact_store import PreparedArtifactStore
 from rlm.video.controller import VideoRLM
@@ -28,7 +31,11 @@ from rlm.video.longshot import (
     load_longshot_samples,
 )
 from rlm.video.memory import PreparedVideoArtifacts, VideoMemoryBuilder
-from rlm.video.semantic_embeddings import LocalImageTextEmbeddingProvider
+from rlm.video.rerankers import VideoWindowReranker
+from rlm.video.semantic_embeddings import (
+    LocalImageTextEmbeddingProvider,
+    LocalInternVideoWindowEmbeddingProvider,
+)
 from rlm.video.traces import result_to_training_examples, save_training_examples
 from rlm.video.types import (
     ActionType,
@@ -107,6 +114,7 @@ __all__ = [
     "CallableEmbeddingProvider",
     "CallableOCRExtractor",
     "CallableSpeechRecognizer",
+    "CallableVideoWindowEmbeddingProvider",
     "CallableVisualSummarizer",
     "ControllerAction",
     "ControllerState",
@@ -115,6 +123,7 @@ __all__ = [
     "EvidenceBoardSlot",
     "EvidenceSlotSpec",
     "FrontierItem",
+    "GeminiVisualSummarizer",
     "LongShOTBenchmarkRunner",
     "LongShOTVideoResolver",
     "Modality",
@@ -122,6 +131,7 @@ __all__ = [
     "Observation",
     "OpenedTarget",
     "ImageTextEmbeddingProvider",
+    "LocalInternVideoWindowEmbeddingProvider",
     "OpenAICompatibleEmbeddingProvider",
     "OpenAICompatibleModelConfig",
     "OpenAICompatibleSpeechRecognizer",
@@ -146,6 +156,8 @@ __all__ = [
     "VideoRLM",
     "VideoRLMLogger",
     "VideoRLMResult",
+    "VideoWindowEmbeddingProvider",
+    "VideoWindowReranker",
     "VisualSummarySpan",
     "default_local_model_dir",
     "download_snapshot",

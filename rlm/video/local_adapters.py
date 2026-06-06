@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import difflib
 import json
+import os
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -24,12 +27,14 @@ from rlm.video.media import (
 from rlm.video.pitome import (
     FrameSelectionResult,
     compact_frame_embedding,
+    compute_memorability_prior,
+    filter_cognitive_anchor_metadata,
     fuse_frame_embeddings_with_semantic,
     limit_frame_selection_by_temporal_coverage,
     load_frame_embeddings,
     select_visual_frames_for_span,
 )
-from rlm.video.types import SpeechSpan, TimeSpan, VideoNodeLevel, VisualSummarySpan
+from rlm.video.types import OCRSpan, SpeechSpan, TimeSpan, VideoNodeLevel, VisualSummarySpan
 
 
 @dataclass
@@ -334,6 +339,7 @@ class LocalQwenVisualSummarizer:
     summary_granularity: VideoNodeLevel | None = None
     prompt_override: str | None = None
     forced_frame_timestamps_override: list[float] | None = None
+    vl_max_input_frames: int | None = None
     vl_retry_frame_count: int = 4
     verbose: bool = False
     progress_callback: Callable[[dict[str, Any]], None] | None = None
@@ -346,7 +352,17 @@ class LocalQwenVisualSummarizer:
             total=len(spans),
             status=f"visual 0/{len(spans)}",
         )
+        self._notify_progress(
+            phase="visual",
+            event="status",
+            status="visual loading model",
+        )
         model, processor = self._ensure_loaded()
+        self._notify_progress(
+            phase="visual",
+            event="status",
+            status="visual model ready",
+        )
         output_root = get_videorlm_output_root() / "tmp"
         output_root.mkdir(parents=True, exist_ok=True)
         summaries: list[VisualSummarySpan] = []
@@ -361,6 +377,11 @@ class LocalQwenVisualSummarizer:
                 frame_dir = temp_dir / f"span_{index:03d}"
                 frame_paths, frame_metadata = self._select_frames(video_path, span, frame_dir)
                 self._log(f"visual span {index}/{len(spans)} selected_frames={len(frame_paths)}")
+                self._notify_progress(
+                    phase="visual",
+                    event="status",
+                    status=f"visual generate {index}/{len(spans)} frames={len(frame_paths)}",
+                )
                 output_text, frame_metadata = self._generate_with_frame_retry(
                     model=model,
                     processor=processor,
@@ -405,6 +426,8 @@ class LocalQwenVisualSummarizer:
         span: TimeSpan,
         metadata: dict[str, Any],
     ) -> tuple[str, dict[str, Any]]:
+        original_frame_count = len(frame_paths)
+        frame_paths = self._limit_vl_input_frames(frame_paths)
         attempts = [frame_paths]
         retry_paths = self._temporal_frame_subset(frame_paths, self.vl_retry_frame_count)
         if len(retry_paths) < len(frame_paths):
@@ -417,9 +440,13 @@ class LocalQwenVisualSummarizer:
         for attempt_index, attempt_paths in enumerate(attempts):
             attempt_metadata = dict(metadata)
             attempt_metadata["vl_input_frame_count"] = len(attempt_paths)
+            if len(frame_paths) < original_frame_count:
+                attempt_metadata["vl_input_frame_limited"] = True
+                attempt_metadata["vl_input_frame_limit"] = self.vl_max_input_frames
+                attempt_metadata["vl_original_frame_count"] = original_frame_count
             if attempt_index > 0:
                 attempt_metadata["vl_retry_reason"] = "frame_batch_reduced"
-                attempt_metadata["vl_original_frame_count"] = len(frame_paths)
+                attempt_metadata.setdefault("vl_original_frame_count", len(frame_paths))
                 self._log(
                     "VL retry with fewer frames "
                     f"original={len(frame_paths)} retry={len(attempt_paths)} "
@@ -443,6 +470,15 @@ class LocalQwenVisualSummarizer:
         if last_error is not None:
             raise last_error
         raise ValueError("VL frame retry received no frame attempts")
+
+    def _limit_vl_input_frames(self, frame_paths: list[Path]) -> list[Path]:
+        if self.vl_max_input_frames is None:
+            return frame_paths
+        if self.vl_max_input_frames <= 0:
+            raise ValueError(
+                f"vl_max_input_frames must be positive when set, got {self.vl_max_input_frames}"
+            )
+        return self._temporal_frame_subset(frame_paths, self.vl_max_input_frames)
 
     def _generate_summary_text(
         self,
@@ -471,9 +507,20 @@ class LocalQwenVisualSummarizer:
             return_dict=True,
             return_tensors="pt",
         )
-        if hasattr(inputs, "to"):
-            inputs = inputs.to(self._resolve_input_device(model))
-        generated_ids = model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+        input_device = self._resolve_input_device(model)
+        input_dtype = self._resolve_input_dtype(model)
+        generation_dtype = _resolve_generation_autocast_dtype(model, input_dtype)
+        inputs = _move_inputs_to_device(
+            inputs,
+            input_device,
+            generation_dtype or input_dtype,
+        )
+        with _generation_autocast_context(input_device, generation_dtype):
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+            )
         generated_ids_trimmed = [
             out_ids[len(in_ids) :]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids, strict=True)
@@ -668,7 +715,7 @@ class LocalQwenVisualSummarizer:
             return self.model, self.processor
 
         import torch
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        from transformers import AutoProcessor
 
         self._log(
             f"loading VL model={self.model_path or self.model_name} "
@@ -681,11 +728,21 @@ class LocalQwenVisualSummarizer:
         if self.attn_implementation is not None:
             model_kwargs["attn_implementation"] = self.attn_implementation
 
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-            self.model_path or self.model_name,
-            **model_kwargs,
-        )
-        self.processor = AutoProcessor.from_pretrained(self.model_path or self.model_name)
+        model_path = self.model_path or self.model_name
+        if _use_image_text_to_text_loader(self.model_name, self.model_path):
+            from transformers import AutoModelForImageTextToText
+
+            self._log("using AutoModelForImageTextToText loader")
+            self.model = AutoModelForImageTextToText.from_pretrained(model_path, **model_kwargs)
+        else:
+            from transformers import Qwen3VLForConditionalGeneration
+
+            self._log("using Qwen3VLForConditionalGeneration loader")
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_path,
+                **model_kwargs,
+            )
+        self.processor = AutoProcessor.from_pretrained(model_path)
         self._log("VL model loaded")
         return self.model, self.processor
 
@@ -695,13 +752,25 @@ class LocalQwenVisualSummarizer:
         except StopIteration as exc:
             raise ValueError("Vision model has no parameters") from exc
 
+    def _resolve_input_dtype(self, model):
+        return _model_floating_dtype(model)
+
     def _build_prompt(self, span: TimeSpan) -> str:
         if self.prompt_override is not None:
             return self.prompt_override
         return (
-            "Summarize this video segment for long-video reasoning. "
+            "Summarize this LongShotBench video segment for grounded question answering. "
             "Return strict JSON with keys `summary`, `tags`, and `entities`. "
-            "Mention visible actions, people, objects, slides, or on-screen text. "
+            "Mention exact visible actions, people, objects, slides, UI labels, signs, "
+            "code text, math expressions, counts, and shell/output text when visible. "
+            "For multi-frame input, preserve frame order, describe important keyframes, "
+            "and state what changes between frames. "
+            "For code/editor/tutorial content, copy short exact strings and variable names "
+            "instead of paraphrasing them. "
+            "Also mention spatial relations, viewpoint/visibility, motion direction, temporal "
+            "ordering, entity continuity, physical context, and evidence useful for counting "
+            "or extracting scene text when visible. "
+            "Do not guess audio or speech content from frames alone. "
             f"Time span: {span.to_display()} seconds."
         )
 
@@ -741,12 +810,22 @@ class LazyPiToMeVisualIndexer:
     pitome_scene_sample_rate: float | None = 1.0
     pitome_scene_keyframes_only: bool = True
     frame_embedding_provider: ImageTextEmbeddingProvider | None = None
+    visual_index_batch_size: int = 1
+    visual_index_workers: int = 1
     summary_granularity: VideoNodeLevel | None = "clip"
     verbose: bool = False
     progress_callback: Callable[[dict[str, Any]], None] | None = None
     progress_unit_weight: int = 1
 
     def summarize(self, video_path: str, spans: list[TimeSpan]) -> list[VisualSummarySpan]:
+        if self.visual_index_batch_size <= 0:
+            raise ValueError(
+                f"visual_index_batch_size must be positive, got {self.visual_index_batch_size}"
+            )
+        if self.visual_index_workers <= 0:
+            raise ValueError(
+                f"visual_index_workers must be positive, got {self.visual_index_workers}"
+            )
         self._log(f"lazy visual index start path={video_path} spans={len(spans)}")
         self._notify_progress(
             phase="visual",
@@ -763,82 +842,125 @@ class LazyPiToMeVisualIndexer:
                     _temporary_directory(prefix="videorlm_lazy_pitome_", dir_path=output_root)
                 )
             )
-            for index, span in enumerate(spans, start=1):
-                frame_dir = temp_dir / f"span_{index:03d}"
-                selection = select_visual_frames_for_span(
-                    media_path=video_path,
-                    span=span,
-                    strategy="pitome",
-                    uniform_frame_count=self.pitome_min_frame_count or self.frame_count,
-                    dense_frame_rate=self.pitome_dense_frame_rate,
-                    ffmpeg_bin=self.ffmpeg_bin,
-                    width=self.pitome_frame_width if self.pitome_frame_width is not None else self.frame_width,
-                    output_dir=frame_dir,
-                    protect_ratio=self.pitome_protect_ratio,
-                    similarity_threshold=self.pitome_similarity_threshold,
-                    embedding_size=self.pitome_embedding_size,
-                    embedding_backend=self.pitome_embedding_backend,
-                    embedding_device=self.pitome_embedding_device,
-                    anchor_frame_count=self.pitome_anchor_frame_count,
-                    frame_extraction_strategy=self.pitome_frame_extraction_strategy,
-                    frame_extraction_seek_workers=self.pitome_frame_extraction_workers,
-                )
-                selection, boundary_metadata = self._add_boundary_frames(
-                    video_path=video_path,
-                    span=span,
-                    output_dir=frame_dir,
-                    selection=selection,
-                )
-                if self.pitome_max_selected_frames is not None:
-                    selection = limit_frame_selection_by_temporal_coverage(
-                        selection,
-                        self.pitome_max_selected_frames,
+            for batch_start in range(0, len(spans), self.visual_index_batch_size):
+                indexed_batch: list[
+                    tuple[int, TimeSpan, FrameSelectionResult, dict[str, list[float]]]
+                ] = []
+                batch_spans = spans[batch_start : batch_start + self.visual_index_batch_size]
+                batch_items = [
+                    (batch_start + offset + 1, span)
+                    for offset, span in enumerate(batch_spans)
+                ]
+
+                def select_one(
+                    item: tuple[int, TimeSpan],
+                ) -> tuple[int, TimeSpan, FrameSelectionResult, dict[str, list[float]]]:
+                    index, span = item
+                    selection, boundary_metadata = self._select_visual_index_frames(
+                        video_path=video_path,
+                        span=span,
+                        output_dir=temp_dir / f"span_{index:03d}",
                     )
-                semantic_metadata = _semantic_frame_metadata(
+                    return index, span, selection, boundary_metadata
+
+                if self.visual_index_workers == 1 or len(batch_items) <= 1:
+                    indexed_batch = [select_one(item) for item in batch_items]
+                else:
+                    worker_count = min(self.visual_index_workers, len(batch_items))
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        indexed_batch = list(executor.map(select_one, batch_items))
+
+                semantic_metadatas = _semantic_frame_metadata_batch(
                     self.frame_embedding_provider,
-                    selection.frame_paths,
+                    [selection.frame_paths for _index, _span, selection, _metadata in indexed_batch],
                 )
-                selection = _fuse_selection_with_semantic_embeddings(
+                for (
+                    index,
+                    span,
                     selection,
-                    semantic_metadata,
-                )
-                metadata = selection.to_metadata()
-                metadata.update(
-                    _selected_boundary_metadata(selection.timestamps, boundary_metadata)
-                )
-                metadata.update(semantic_metadata)
-                metadata.update(
-                    {
-                        "visual_summary_mode": "lazy_pitome_index",
-                        "on_demand_visual_refinement": True,
-                        "lazy_visual_index": True,
-                    }
-                )
-                summary = (
-                    f"PiToMe visual index for {span.to_display()} with "
-                    f"{len(selection.frame_paths)} representative frames. "
-                    "Open this node visually to run QwenVL refinement."
-                )
-                summaries.append(
-                    VisualSummarySpan(
-                        summary=summary,
-                        time_span=span,
-                        granularity=self._infer_granularity(span),
-                        tags=["pitome", "visual_index"],
-                        entities=[],
-                        metadata=metadata,
+                    boundary_metadata,
+                ), semantic_metadata in zip(indexed_batch, semantic_metadatas, strict=True):
+                    selection = _fuse_selection_with_semantic_embeddings(
+                        selection,
+                        semantic_metadata,
                     )
-                )
-                self._notify_progress(
-                    phase="visual",
-                    event="advance",
-                    advance=1,
-                    index=index,
-                    total=len(spans),
-                    status=f"visual-index {index}/{len(spans)}",
-                )
+                    metadata = selection.to_metadata()
+                    metadata.update(
+                        _selected_boundary_metadata(selection.timestamps, boundary_metadata)
+                    )
+                    metadata.update(semantic_metadata)
+                    metadata.update(
+                        {
+                            "visual_summary_mode": "lazy_pitome_index",
+                            "on_demand_visual_refinement": True,
+                            "lazy_visual_index": True,
+                            "visual_index_batch_size": self.visual_index_batch_size,
+                            "visual_index_workers": self.visual_index_workers,
+                        }
+                    )
+                    summary = (
+                        f"PiToMe visual index for {span.to_display()} with "
+                        f"{len(selection.frame_paths)} representative frames. "
+                        "Open this node visually to run QwenVL refinement."
+                    )
+                    summaries.append(
+                        VisualSummarySpan(
+                            summary=summary,
+                            time_span=span,
+                            granularity=self._infer_granularity(span),
+                            tags=["pitome", "visual_index"],
+                            entities=[],
+                            metadata=metadata,
+                        )
+                    )
+                    self._notify_progress(
+                        phase="visual",
+                        event="advance",
+                        advance=1,
+                        index=index,
+                        total=len(spans),
+                        status=f"visual-index {index}/{len(spans)}",
+                    )
         self._log(f"lazy visual index done summaries={len(summaries)}")
         return summaries
+
+    def _select_visual_index_frames(
+        self,
+        *,
+        video_path: str,
+        span: TimeSpan,
+        output_dir: Path,
+    ) -> tuple[FrameSelectionResult, dict[str, list[float]]]:
+        selection = select_visual_frames_for_span(
+            media_path=video_path,
+            span=span,
+            strategy="pitome",
+            uniform_frame_count=self.pitome_min_frame_count or self.frame_count,
+            dense_frame_rate=self.pitome_dense_frame_rate,
+            ffmpeg_bin=self.ffmpeg_bin,
+            width=self.pitome_frame_width if self.pitome_frame_width is not None else self.frame_width,
+            output_dir=output_dir,
+            protect_ratio=self.pitome_protect_ratio,
+            similarity_threshold=self.pitome_similarity_threshold,
+            embedding_size=self.pitome_embedding_size,
+            embedding_backend=self.pitome_embedding_backend,
+            embedding_device=self.pitome_embedding_device,
+            anchor_frame_count=self.pitome_anchor_frame_count,
+            frame_extraction_strategy=self.pitome_frame_extraction_strategy,
+            frame_extraction_seek_workers=self.pitome_frame_extraction_workers,
+        )
+        selection, boundary_metadata = self._add_boundary_frames(
+            video_path=video_path,
+            span=span,
+            output_dir=output_dir,
+            selection=selection,
+        )
+        if self.pitome_max_selected_frames is not None:
+            selection = limit_frame_selection_by_temporal_coverage(
+                selection,
+                self.pitome_max_selected_frames,
+            )
+        return selection, boundary_metadata
 
     def _add_boundary_frames(
         self,
@@ -877,6 +999,243 @@ class LazyPiToMeVisualIndexer:
     def _log(self, message: str) -> None:
         if self.verbose:
             print(f"[LazyPiToMe] {message}", flush=True)
+
+
+@dataclass
+class PaddleOCRTextExtractor:
+    ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = "ffprobe"
+    window_duration_seconds: float = 45.0
+    frame_count: int = 6
+    frame_width: int | None = 960
+    frame_extraction_strategy: Literal["auto", "batch", "seek", "sequence"] = "seek"
+    frame_extraction_workers: int = 1
+    lang: str = "en"
+    ocr_version: str = "PP-OCRv5"
+    text_detection_model_name: str | None = None
+    text_recognition_model_name: str | None = None
+    text_recognition_batch_size: int | None = None
+    device: str | None = None
+    min_confidence: float = 0.35
+    enable_mkldnn: bool = False
+    cache_dir: str | None = None
+    model: Any | None = None
+    verbose: bool = False
+    progress_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def extract(self, video_path: str) -> list[OCRSpan]:
+        if self.window_duration_seconds <= 0:
+            raise ValueError(
+                "window_duration_seconds must be positive, "
+                f"got {self.window_duration_seconds}"
+            )
+        if self.frame_count <= 0:
+            raise ValueError(f"frame_count must be positive, got {self.frame_count}")
+        if self.frame_extraction_workers <= 0:
+            raise ValueError(
+                "frame_extraction_workers must be positive, "
+                f"got {self.frame_extraction_workers}"
+            )
+        model = self._ensure_loaded()
+        duration_seconds = probe_media_duration(video_path, ffprobe_bin=self.ffprobe_bin)
+        windows = _chunk_time_spans(duration_seconds, self.window_duration_seconds)
+        self._log(
+            f"paddle OCR start path={video_path} windows={len(windows)} "
+            f"window_seconds={self.window_duration_seconds:.2f}"
+        )
+        self._notify_progress(
+            phase="ocr",
+            event="planned",
+            total=len(windows),
+            status=f"ocr 0/{len(windows)}",
+        )
+        output_root = get_videorlm_output_root() / "tmp"
+        output_root.mkdir(parents=True, exist_ok=True)
+        spans: list[OCRSpan] = []
+        with contextlib.ExitStack() as stack:
+            temp_dir = Path(
+                stack.enter_context(
+                    _temporary_directory(prefix="videorlm_paddle_ocr_", dir_path=output_root)
+                )
+            )
+            for index, span in enumerate(windows, start=1):
+                frame_paths = extract_frames_for_span(
+                    media_path=video_path,
+                    span=span,
+                    frame_count=self.frame_count,
+                    ffmpeg_bin=self.ffmpeg_bin,
+                    width=self.frame_width,
+                    output_dir=temp_dir / f"window_{index:03d}",
+                    extraction_strategy=self.frame_extraction_strategy,
+                    seek_workers=self.frame_extraction_workers,
+                )
+                lines: list[str] = []
+                for frame_path in frame_paths:
+                    lines.extend(self._predict_frame_lines(model, frame_path))
+                text = self._merge_ocr_lines(lines)
+                if text:
+                    spans.append(OCRSpan(text=text, time_span=span))
+                self._notify_progress(
+                    phase="ocr",
+                    event="advance",
+                    advance=1,
+                    index=index,
+                    total=len(windows),
+                    status=f"ocr {index}/{len(windows)}",
+                )
+        self._log(f"paddle OCR done spans={len(spans)}")
+        return spans
+
+    def _ensure_loaded(self) -> Any:
+        if self.model is not None:
+            return self.model
+        cache_dir = Path(self.cache_dir) if self.cache_dir else (
+            get_videorlm_output_root() / "cache" / "paddlex"
+        )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_dir))
+        try:
+            from paddleocr import PaddleOCR
+        except ImportError as exc:
+            raise ImportError(
+                "PaddleOCRTextExtractor requires paddleocr. Install it in the active "
+                "environment before using --enable-paddle-ocr."
+            ) from exc
+        self.model = PaddleOCR(
+            lang=self.lang,
+            ocr_version=self.ocr_version,
+            text_detection_model_name=self.text_detection_model_name,
+            text_recognition_model_name=self.text_recognition_model_name,
+            text_recognition_batch_size=self.text_recognition_batch_size,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_rec_score_thresh=self.min_confidence,
+            enable_mkldnn=self.enable_mkldnn,
+            device=self.device,
+        )
+        return self.model
+
+    def _predict_frame_lines(self, model: Any, frame_path: Path) -> list[str]:
+        if hasattr(model, "predict"):
+            result = model.predict(
+                str(frame_path),
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                text_rec_score_thresh=self.min_confidence,
+            )
+        else:
+            result = model.ocr(str(frame_path), cls=False)
+        return self._extract_lines_from_result(result)
+
+    def _extract_lines_from_result(self, result: object) -> list[str]:
+        lines: list[str] = []
+        self._collect_ocr_lines(result, lines)
+        return [line for line in lines if line]
+
+    def _collect_ocr_lines(self, value: object, lines: list[str]) -> None:
+        if value is None:
+            return
+        payload = self._paddle_result_payload(value)
+        if payload is not None:
+            rec_texts = payload.get("rec_texts")
+            if isinstance(rec_texts, list):
+                scores = payload.get("rec_scores", [])
+                for index, text in enumerate(rec_texts):
+                    score = scores[index] if isinstance(scores, list) and index < len(scores) else None
+                    if not self._score_is_usable(score):
+                        continue
+                    normalized = self._normalize_ocr_line(str(text))
+                    if normalized:
+                        lines.append(normalized)
+            for key in ("res", "ocr_res", "ocr_result", "ocr_results", "result", "results"):
+                if key in payload:
+                    self._collect_ocr_lines(payload[key], lines)
+            return
+        if isinstance(value, (list, tuple)):
+            if self._looks_like_legacy_text_score(value):
+                text = self._normalize_ocr_line(str(value[0]))
+                score = value[1]
+                if text and self._score_is_usable(score):
+                    lines.append(text)
+                return
+            if len(value) >= 2 and self._looks_like_legacy_text_score(value[1]):
+                text_score = value[1]
+                text = self._normalize_ocr_line(str(text_score[0]))
+                score = text_score[1]
+                if text and self._score_is_usable(score):
+                    lines.append(text)
+                return
+            for item in value:
+                self._collect_ocr_lines(item, lines)
+
+    def _paddle_result_payload(self, value: object) -> dict[str, object] | None:
+        if isinstance(value, dict):
+            return value
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict()
+            if isinstance(payload, dict):
+                return payload
+        json_value = getattr(value, "json", None)
+        if callable(json_value):
+            payload = json_value()
+            if isinstance(payload, dict):
+                return payload
+        elif isinstance(json_value, dict):
+            return json_value
+        res_value = getattr(value, "res", None)
+        if isinstance(res_value, dict):
+            return res_value
+        return None
+
+    def _looks_like_legacy_text_score(self, value: object) -> bool:
+        return (
+            isinstance(value, (list, tuple))
+            and len(value) >= 2
+            and isinstance(value[0], str)
+            and isinstance(value[1], (int, float))
+        )
+
+    def _score_is_usable(self, score: object) -> bool:
+        if score is None:
+            return True
+        if not isinstance(score, (int, float)):
+            return True
+        return float(score) >= self.min_confidence
+
+    def _merge_ocr_lines(self, lines: list[str]) -> str:
+        seen: set[str] = set()
+        merged: list[str] = []
+        for line in lines:
+            key = self._ocr_line_key(line)
+            if key in seen:
+                continue
+            if any(self._is_near_duplicate_ocr_line(key, existing) for existing in seen):
+                continue
+            seen.add(key)
+            merged.append(line)
+        return "\n".join(merged)
+
+    def _normalize_ocr_line(self, text: str) -> str:
+        return " ".join(text.replace("\r", "\n").split()).strip()
+
+    def _ocr_line_key(self, line: str) -> str:
+        return re.sub(r"\W+", "", line.casefold())
+
+    def _is_near_duplicate_ocr_line(self, key: str, existing_key: str) -> bool:
+        if len(key) < 12 or len(existing_key) < 12:
+            return False
+        return difflib.SequenceMatcher(None, key, existing_key).ratio() >= 0.94
+
+    def _notify_progress(self, **payload: Any) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(payload)
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[PaddleOCR] {message}", flush=True)
 
 
 @dataclass
@@ -1030,16 +1389,44 @@ def _semantic_frame_metadata(
     provider: ImageTextEmbeddingProvider | None,
     frame_paths: list[Path],
 ) -> dict[str, Any]:
-    if provider is None or not frame_paths:
-        return {}
-    embeddings = provider.embed_images(frame_paths)
+    return _semantic_frame_metadata_batch(provider, [frame_paths])[0]
+
+
+def _semantic_frame_metadata_batch(
+    provider: ImageTextEmbeddingProvider | None,
+    frame_path_groups: list[list[Path]],
+) -> list[dict[str, Any]]:
+    metadatas: list[dict[str, Any]] = [{} for _group in frame_path_groups]
+    if provider is None:
+        return metadatas
+
+    flat_paths = [path for group in frame_path_groups for path in group]
+    if not flat_paths:
+        return metadatas
+
+    embeddings = provider.embed_images(flat_paths)
     if not embeddings:
-        return {}
-    return {
-        "semantic_frame_embeddings": embeddings,
-        "semantic_frame_embedding_model": getattr(provider, "model_name", None),
-        "semantic_frame_embedding_dim": len(embeddings[0]),
-    }
+        return metadatas
+    if len(embeddings) != len(flat_paths):
+        raise ValueError(
+            "Semantic frame embedding provider returned "
+            f"{len(embeddings)} embeddings for {len(flat_paths)} frames."
+        )
+
+    offset = 0
+    model_name = getattr(provider, "model_name", None)
+    for index, group in enumerate(frame_path_groups):
+        count = len(group)
+        group_embeddings = embeddings[offset : offset + count]
+        offset += count
+        if not group_embeddings:
+            continue
+        metadatas[index] = {
+            "semantic_frame_embeddings": group_embeddings,
+            "semantic_frame_embedding_model": model_name,
+            "semantic_frame_embedding_dim": len(group_embeddings[0]),
+        }
+    return metadatas
 
 
 def _fuse_selection_with_semantic_embeddings(
@@ -1073,6 +1460,10 @@ def _fuse_selection_with_semantic_embeddings(
         representative_timestamps=list(selection.representative_timestamps),
         energy_scores=list(selection.energy_scores),
         merged_pairs=list(selection.merged_pairs),
+        event_boundary_scores=list(selection.event_boundary_scores),
+        visual_novelty_scores=list(selection.visual_novelty_scores),
+        cognitive_anchor_metadata=list(selection.cognitive_anchor_metadata),
+        memorability_prior=selection.memorability_prior,
     )
 
 
@@ -1094,10 +1485,53 @@ def _vrrqa_visual_verification_metadata(payload: dict[str, Any]) -> dict[str, An
     raw_summary = payload.get("summary")
     if isinstance(raw_summary, str):
         metadata.update(_extract_vrrqa_metadata_from_text(raw_summary))
+    if "target_entities" in payload:
+        metadata["vrrqa_target_entities"] = payload["target_entities"]
+    if "candidate_entities" in payload:
+        metadata["vrrqa_candidate_entities"] = payload["candidate_entities"]
+    if "entity_grounding" in payload:
+        metadata["vrrqa_entity_grounding"] = payload["entity_grounding"]
+    if "frame_observations" in payload:
+        metadata["vrrqa_frame_observations"] = payload["frame_observations"]
     if "frame_timeline" in payload:
         metadata["vrrqa_frame_timeline"] = payload["frame_timeline"]
     if "visible_relation" in payload:
         metadata["vrrqa_visible_relation"] = payload["visible_relation"]
+    if "spatial_relation" in payload:
+        metadata["vrrqa_spatial_relation"] = payload["spatial_relation"]
+    if "entities_visible" in payload:
+        metadata["vrrqa_entities_visible"] = payload["entities_visible"]
+    if "co_visible" in payload:
+        metadata["vrrqa_co_visible"] = payload["co_visible"]
+    if "co_visible_frame_indices" in payload:
+        metadata["vrrqa_co_visible_frame_indices"] = payload["co_visible_frame_indices"]
+    if "relation_supported" in payload:
+        metadata["vrrqa_relation_supported"] = payload["relation_supported"]
+    if "relation_votes" in payload:
+        metadata["vrrqa_relation_votes"] = payload["relation_votes"]
+    if "vote_counts" in payload:
+        metadata["vrrqa_vote_counts"] = payload["vote_counts"]
+    if "aggregated_relation" in payload:
+        metadata["vrrqa_aggregated_relation"] = payload["aggregated_relation"]
+    if "motion_trajectory" in payload:
+        metadata["vrrqa_motion_trajectory"] = payload["motion_trajectory"]
+    if "temporal_order" in payload:
+        metadata["vrrqa_temporal_order"] = payload["temporal_order"]
+    if "entity_continuity" in payload:
+        metadata["vrrqa_entity_continuity"] = payload["entity_continuity"]
+    if "physical_context" in payload:
+        metadata["vrrqa_physical_context"] = payload["physical_context"]
+    if "inferred_relation" in payload:
+        metadata["vrrqa_inferred_relation"] = payload["inferred_relation"]
+    if "option_comparison" in payload:
+        metadata["vrrqa_option_comparison"] = payload["option_comparison"]
+    if "verifier_verdict" in payload:
+        metadata["vrrqa_verifier_verdict"] = payload["verifier_verdict"]
+    if "needs_more_evidence" in payload:
+        metadata["vrrqa_needs_more_evidence"] = payload["needs_more_evidence"]
+    co_visible_frame_count = _co_visible_frame_count_from_payload(payload)
+    if co_visible_frame_count is not None:
+        metadata["vrrqa_co_visible_frame_count"] = co_visible_frame_count
     evidence = payload.get("evidence")
     if isinstance(evidence, str) and evidence.strip():
         metadata["vrrqa_evidence"] = evidence.strip()
@@ -1112,6 +1546,35 @@ def _vrrqa_visual_verification_metadata(payload: dict[str, Any]) -> dict[str, An
     if any(key.startswith("vrrqa_") for key in metadata):
         metadata["vrrqa_visual_verification"] = True
     return metadata
+
+
+def _co_visible_frame_count_from_payload(payload: dict[str, Any]) -> int | None:
+    indices = payload.get("co_visible_frame_indices")
+    if isinstance(indices, list):
+        return len(indices)
+
+    observations = payload.get("frame_observations")
+    if not isinstance(observations, list):
+        return None
+    count = 0
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        if _metadata_bool_value(observation.get("co_visible")) is True:
+            count += 1
+    return count
+
+
+def _metadata_bool_value(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "supported"}:
+            return True
+        if normalized in {"false", "no", "0", "unsupported"}:
+            return False
+    return None
 
 
 def _extract_vrrqa_metadata_from_text(text: str) -> dict[str, Any]:
@@ -1320,10 +1783,16 @@ def _merge_frame_selection_with_boundaries(
     merged_embeddings = []
     if all(embedding is not None for _, _, embedding, _ in deduped):
         merged_embeddings = [list(embedding) for _, _, embedding, _ in deduped]
+    selected_timestamps = [timestamp for timestamp, _, _, _ in deduped]
+    boundary_anchor_metadata = _boundary_cognitive_anchor_metadata(
+        selection=selection,
+        selected_timestamps=selected_timestamps,
+        boundary_timestamps=boundary_timestamps,
+    )
     return FrameSelectionResult(
         strategy=selection.strategy,
         frame_paths=[path for _, path, _, _ in deduped],
-        timestamps=[timestamp for timestamp, _, _, _ in deduped],
+        timestamps=selected_timestamps,
         dense_frame_count=selection.dense_frame_count,
         embedding_backend=selection.embedding_backend,
         embedding_size=selection.embedding_size,
@@ -1332,7 +1801,62 @@ def _merge_frame_selection_with_boundaries(
         representative_timestamps=list(selection.representative_timestamps),
         energy_scores=list(selection.energy_scores),
         merged_pairs=list(selection.merged_pairs),
+        event_boundary_scores=list(selection.event_boundary_scores),
+        visual_novelty_scores=list(selection.visual_novelty_scores),
+        cognitive_anchor_metadata=boundary_anchor_metadata,
+        memorability_prior=compute_memorability_prior(
+            anchor_metadata=boundary_anchor_metadata,
+            event_boundary_scores=[
+                float(item.get("score", 0.0)) for item in selection.event_boundary_scores
+            ],
+            visual_novelty_scores=[
+                float(item.get("score", 0.0)) for item in selection.visual_novelty_scores
+            ],
+            dense_frame_count=selection.dense_frame_count,
+        ),
     )
+
+
+def _boundary_cognitive_anchor_metadata(
+    *,
+    selection: FrameSelectionResult,
+    selected_timestamps: list[float],
+    boundary_timestamps: list[float],
+) -> list[dict[str, Any]]:
+    merged_metadata = filter_cognitive_anchor_metadata(
+        selection.cognitive_anchor_metadata,
+        selected_timestamps,
+    )
+    existing_timestamps = {float(item.get("timestamp", -1.0)) for item in merged_metadata}
+    for timestamp in boundary_timestamps:
+        if not any(abs(timestamp - existing) <= 0.05 for existing in existing_timestamps):
+            merged_metadata.append(
+                {
+                    "timestamp": round(float(timestamp), 3),
+                    "dense_index": None,
+                    "reasons": ["ffmpeg_scene_or_span_boundary"],
+                    "score": 0.9,
+                    "event_boundary_score": 0.9,
+                    "visual_novelty_score": 0.0,
+                }
+            )
+            existing_timestamps.add(float(timestamp))
+            continue
+        for item in merged_metadata:
+            if abs(float(item.get("timestamp", -1.0)) - timestamp) > 0.05:
+                continue
+            reasons = [str(reason) for reason in item.get("reasons", [])]
+            if "ffmpeg_scene_or_span_boundary" not in reasons:
+                reasons.append("ffmpeg_scene_or_span_boundary")
+            item["reasons"] = reasons
+            item["score"] = max(float(item.get("score", 0.0)), 0.9)
+            item["event_boundary_score"] = max(
+                float(item.get("event_boundary_score", 0.0)),
+                0.9,
+            )
+            break
+    merged_metadata.sort(key=lambda item: float(item.get("timestamp", 0.0)))
+    return filter_cognitive_anchor_metadata(merged_metadata, selected_timestamps)
 
 
 def _is_retryable_vl_frame_error(exc: RuntimeError) -> bool:
@@ -1343,9 +1867,90 @@ def _is_retryable_vl_frame_error(exc: RuntimeError) -> bool:
 def _resolve_torch_dtype(torch_module, value: str | Any):
     if not isinstance(value, str):
         return value
+    if value == "auto":
+        return "auto"
     if not hasattr(torch_module, value):
         raise ValueError(f"Unsupported torch dtype: {value}")
     return getattr(torch_module, value)
+
+
+def _model_floating_dtype(model: Any) -> Any | None:
+    if hasattr(model, "parameters"):
+        for parameter in model.parameters():
+            if hasattr(parameter, "is_floating_point") and parameter.is_floating_point():
+                return parameter.dtype
+    return getattr(model, "dtype", None)
+
+
+def _resolve_generation_autocast_dtype(model: Any, input_dtype: Any | None) -> Any | None:
+    for dtype in (
+        input_dtype,
+        _model_config_torch_dtype(model),
+        getattr(model, "dtype", None),
+    ):
+        dtype = _coerce_torch_dtype(dtype)
+        if _is_half_precision_torch_dtype(dtype):
+            return dtype
+    return None
+
+
+def _model_config_torch_dtype(model: Any) -> Any | None:
+    config = getattr(model, "config", None)
+    if config is None:
+        return None
+    return getattr(config, "torch_dtype", None)
+
+
+def _coerce_torch_dtype(dtype: Any) -> Any | None:
+    if not isinstance(dtype, str):
+        return dtype
+    import torch
+
+    return getattr(torch, dtype, None)
+
+
+def _is_half_precision_torch_dtype(dtype: Any) -> bool:
+    import torch
+
+    return dtype in {torch.float16, torch.bfloat16}
+
+
+def _generation_autocast_context(device: Any, dtype: Any | None):
+    if not _is_half_precision_torch_dtype(dtype):
+        return contextlib.nullcontext()
+    device_type = getattr(device, "type", str(device).split(":", maxsplit=1)[0])
+    if device_type != "cuda":
+        return contextlib.nullcontext()
+
+    import torch
+
+    return torch.autocast(device_type=device_type, dtype=dtype)
+
+
+def _move_inputs_to_device(inputs: Any, device: Any, dtype: Any | None) -> Any:
+    if hasattr(inputs, "items"):
+        for key, value in list(inputs.items()):
+            moved = _move_value_to_device(value, device, dtype)
+            inputs[key] = moved
+            if hasattr(inputs, key):
+                try:
+                    setattr(inputs, key, moved)
+                except AttributeError:
+                    pass
+        return inputs
+    return _move_value_to_device(inputs, device, dtype)
+
+
+def _move_value_to_device(value: Any, device: Any, dtype: Any | None) -> Any:
+    if hasattr(value, "to"):
+        if hasattr(value, "is_floating_point") and value.is_floating_point() and dtype is not None:
+            return value.to(device=device, dtype=dtype)
+        return value.to(device)
+    if isinstance(value, list):
+        return [_move_value_to_device(item, device, dtype) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_device(item, device, dtype) for item in value)
+    return value
 
 
 @contextlib.contextmanager
@@ -1498,3 +2103,21 @@ def _normalize_whitespace(text: str) -> str:
     for source, target in replacements.items():
         normalized = normalized.replace(source, target)
     return normalized.strip()
+
+
+def _use_image_text_to_text_loader(model_name: str, model_path: str | None) -> bool:
+    model_identifiers = [model_name, model_path or ""]
+    normalized_identifiers = [identifier.replace("\\", "/").lower() for identifier in model_identifiers]
+    image_text_model_markers = (
+        "qwen3.5",
+        "qwen3.6",
+        "gemma-3",
+        "gemma3",
+        "paligemma",
+        "medgemma",
+    )
+    return any(
+        marker in identifier
+        for identifier in normalized_identifiers
+        for marker in image_text_model_markers
+    )

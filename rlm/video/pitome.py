@@ -18,6 +18,9 @@ FrameSelectionStrategy = Literal["uniform", "pitome"]
 FrameEmbeddingBackend = Literal["pixel", "hybrid"]
 DEFAULT_STORED_FRAME_EMBEDDING_SIZE = 64
 FRAME_EMBEDDING_TORCH_BATCH_SIZE = 128
+COGNITIVE_EVENT_BOUNDARY_MIN_SCORE = 0.18
+COGNITIVE_NOVELTY_MIN_SCORE = 0.22
+COGNITIVE_ANCHOR_TIMESTAMP_TOLERANCE = 0.05
 
 
 @dataclass
@@ -33,6 +36,10 @@ class FrameSelectionResult:
     representative_timestamps: list[float] = field(default_factory=list)
     energy_scores: list[float] = field(default_factory=list)
     merged_pairs: list[tuple[float, float]] = field(default_factory=list)
+    event_boundary_scores: list[dict[str, Any]] = field(default_factory=list)
+    visual_novelty_scores: list[dict[str, Any]] = field(default_factory=list)
+    cognitive_anchor_metadata: list[dict[str, Any]] = field(default_factory=list)
+    memorability_prior: float = 0.0
 
     def to_metadata(self) -> dict[str, Any]:
         metadata = {
@@ -43,7 +50,28 @@ class FrameSelectionResult:
             "protected_timestamps": list(self.protected_timestamps),
             "representative_timestamps": list(self.representative_timestamps),
             "merged_pairs": [{"left": left, "right": right} for left, right in self.merged_pairs],
+            "memorability_prior": round(self.memorability_prior, 4),
         }
+        if self.event_boundary_scores:
+            metadata["event_boundary_scores"] = list(self.event_boundary_scores)
+            metadata["event_boundary_peak_timestamps"] = [
+                float(item["timestamp"])
+                for item in self.event_boundary_scores
+                if item.get("peak")
+            ]
+        if self.visual_novelty_scores:
+            metadata["visual_novelty_scores"] = list(self.visual_novelty_scores)
+            metadata["visual_novelty_peak_timestamps"] = [
+                float(item["timestamp"])
+                for item in self.visual_novelty_scores
+                if item.get("peak")
+            ]
+        if self.cognitive_anchor_metadata:
+            metadata["cognitive_anchor_frames"] = list(self.cognitive_anchor_metadata)
+            metadata["cognitive_anchor_timestamps"] = [
+                float(item["timestamp"]) for item in self.cognitive_anchor_metadata
+            ]
+            metadata["cognitive_anchor_frame_count"] = len(self.cognitive_anchor_metadata)
         if self.frame_embeddings:
             backend = self.embedding_backend
             metadata.update(
@@ -66,13 +94,14 @@ def limit_frame_selection_by_temporal_coverage(
     selection: FrameSelectionResult,
     max_count: int,
 ) -> FrameSelectionResult:
-    indices = _temporal_coverage_indices(len(selection.frame_paths), max_count)
+    indices = limit_indices_preserving_cognitive_anchors(selection, max_count)
     if indices == list(range(len(selection.frame_paths))):
         return selection
+    timestamps = [selection.timestamps[index] for index in indices]
     return FrameSelectionResult(
         strategy=selection.strategy,
         frame_paths=[selection.frame_paths[index] for index in indices],
-        timestamps=[selection.timestamps[index] for index in indices],
+        timestamps=timestamps,
         dense_frame_count=selection.dense_frame_count,
         embedding_backend=selection.embedding_backend,
         embedding_size=selection.embedding_size,
@@ -83,6 +112,13 @@ def limit_frame_selection_by_temporal_coverage(
         representative_timestamps=list(selection.representative_timestamps),
         energy_scores=list(selection.energy_scores),
         merged_pairs=list(selection.merged_pairs),
+        event_boundary_scores=list(selection.event_boundary_scores),
+        visual_novelty_scores=list(selection.visual_novelty_scores),
+        cognitive_anchor_metadata=filter_cognitive_anchor_metadata(
+            selection.cognitive_anchor_metadata,
+            timestamps,
+        ),
+        memorability_prior=selection.memorability_prior,
     )
 
 
@@ -117,11 +153,29 @@ def select_visual_frames_for_span(
             extraction_strategy=frame_extraction_strategy,
             seek_workers=frame_extraction_seek_workers,
         )
+        anchor_metadata = build_cognitive_anchor_metadata(
+            timestamps=timestamps,
+            anchor_indices=list(range(len(timestamps))),
+            selected_indices=list(range(len(timestamps))),
+            protected_indices=[],
+            representative_indices=list(range(len(timestamps))),
+            event_boundary_scores=[0.0 for _ in timestamps],
+            visual_novelty_scores=[0.0 for _ in timestamps],
+            event_boundary_peak_indices=[],
+            visual_novelty_peak_indices=[],
+        )
         return FrameSelectionResult(
             strategy="uniform",
             frame_paths=frame_paths,
             timestamps=timestamps,
             dense_frame_count=len(timestamps),
+            cognitive_anchor_metadata=anchor_metadata,
+            memorability_prior=compute_memorability_prior(
+                anchor_metadata=anchor_metadata,
+                event_boundary_scores=[],
+                visual_novelty_scores=[],
+                dense_frame_count=len(timestamps),
+            ),
         )
 
     dense_timestamps = sample_span_timestamps_by_rate(
@@ -165,6 +219,31 @@ def select_visual_frames_for_span(
         (dense_timestamps[left], dense_timestamps[right])
         for left, right in selection["merged_pairs"]
     ]
+    event_boundary_scores = selection["event_boundary_scores"]
+    visual_novelty_scores = selection["visual_novelty_scores"]
+    event_boundary_peak_indices = selection["event_boundary_peak_indices"]
+    visual_novelty_peak_indices = selection["visual_novelty_peak_indices"]
+    cognitive_anchor_metadata = build_cognitive_anchor_metadata(
+        timestamps=dense_timestamps,
+        anchor_indices=selection["cognitive_anchor_indices"],
+        selected_indices=selected_indices,
+        protected_indices=selection["protected_indices"],
+        representative_indices=selection["representative_indices"],
+        event_boundary_scores=event_boundary_scores,
+        visual_novelty_scores=visual_novelty_scores,
+        event_boundary_peak_indices=event_boundary_peak_indices,
+        visual_novelty_peak_indices=visual_novelty_peak_indices,
+    )
+    event_boundary_timeline = build_score_timeline(
+        timestamps=dense_timestamps,
+        scores=event_boundary_scores,
+        peak_indices=event_boundary_peak_indices,
+    )
+    visual_novelty_timeline = build_score_timeline(
+        timestamps=dense_timestamps,
+        scores=visual_novelty_scores,
+        peak_indices=visual_novelty_peak_indices,
+    )
 
     return FrameSelectionResult(
         strategy="pitome",
@@ -178,6 +257,13 @@ def select_visual_frames_for_span(
         representative_timestamps=representative_timestamps,
         energy_scores=selection["energy_scores"],
         merged_pairs=merged_pairs,
+        event_boundary_scores=event_boundary_timeline,
+        visual_novelty_scores=visual_novelty_timeline,
+        cognitive_anchor_metadata=filter_cognitive_anchor_metadata(
+            cognitive_anchor_metadata,
+            selected_timestamps,
+        ),
+        memorability_prior=selection["memorability_prior"],
     )
 
 
@@ -196,6 +282,12 @@ def select_frame_indices_from_embeddings(
             "representative_indices": [],
             "merged_pairs": [],
             "energy_scores": [],
+            "event_boundary_scores": [],
+            "visual_novelty_scores": [],
+            "event_boundary_peak_indices": [],
+            "visual_novelty_peak_indices": [],
+            "cognitive_anchor_indices": [],
+            "memorability_prior": 0.0,
         }
 
     _validate_ratio(protect_ratio, name="protect_ratio")
@@ -209,10 +301,25 @@ def select_frame_indices_from_embeddings(
             "representative_indices": [],
             "merged_pairs": [],
             "energy_scores": [0.0],
+            "event_boundary_scores": [0.0],
+            "visual_novelty_scores": [0.0],
+            "event_boundary_peak_indices": [],
+            "visual_novelty_peak_indices": [],
+            "cognitive_anchor_indices": [0],
+            "memorability_prior": 0.5,
         }
 
     similarity_matrix = build_similarity_matrix(embeddings, device=embedding_device)
     energy_scores = compute_energy_scores(similarity_matrix, device=embedding_device)
+    event_boundary_scores = compute_event_boundary_scores(
+        embeddings,
+        similarity_matrix=similarity_matrix,
+        energy_scores=energy_scores,
+    )
+    visual_novelty_scores = compute_visual_novelty_scores(
+        embeddings,
+        similarity_matrix=similarity_matrix,
+    )
     protected_count = max(1, math.ceil(len(embeddings) * protect_ratio))
     energy_order = sorted(range(len(embeddings)), key=lambda index: energy_scores[index])
     anchor_indices = _uniform_anchor_indices(len(embeddings), anchor_count)
@@ -247,15 +354,430 @@ def select_frame_indices_from_embeddings(
         merged_pairs.append((index_a, best_b))
 
     leftovers.update(unmatched_b)
-    selected_indices = sorted(protected_set | representatives | leftovers)
+    base_selected = sorted(protected_set | representatives | leftovers)
     representative_indices = sorted(representatives)
+    cognitive_selection = select_cognitive_anchor_indices(
+        event_boundary_scores=event_boundary_scores,
+        visual_novelty_scores=visual_novelty_scores,
+        selected_indices=base_selected,
+        protected_indices=protected_indices,
+        representative_indices=representative_indices,
+    )
+    selected_indices = sorted(set(base_selected) | set(cognitive_selection["anchor_indices"]))
+    anchor_metadata = build_cognitive_anchor_metadata(
+        timestamps=[float(index) for index in range(len(embeddings))],
+        anchor_indices=cognitive_selection["anchor_indices"],
+        selected_indices=selected_indices,
+        protected_indices=protected_indices,
+        representative_indices=representative_indices,
+        event_boundary_scores=event_boundary_scores,
+        visual_novelty_scores=visual_novelty_scores,
+        event_boundary_peak_indices=cognitive_selection["event_boundary_peak_indices"],
+        visual_novelty_peak_indices=cognitive_selection["visual_novelty_peak_indices"],
+    )
     return {
         "selected_indices": selected_indices,
         "protected_indices": protected_indices,
         "representative_indices": representative_indices,
         "merged_pairs": merged_pairs,
         "energy_scores": energy_scores,
+        "event_boundary_scores": event_boundary_scores,
+        "visual_novelty_scores": visual_novelty_scores,
+        "event_boundary_peak_indices": cognitive_selection["event_boundary_peak_indices"],
+        "visual_novelty_peak_indices": cognitive_selection["visual_novelty_peak_indices"],
+        "cognitive_anchor_indices": cognitive_selection["anchor_indices"],
+        "memorability_prior": compute_memorability_prior(
+            anchor_metadata=anchor_metadata,
+            event_boundary_scores=event_boundary_scores,
+            visual_novelty_scores=visual_novelty_scores,
+            dense_frame_count=len(embeddings),
+        ),
     }
+
+
+def compute_visual_novelty_scores(
+    embeddings: list[list[float]],
+    *,
+    similarity_matrix: list[list[float]] | None = None,
+    lookback: int = 4,
+) -> list[float]:
+    if not embeddings:
+        return []
+    if lookback <= 0:
+        raise ValueError(f"lookback must be positive, got {lookback}")
+    matrix = similarity_matrix or build_similarity_matrix(embeddings)
+    scores: list[float] = []
+    for index in range(len(embeddings)):
+        if index == 0:
+            scores.append(0.0)
+            continue
+        start = max(0, index - lookback)
+        best_recent_similarity = max(matrix[index][candidate] for candidate in range(start, index))
+        scores.append(round(_clamp01(1.0 - best_recent_similarity), 4))
+    return scores
+
+
+def compute_event_boundary_scores(
+    embeddings: list[list[float]],
+    *,
+    similarity_matrix: list[list[float]] | None = None,
+    energy_scores: list[float] | None = None,
+    lookback: int = 4,
+) -> list[float]:
+    if not embeddings:
+        return []
+    if lookback <= 0:
+        raise ValueError(f"lookback must be positive, got {lookback}")
+    if len(embeddings) == 1:
+        return [0.0]
+
+    matrix = similarity_matrix or build_similarity_matrix(embeddings)
+    novelty_scores = compute_visual_novelty_scores(
+        embeddings,
+        similarity_matrix=matrix,
+        lookback=lookback,
+    )
+    inverse_energy_scores = normalize_inverse_scores(
+        energy_scores or compute_energy_scores(matrix)
+    )
+
+    boundary_scores: list[float] = []
+    for index in range(len(embeddings)):
+        if index == 0:
+            boundary_scores.append(0.0)
+            continue
+        previous_delta = _clamp01(1.0 - matrix[index][index - 1])
+        next_delta = (
+            _clamp01(1.0 - matrix[index][index + 1])
+            if index + 1 < len(embeddings)
+            else previous_delta
+        )
+        context_start = max(0, index - lookback)
+        context_similarity = sum(
+            matrix[index][candidate] for candidate in range(context_start, index)
+        ) / max(index - context_start, 1)
+        context_delta = _clamp01(1.0 - context_similarity)
+        score = (
+            (0.45 * context_delta)
+            + (0.25 * previous_delta)
+            + (0.15 * novelty_scores[index])
+            + (0.10 * next_delta)
+            + (0.05 * inverse_energy_scores[index])
+        )
+        boundary_scores.append(round(_clamp01(score), 4))
+    return boundary_scores
+
+
+def normalize_inverse_scores(scores: list[float]) -> list[float]:
+    if not scores:
+        return []
+    minimum = min(scores)
+    maximum = max(scores)
+    if maximum <= minimum:
+        return [0.0 for _score in scores]
+    return [round(_clamp01(1.0 - ((score - minimum) / (maximum - minimum))), 4) for score in scores]
+
+
+def select_cognitive_anchor_indices(
+    *,
+    event_boundary_scores: list[float],
+    visual_novelty_scores: list[float],
+    selected_indices: list[int],
+    protected_indices: list[int],
+    representative_indices: list[int],
+) -> dict[str, Any]:
+    frame_count = max(
+        len(event_boundary_scores),
+        len(visual_novelty_scores),
+        max(selected_indices, default=-1) + 1,
+    )
+    if frame_count <= 0:
+        return {
+            "anchor_indices": [],
+            "event_boundary_peak_indices": [],
+            "visual_novelty_peak_indices": [],
+        }
+
+    max_boundary_peaks = max(1, math.ceil(frame_count * 0.12))
+    max_novelty_peaks = max(1, math.ceil(frame_count * 0.10))
+    event_boundary_peak_indices = peak_indices(
+        event_boundary_scores,
+        min_score=adaptive_peak_threshold(
+            event_boundary_scores,
+            floor=COGNITIVE_EVENT_BOUNDARY_MIN_SCORE,
+        ),
+        max_count=max_boundary_peaks,
+    )
+    visual_novelty_peak_indices = peak_indices(
+        visual_novelty_scores,
+        min_score=adaptive_peak_threshold(
+            visual_novelty_scores,
+            floor=COGNITIVE_NOVELTY_MIN_SCORE,
+        ),
+        max_count=max_novelty_peaks,
+    )
+
+    anchor_indices = set(selected_indices)
+    anchor_indices.update(protected_indices)
+    anchor_indices.update(representative_indices)
+    anchor_indices.update(event_boundary_peak_indices)
+    anchor_indices.update(visual_novelty_peak_indices)
+    anchor_indices.add(0)
+    anchor_indices.add(frame_count - 1)
+    return {
+        "anchor_indices": sorted(index for index in anchor_indices if 0 <= index < frame_count),
+        "event_boundary_peak_indices": event_boundary_peak_indices,
+        "visual_novelty_peak_indices": visual_novelty_peak_indices,
+    }
+
+
+def adaptive_peak_threshold(scores: list[float], *, floor: float) -> float:
+    if not scores:
+        return floor
+    mean = sum(scores) / len(scores)
+    variance = sum((score - mean) ** 2 for score in scores) / len(scores)
+    return max(floor, mean + (math.sqrt(variance) * 0.5))
+
+
+def peak_indices(
+    scores: list[float],
+    *,
+    min_score: float,
+    max_count: int,
+) -> list[int]:
+    if max_count <= 0 or not scores:
+        return []
+    candidates: list[tuple[float, int]] = []
+    for index, score in enumerate(scores):
+        if score < min_score:
+            continue
+        previous_score = scores[index - 1] if index > 0 else -1.0
+        next_score = scores[index + 1] if index + 1 < len(scores) else -1.0
+        if score >= previous_score and score >= next_score:
+            candidates.append((score, index))
+    if not candidates:
+        best_index = max(range(len(scores)), key=lambda item: scores[item])
+        if scores[best_index] >= min_score:
+            candidates.append((scores[best_index], best_index))
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    selected: list[int] = []
+    for _score, index in candidates:
+        if any(abs(index - existing) <= 1 for existing in selected):
+            continue
+        selected.append(index)
+        if len(selected) >= max_count:
+            break
+    return sorted(selected)
+
+
+def build_score_timeline(
+    *,
+    timestamps: list[float],
+    scores: list[float],
+    peak_indices: list[int],
+) -> list[dict[str, Any]]:
+    peak_set = set(peak_indices)
+    timeline: list[dict[str, Any]] = []
+    for index, (timestamp, score) in enumerate(zip(timestamps, scores, strict=False)):
+        timeline.append(
+            {
+                "timestamp": round(float(timestamp), 3),
+                "score": round(float(score), 4),
+                "peak": index in peak_set,
+            }
+        )
+    return timeline
+
+
+def build_cognitive_anchor_metadata(
+    *,
+    timestamps: list[float],
+    anchor_indices: list[int],
+    selected_indices: list[int],
+    protected_indices: list[int],
+    representative_indices: list[int],
+    event_boundary_scores: list[float],
+    visual_novelty_scores: list[float],
+    event_boundary_peak_indices: list[int],
+    visual_novelty_peak_indices: list[int],
+) -> list[dict[str, Any]]:
+    selected_set = set(selected_indices)
+    protected_set = set(protected_indices)
+    representative_set = set(representative_indices)
+    boundary_peak_set = set(event_boundary_peak_indices)
+    novelty_peak_set = set(visual_novelty_peak_indices)
+    anchor_metadata: list[dict[str, Any]] = []
+    frame_count = len(timestamps)
+
+    for index in sorted(set(anchor_indices)):
+        if index < 0 or index >= frame_count:
+            continue
+        reasons: list[str] = []
+        if index in selected_set:
+            reasons.append("pitome_selected")
+        if index in protected_set:
+            reasons.append("pitome_protected_novelty")
+        if index in representative_set:
+            reasons.append("pitome_representative")
+        if index == 0:
+            reasons.append("event_start")
+        if index == frame_count - 1:
+            reasons.append("event_end")
+        if index in boundary_peak_set:
+            reasons.append("event_boundary_peak")
+        if index in novelty_peak_set:
+            reasons.append("visual_novelty_peak")
+        if not reasons:
+            reasons.append("cognitive_anchor")
+
+        boundary_score = (
+            event_boundary_scores[index] if index < len(event_boundary_scores) else 0.0
+        )
+        novelty_score = visual_novelty_scores[index] if index < len(visual_novelty_scores) else 0.0
+        anchor_score = max(
+            boundary_score,
+            novelty_score,
+            0.7 if "event_start" in reasons or "event_end" in reasons else 0.0,
+            0.6 if "pitome_representative" in reasons else 0.0,
+            0.55 if "pitome_protected_novelty" in reasons else 0.0,
+        )
+        anchor_metadata.append(
+            {
+                "timestamp": round(float(timestamps[index]), 3),
+                "dense_index": index,
+                "reasons": reasons,
+                "score": round(_clamp01(anchor_score), 4),
+                "event_boundary_score": round(_clamp01(boundary_score), 4),
+                "visual_novelty_score": round(_clamp01(novelty_score), 4),
+            }
+        )
+    return anchor_metadata
+
+
+def filter_cognitive_anchor_metadata(
+    anchor_metadata: list[dict[str, Any]],
+    selected_timestamps: list[float],
+) -> list[dict[str, Any]]:
+    if not anchor_metadata or not selected_timestamps:
+        return []
+    selected = [float(timestamp) for timestamp in selected_timestamps]
+    return [
+        dict(item)
+        for item in anchor_metadata
+        if any(
+            abs(float(item.get("timestamp", -1.0)) - timestamp)
+            <= COGNITIVE_ANCHOR_TIMESTAMP_TOLERANCE
+            for timestamp in selected
+        )
+    ]
+
+
+def compute_memorability_prior(
+    *,
+    anchor_metadata: list[dict[str, Any]],
+    event_boundary_scores: list[float],
+    visual_novelty_scores: list[float],
+    dense_frame_count: int,
+) -> float:
+    if dense_frame_count <= 0:
+        return 0.0
+    max_boundary = max(event_boundary_scores, default=0.0)
+    max_novelty = max(visual_novelty_scores, default=0.0)
+    anchor_density = min(1.0, len(anchor_metadata) / max(dense_frame_count, 1))
+    reason_bonus = 0.0
+    for item in anchor_metadata:
+        reasons = set(item.get("reasons", []))
+        if "event_boundary_peak" in reasons:
+            reason_bonus += 0.04
+        if "visual_novelty_peak" in reasons:
+            reason_bonus += 0.03
+        if "pitome_protected_novelty" in reasons:
+            reason_bonus += 0.02
+    prior = (
+        (0.40 * max_boundary)
+        + (0.35 * max_novelty)
+        + (0.15 * anchor_density)
+        + min(0.10, reason_bonus)
+    )
+    return round(_clamp01(prior), 4)
+
+
+def limit_indices_preserving_cognitive_anchors(
+    selection: FrameSelectionResult,
+    max_count: int,
+) -> list[int]:
+    if max_count <= 0:
+        raise ValueError(f"max_count must be positive, got {max_count}")
+    item_count = len(selection.frame_paths)
+    if item_count <= max_count:
+        return list(range(item_count))
+    if not selection.cognitive_anchor_metadata:
+        return _temporal_coverage_indices(item_count, max_count)
+
+    priority_by_timestamp: dict[float, tuple[int, float]] = {}
+    for item in selection.cognitive_anchor_metadata:
+        timestamp = float(item.get("timestamp", -1.0))
+        reasons = [str(reason) for reason in item.get("reasons", [])]
+        priority = cognitive_anchor_priority(reasons)
+        score = float(item.get("score", 0.0))
+        priority_by_timestamp[timestamp] = max(
+            priority_by_timestamp.get(timestamp, (0, 0.0)),
+            (priority, score),
+        )
+
+    ranked: list[tuple[int, float, int]] = []
+    for index, timestamp in enumerate(selection.timestamps):
+        priority, score = best_anchor_priority_for_timestamp(
+            float(timestamp),
+            priority_by_timestamp,
+        )
+        ranked.append((priority, score, index))
+    ranked.sort(key=lambda item: (-item[0], -item[1], selection.timestamps[item[2]], item[2]))
+
+    selected = [index for priority, _score, index in ranked if priority > 0][:max_count]
+    if len(selected) < max_count:
+        temporal_candidates = _temporal_coverage_indices(item_count, max_count)
+        for index in temporal_candidates:
+            if index not in selected:
+                selected.append(index)
+            if len(selected) >= max_count:
+                break
+    if len(selected) < max_count:
+        for _priority, _score, index in ranked:
+            if index not in selected:
+                selected.append(index)
+            if len(selected) >= max_count:
+                break
+    return sorted(selected[:max_count])
+
+
+def cognitive_anchor_priority(reasons: list[str]) -> int:
+    priority = 0
+    if "event_start" in reasons or "event_end" in reasons:
+        priority = max(priority, 100)
+    if "event_boundary_peak" in reasons:
+        priority = max(priority, 95)
+    if "visual_novelty_peak" in reasons:
+        priority = max(priority, 85)
+    if "pitome_protected_novelty" in reasons:
+        priority = max(priority, 75)
+    if "pitome_representative" in reasons:
+        priority = max(priority, 65)
+    if "pitome_selected" in reasons:
+        priority = max(priority, 45)
+    return priority
+
+
+def best_anchor_priority_for_timestamp(
+    timestamp: float,
+    priority_by_timestamp: dict[float, tuple[int, float]],
+) -> tuple[int, float]:
+    best = (0, 0.0)
+    for anchor_timestamp, value in priority_by_timestamp.items():
+        if abs(timestamp - anchor_timestamp) <= COGNITIVE_ANCHOR_TIMESTAMP_TOLERANCE:
+            best = max(best, value)
+    return best
 
 
 def build_similarity_matrix(
@@ -662,6 +1184,10 @@ def _normalize_embedding(embedding: list[float]) -> list[float]:
         scale = 1.0 / math.sqrt(len(embedding))
         return [scale] * len(embedding)
     return [value / norm for value in embedding]
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 def _uniform_anchor_indices(item_count: int, anchor_count: int) -> list[int]:

@@ -15,6 +15,7 @@ DEFAULT_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DEFAULT_VERCEL_API_KEY = os.getenv("AI_GATEWAY_API_KEY")
 DEFAULT_PRIME_API_KEY = os.getenv("PRIME_API_KEY")
+DEFAULT_DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEFAULT_PRIME_INTELLECT_BASE_URL = "https://api.pinference.ai/api/v1/"
 
 
@@ -32,9 +33,11 @@ class OpenAIClient(BaseLM):
         api_key: str | None = None,
         model_name: str | None = None,
         base_url: str | None = None,
+        completion_kwargs: dict[str, Any] | None = None,
         **kwargs,
     ):
         super().__init__(model_name=model_name, **kwargs)
+        self.completion_kwargs = dict(completion_kwargs or {})
 
         if api_key is None:
             if base_url == "https://api.openai.com/v1" or base_url is None:
@@ -45,6 +48,8 @@ class OpenAIClient(BaseLM):
                 api_key = DEFAULT_VERCEL_API_KEY
             elif base_url == DEFAULT_PRIME_INTELLECT_BASE_URL:
                 api_key = DEFAULT_PRIME_API_KEY
+            elif base_url and base_url.rstrip("/").startswith("https://api.deepseek.com"):
+                api_key = DEFAULT_DEEPSEEK_API_KEY
 
         # Pass through arbitrary kwargs to the OpenAI client (e.g. default_headers, default_query, max_retries).
         # Exclude model_name since it is not an OpenAI client constructor argument.
@@ -83,7 +88,10 @@ class OpenAIClient(BaseLM):
             extra_body["usage"] = {"include": True}
 
         response = self.client.chat.completions.create(
-            model=model, messages=messages, extra_body=extra_body
+            model=model,
+            messages=messages,
+            extra_body=extra_body,
+            **self.completion_kwargs,
         )
         self._track_cost(response, model)
         return response.choices[0].message.content
@@ -107,7 +115,10 @@ class OpenAIClient(BaseLM):
             extra_body["usage"] = {"include": True}
 
         response = await self.async_client.chat.completions.create(
-            model=model, messages=messages, extra_body=extra_body
+            model=model,
+            messages=messages,
+            extra_body=extra_body,
+            **self.completion_kwargs,
         )
         self._track_cost(response, model)
         return response.choices[0].message.content

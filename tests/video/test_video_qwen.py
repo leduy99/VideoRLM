@@ -32,10 +32,11 @@ def test_qwen_stack_wires_pitome_visual_preprocessing():
 
     bundle = config.build_bundle()
 
-    assert bundle.visual_summarizer.use_pitome is True
     assert bundle.visual_summarizer.summary_granularity == "clip"
     assert bundle.visual_summarizer.pitome_dense_frame_rate == 2.0
     assert bundle.visual_summarizer.pitome_min_frame_count == 8
     assert bundle.visual_summarizer.pitome_max_selected_frames == 6
+    assert bundle.visual_refiner is not None
+    assert bundle.visual_refiner.use_pitome is True
     assert bundle.memory_builder.visual_span_mode == "clip"
     assert bundle.memory_builder.aggregate_child_visual_summaries is True

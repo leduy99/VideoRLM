@@ -8,6 +8,7 @@ from rlm.video import (
     OpenAICompatibleVisualSummarizer,
     TimeSpan,
 )
+from rlm.video.pitome import FrameSelectionResult
 
 
 class FakeAudioTranscriptions:
@@ -108,14 +109,18 @@ def test_openai_compatible_visual_summarizer_uses_pitome(monkeypatch, tmp_path: 
     for path in selected:
         path.write_bytes(b"fake-image")
 
-    class FakeSelection:
-        frame_paths = selected
-
     calls = []
 
     def fake_select_visual_frames_for_span(**kwargs):
         calls.append(kwargs)
-        return FakeSelection()
+        return FrameSelectionResult(
+            strategy="pitome",
+            frame_paths=selected,
+            timestamps=[0.0, 60.0],
+            dense_frame_count=2,
+            embedding_backend="pixel",
+            embedding_size=16,
+        )
 
     monkeypatch.setattr(video_adapters, "select_visual_frames_for_span", fake_select_visual_frames_for_span)
     client = RecordingClient()
@@ -139,6 +144,27 @@ def test_openai_compatible_visual_summarizer_uses_pitome(monkeypatch, tmp_path: 
     assert calls[0]["dense_frame_rate"] == 2.0
     content = client.chat_completions.calls[0]["messages"][1]["content"]
     assert sum(1 for item in content if item["type"] == "image_url") == 1
+
+
+def test_openai_compatible_visual_summarizer_can_use_string_image_urls(monkeypatch, tmp_path: Path):
+    frame_path = tmp_path / "frame.jpg"
+    frame_path.write_bytes(b"fake-image")
+
+    monkeypatch.setattr(video_adapters, "extract_frames_for_span", lambda **kwargs: [frame_path])
+    client = RecordingClient()
+    summarizer = OpenAICompatibleVisualSummarizer(
+        model_name="qwen-vl",
+        client=client,
+        frame_count=1,
+        image_url_format="string",
+    )
+
+    summarizer.summarize("video.mp4", [TimeSpan(0.0, 8.0)])
+
+    content = client.chat_completions.calls[0]["messages"][1]["content"]
+    image_part = next(item for item in content if item["type"] == "image_url")
+    assert isinstance(image_part["image_url"], str)
+    assert image_part["image_url"].startswith("data:image/")
 
 
 def test_openai_compatible_embedding_provider_reads_embeddings():

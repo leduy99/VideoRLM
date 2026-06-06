@@ -1,0 +1,50 @@
+# Conda environment for Qwen3.5 local inference plus the optional InternVideo
+# stage-2 video-window reranker.
+#
+# Create:
+#   conda env create -f environment_internvideo_rerank.yml
+#   conda activate videorlm-internvideo-rerank
+#   bash scripts/install_internvideo_flash_attn.sh
+#
+# flash-attn is intentionally not in the pip block below. It must be installed
+# after conda has installed torch, with pip build isolation disabled; otherwise
+# setup.py fails with: ModuleNotFoundError: No module named 'torch'.
+#
+# The OpenGVLab InternVideo2 Stage2 model imports flash_attn, timm, einops, and
+# cv2. The model config has use_flash_attn=false, but the Python module still
+# imports flash_attn symbols at import time.
+name: videorlm
+channels:
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip>=24
+  - ffmpeg
+  - git
+  - cmake
+  - ninja
+  - packaging
+  - protobuf
+  - numpy<2
+  - opencv
+  - cuda-nvcc=12.6
+  - pip:
+      - -e .
+      - accelerate>=0.33.0
+      - av>=12.0.0
+      - datasets>=2.20.0
+      - decord>=0.6.0
+      - einops>=0.7.0
+      - huggingface-hub>=0.24.0
+      - pillow>=10.4.0
+      - safetensors>=0.4.4
+      - sentencepiece>=0.2.0
+      - timm>=0.9.16
+      - transformers>=5.2.0,<6.0.0
+      - yt-dlp>=2024.8.6
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.10.0+cu126
+      - torchvision==0.25.0+cu126
+      - torchaudio==2.10.0+cu126

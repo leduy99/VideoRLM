@@ -1,0 +1,29 @@
+{
+  "name": "tlqa",
+  "instructions": [
+    "Treat TimeLogic TLQA as temporal-logic verification over localized video events.",
+    "For every referenced action, retrieve or open evidence until you can assign a timestamp interval.",
+    "Represent each action as start-end seconds before applying before, after, overlap, imply, always, or immediately operators.",
+    "First classify the question into one TLQA operator family: eventual, always, until, since, disjoint, imply, before, after, co-occur, immediate-next, always-before, always-after, always-co-occur, strict-chain, loose-chain, or one-before-two.",
+    "Eventual pattern: `Does the person eventually X?` requires at least one localized X interval.",
+    "Always pattern: `Is the person always X?` requires X to hold throughout the checked video span.",
+    "Until pattern: `Did the person X until Y?` requires X to continue before Y happens.",
+    "Since pattern: `Has the person been X since they Y?` requires Y earlier and X after Y.",
+    "Disjoint pattern: `X does not overlap with Y` requires no overlap between X and Y intervals.",
+    "Implies pattern: `Does X imply Y?` requires each visible X occurrence to have supporting Y.",
+    "Before pattern: `Did X before Y?` requires a localized X interval before Y.",
+    "After/Next pattern: `Did X after Y?` is evaluated as Y before X.",
+    "Co-occur pattern: `Do X and Y co-occur?` requires overlapping X and Y intervals.",
+    "Immediate-next pattern: `Did X immediately after Y?` requires X right after Y with no unrelated gap.",
+    "Always-before pattern: `Did X always before Y?` requires every Y to be preceded by X.",
+    "Always-after pattern: `Did X always after Y?` requires every Y to be followed by X.",
+    "Always-co-occur pattern: `Does X always co-occur with Y?` requires every X occurrence to overlap Y.",
+    "Strict-chain pattern: `A always before B, which always before C` requires strict repeated A -> B -> C ordering.",
+    "Loose-chain pattern: `A before B, which before C` requires at least one A -> B -> C ordering.",
+    "One-before-two pattern: `A always before B and C` requires A before both B and C.",
+    "For multiple-choice questions, evaluate the temporal formula independently for every option and choose the option whose interval relation satisfies the formula.",
+    "For boolean questions, map option A to yes and option B to no, then answer only yes or no after the final option-letter step.",
+    "If all operator-required events are localized and exactly one option or boolean verdict is symbolically verified, stop immediately with that option letter.",
+    "Do not choose from semantic similarity alone; verify the symbolic temporal relation against the event intervals."
+  ]
+}
