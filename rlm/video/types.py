@@ -49,6 +49,7 @@ class SpeechSpan:
     time_span: TimeSpan
     speaker: str | None = None
     language: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +57,7 @@ class SpeechSpan:
             "time_span": self.time_span.to_dict(),
             "speaker": self.speaker,
             "language": self.language,
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -65,6 +67,7 @@ class SpeechSpan:
             time_span=TimeSpan.from_dict(data["time_span"]),
             speaker=data.get("speaker"),
             language=data.get("language"),
+            metadata=dict(data.get("metadata", {})),
         )
 
 
@@ -117,12 +120,14 @@ class AudioEvent:
     label: str
     time_span: TimeSpan
     confidence: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "label": self.label,
             "time_span": self.time_span.to_dict(),
             "confidence": self.confidence,
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -131,6 +136,7 @@ class AudioEvent:
             label=data["label"],
             time_span=TimeSpan.from_dict(data["time_span"]),
             confidence=data.get("confidence"),
+            metadata=dict(data.get("metadata", {})),
         )
 
 
@@ -400,11 +406,16 @@ class CrossModalTemporalIndex:
         event_type: str | None = None,
         text_query: str | None = None,
         section_id: str | None = None,
+        temporal_query: str | None = None,
         before: float | None = None,
         after: float | None = None,
         screen_region: str | None = None,
         limit: int | None = None,
     ) -> list[RawTemporalEvent]:
+        if section_id is None and temporal_query:
+            resolved_section = self.resolve_section(temporal_query)
+            if resolved_section is not None:
+                section_id = resolved_section.section_id
         query_tokens = _temporal_index_tokens(text_query or "")
         events: list[tuple[float, RawTemporalEvent]] = []
         for event in self.all_events():
@@ -427,10 +438,46 @@ class CrossModalTemporalIndex:
                 if overlap <= 0:
                     continue
                 score += float(overlap)
+            if temporal_query:
+                score += _temporal_constraint_score(event, temporal_query)
             events.append((score, event))
         events.sort(key=lambda item: (-item[0], item[1].time_span.start, item[1].event_id))
         selected = [event for _, event in events]
         return selected[:limit] if limit is not None else selected
+
+    def resolve_temporal_interval(self, query: str) -> TimeSpan | None:
+        section = self.resolve_section(query)
+        if section is not None:
+            return section.time_span
+        duration = float(self.metadata.get("duration_seconds") or 0.0)
+        if duration <= 0:
+            return None
+        lowered = query.lower()
+        if any(cue in lowered for cue in ("first half", "beginning", "early part")):
+            return TimeSpan(0.0, duration / 2.0)
+        if any(cue in lowered for cue in ("second half", "later part", "ending", "final part")):
+            return TimeSpan(duration / 2.0, duration)
+        return None
+
+    def audio_event_index(self) -> dict[str, Any]:
+        events = []
+        for event in self.audio_events:
+            events.append(
+                {
+                    "event_id": event.event_id,
+                    "label": event.text,
+                    "time_span": event.time_span.to_dict(),
+                    "confidence": event.confidence,
+                    "linked_events": list(event.linked_events),
+                    "occurrence_index": event.metadata.get("occurrence_index"),
+                    "occurrence_count": event.metadata.get("occurrence_count"),
+                    "section_id": event.section_id,
+                    "source": event.metadata.get("audio_index_source"),
+                    "tags": list(event.metadata.get("audio_tags", [])),
+                    "caption": event.metadata.get("audio_caption"),
+                }
+            )
+        return {"events": events, "event_count": len(events)}
 
     def get_code_snapshot(
         self,
@@ -560,6 +607,50 @@ def _temporal_index_tokens(text: str) -> set[str]:
         for token in re.findall(r"[a-z0-9_]+", text.lower().replace("-", "_"))
         if len(token) > 1
     )
+
+
+def _temporal_constraint_score(event: RawTemporalEvent, query: str) -> float:
+    lowered = query.lower()
+    score = 0.0
+    occurrence_index = event.metadata.get("occurrence_index")
+    occurrence_count = event.metadata.get("occurrence_count")
+    section_local_ordinal = event.metadata.get("section_local_ordinal")
+    if _is_int_like(occurrence_index):
+        index = int(occurrence_index)
+        if any(cue in lowered for cue in ("first", "earliest", "initial", "beginning")):
+            score += 2.0 if index == 1 else -0.25
+        if any(cue in lowered for cue in ("second", "2nd")):
+            score += 2.0 if index == 2 else -0.15
+        if any(cue in lowered for cue in ("third", "3rd")):
+            score += 2.0 if index == 3 else -0.15
+    if _is_int_like(occurrence_index) and _is_int_like(occurrence_count):
+        if any(cue in lowered for cue in ("last", "latest", "final", "ending")):
+            score += 2.0 if int(occurrence_index) == int(occurrence_count) else -0.25
+    if _is_int_like(section_local_ordinal):
+        local_index = int(section_local_ordinal)
+        if "section" in lowered and "first" in lowered:
+            score += 1.0 if local_index == 1 else -0.1
+        if "section" in lowered and "third" in lowered:
+            score += 1.0 if local_index == 3 else -0.1
+    if any(cue in lowered for cue in ("before", "previous")) and event.metadata.get(
+        "next_same_entity_event"
+    ):
+        score += 0.35
+    if any(cue in lowered for cue in ("after", "next")) and event.metadata.get(
+        "previous_same_entity_event"
+    ):
+        score += 0.35
+    return score
+
+
+def _is_int_like(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        return value.isdigit()
+    return False
 
 
 @dataclass
@@ -1237,6 +1328,7 @@ class TraceStep:
     observation: dict[str, Any]
     next_state: dict[str, Any]
     raw_model_response: str | None = None
+    timing: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1246,6 +1338,7 @@ class TraceStep:
             "observation": self.observation,
             "next_state": self.next_state,
             "raw_model_response": self.raw_model_response,
+            "timing": dict(self.timing),
         }
 
 
@@ -1256,6 +1349,7 @@ class VideoRLMResult:
     trace: list[dict[str, Any]]
     usage_summary: UsageSummary
     execution_time: float
+    timing: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1264,4 +1358,5 @@ class VideoRLMResult:
             "trace": list(self.trace),
             "usage_summary": self.usage_summary.to_dict(),
             "execution_time": self.execution_time,
+            "timing": dict(self.timing),
         }

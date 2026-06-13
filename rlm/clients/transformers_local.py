@@ -122,6 +122,15 @@ class TransformersClient(BaseLM):
             total_output_tokens=self.last_completion_tokens,
         )
 
+    def unload(self) -> None:
+        self.model = None
+        self.tokenizer = None
+        try:
+            from rlm.video.gpu_memory import clear_torch_cache
+        except ImportError:
+            return
+        clear_torch_cache()
+
     def _ensure_loaded(self) -> None:
         if self.model is not None and self.tokenizer is not None:
             return

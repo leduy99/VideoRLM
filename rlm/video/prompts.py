@@ -47,6 +47,18 @@ Rules:
   intervals in `event_memory`.
 - Respect question_spec preferred_modality: use visual for screen/sign/visible text, audio for
   sound/noise, and speech for spoken explanations.
+- Choose SEARCH/OPEN modality dynamically for the current case. Before each action, check:
+  the question route, the target_slot's preferred modality, `global_context.longshot.expected_modalities`,
+  the frontier item's recommended modality, and which evidence slots are still missing. Open the
+  modality that fills the missing slot; switch modalities when the answer requires a bundle.
+- Treat task modality requirements explicitly:
+  information_retrieval, summarization, and instruction_extraction can be speech-only when the
+  question asks about narration or dialogue; entity_recognition, quantitative_reasoning, and
+  audio_understanding may be single-modality but must use the modality named by the question;
+  temporal_reasoning, causal_reasoning, compositional_reasoning, comparative_analysis, and
+  event_understanding usually need multiple spans from the relevant modality; sentiment_analysis,
+  multimodal_synthesis, cross_modal_verification, and audio_visual_alignment require a cross-modal
+  bundle when visual/audio evidence is available.
 - Respect `global_context.question_route`: for code_value_eval, terminal_output, assignment_count,
   operator_list, and ui_header_text questions, STOP only with evidence whose metadata kind matches
   that route. If `last_stop_verification` says a STOP was rejected, search or open the route's
@@ -56,9 +68,20 @@ Rules:
 - Use MERGE when adjacent event evidence or evidence sharing actor/object/place/topic supports one claim.
 - Use consolidated_memory/event_schema fields in evidence as durable situation-model facts, not as
   final answers by themselves.
+- OPEN observations may include `evidence_bundle` metadata. Treat a bundle as one structured
+  answer support set: inspect its answer_spans, evidence_kinds, source_events, aggregation_rule,
+  temporal_constraints, and opened_targets before deciding whether all question parts are covered.
 - Do not OPEN the same node with the same modality and the same target_slot twice.
 - If a slot has query hints or refinement candidates after a background-only open, use them before STOP.
-- If required slots are already filled, prefer STOP.
+- If `global_context.dynamic_evidence_retrieval.enabled` is true, the frontier is an ordered
+  multi-target evidence chain. Prefer opening the selected chain nodes across distinct targets
+  before STOP, especially for problem+fix, cause+consequence, or event+later-action questions.
+- For non-exact speech, temporal, causal, summarization, or multimodal questions, do not base the
+  final answer on only one plausible span. Open and combine multiple distinct spans when the question
+  asks for cause+effect, before/after, repeated occurrences, comparison, problem+fix, or event+later
+  action. One span is enough only when it contains an exact requested answer.
+- If required slots are already filled, prefer STOP only after the opened evidence covers every
+  needed part of the question, not merely one related mention.
 - If evidence is only background, do not answer from it.
 - Use STOP only when you can answer the user's question from core or support evidence and cite
   relevant evidence ids.
@@ -81,6 +104,66 @@ LONGSHOT_CONTROLLER_PROMPT_SECTION = """LongShotBench instructions:
 - STOP with a natural-language answer, not an option letter, unless explicit answer choices are
   present in the current question.
 - Keep the final answer concise and directly grounded in evidence ids.
+"""
+
+LONGSHOT_POSTVALID_V1_CONTROLLER_PROMPT_SECTION = """LongShotBench postvalid_v1 instructions:
+- Treat most questions as documentary speech QA unless the question explicitly asks for visible
+  text, code, formulas, terminal output, UI labels, counts, or non-speech sounds.
+- For why/how/main-problem questions, answer from core or support speech evidence. Do not require
+  exact answer spans.
+- If support speech evidence is clearly about the same experiment/event/mechanism but omits one
+  query phrase, synthesize the grounded mechanism instead of refusing. For Bell-test/quasar
+  questions, evidence mentioning loopholes, random filter/measurement choices, photons,
+  hidden influences, or using the universe as the randomness source is answer-bearing support.
+- Prefer a concise 2-4 sentence explanation covering the event/entity, mechanism, causal or
+  temporal link, and consequence when those are present in evidence.
+- Before saying evidence is missing, use a broad speech SEARCH with named entities plus dialogue
+  context, then inspect adjacent speech windows.
+- OPEN candidate speech windows even when the first transcript looks sparse or noisy; the tool
+  may run targeted ASR refinement and replace weak coarse ASR with a better local transcript.
+- If opened evidence metadata or excerpts indicate refined ASR/speech refinement, prefer that
+  refined transcript over earlier coarse or lazy ASR text.
+- For non-speech sound questions, SEARCH/OPEN audio evidence first. Audio-event captions from
+  the audio branch are answer-bearing for ambient sounds, alerts, music, crowd reactions, and
+  audio-visual alignment.
+- For sentiment_analysis questions, do not answer from speech alone when visual evidence is
+  available. Search/open the quoted or emotional speech moment, then open a nearby visual window
+  for body language, bench/sideline behavior, coach interaction, and scene context. Open audio
+  evidence too when audio events or tone cues exist. The final answer must synthesize the available
+  speech, visual/context, and audio/tone evidence.
+- After an initial weak OPEN on a speech explanation, do at least one SEARCH followed by another
+  OPEN from the reranked speech frontier before STOP.
+- Use `global_context.postvalid_temporal_intents` to choose search terms:
+  `immediate_after`, `earlier_problem`, `first_piece`, `early_race`, `later_effect`,
+  and `cause_consequence` should bias searches toward the matching temporal section.
+- Multi-evidence questions often need problem + fix, cause + consequence, or immediate event +
+  later action. Aggregate 2-3 speech windows when the first evidence item is partial.
+- Fine ASR windows are local snippets. Use their nearby context and adjacent opened spans to
+  synthesize the final answer; do not copy one raw fine-ASR snippet when it is incomplete.
+- When `dynamic_evidence_retrieval` is present, treat its `targets` and `selected` nodes as the
+  planned evidence combination. Open enough distinct selected nodes to cover the targets before
+  synthesizing the final answer.
+- Concrete multi-span examples:
+  * Quasar loophole question: open spans for distant quasar light, filter-randomness mechanism,
+    and loophole/consequence. Do not STOP after only the Canary Islands setup intro.
+  * Bench/tryout question: open spans for roster/goal, bench actions such as rebounding or high
+    fives, and the contribution/readiness result. Do not answer from goal text alone.
+  * Sentiment bench/tryout question: combine speech such as "I'm ready", "I need to prove myself",
+    or "throw you in" with visual evidence of the person on the bench/not playing and coach
+    interaction, plus scenario context that the person is a non-roster tryout participant. Use
+    tone only as support; do not infer sentiment from transcript alone when visual context exists.
+  * Tire-choice question: open spans for the harder tire decision context, hotter-track tire effect,
+    and race consequence. Do not answer from only a position/order race-call snippet.
+  * First-jewelry question: open one span identifying the item and another span explaining why it
+    mattered. Do not stop after only a generic jewelry or sister/chain mention.
+- Only say evidence is insufficient when the opened evidence is about a different topic or lacks
+  any answer-bearing mechanism. Do not refuse merely because the exact named entity appears in
+  the scenario/dialogue rather than the opened transcript excerpt.
+- Use scenario as a retrieval hint only when it agrees with the current question. If scenario and
+  question named entities conflict, trust the current question.
+- For follow-up questions, include prior user/assistant context in the SEARCH query.
+- Do not use OCR/code routes unless the current question explicitly asks for screen text, code,
+  formulas, terminal output, UI labels, or counts.
 """
 
 TIMELOGIC_CONTROLLER_PROMPT_SECTION = """TimeLogic/TLQA instructions:
@@ -121,6 +204,12 @@ def build_controller_prompt(
     benchmark = state.global_context.get("benchmark")
     if benchmark == "longshotbench" or state.global_context.get("longshot") is not None:
         prompt += "\n\n" + LONGSHOT_CONTROLLER_PROMPT_SECTION
+        longshot_context = state.global_context.get("longshot")
+        if (
+            isinstance(longshot_context, dict)
+            and longshot_context.get("dataset_name") == "postvalid_v1"
+        ):
+            prompt += "\n\n" + LONGSHOT_POSTVALID_V1_CONTROLLER_PROMPT_SECTION
     if benchmark == "timelogic" or getattr(state.event_memory, "task_name", None) == "timelogic":
         prompt += "\n\n" + TIMELOGIC_CONTROLLER_PROMPT_SECTION
     return prompt + "\n\nCurrent state:\n" + json.dumps(

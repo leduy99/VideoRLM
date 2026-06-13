@@ -34,7 +34,13 @@ from rlm.video.pitome import (
     load_frame_embeddings,
     select_visual_frames_for_span,
 )
-from rlm.video.types import OCRSpan, SpeechSpan, TimeSpan, VideoNodeLevel, VisualSummarySpan
+from rlm.video.types import (
+    OCRSpan,
+    SpeechSpan,
+    TimeSpan,
+    VideoNodeLevel,
+    VisualSummarySpan,
+)
 
 
 @dataclass
@@ -48,6 +54,7 @@ class LocalQwenASRSpeechRecognizer:
     ffmpeg_bin: str = "ffmpeg"
     ffprobe_bin: str = "ffprobe"
     chunk_duration_seconds: float = 60.0
+    chunk_batch_size: int = 1
     max_inference_batch_size: int = 8
     max_new_tokens: int = 512
     model: Any | None = None
@@ -117,10 +124,18 @@ class LocalQwenASRSpeechRecognizer:
             )
         )
         duration_seconds = probe_media_duration(audio_path, ffprobe_bin=self.ffprobe_bin)
-        chunks = _chunk_time_spans(duration_seconds, self.chunk_duration_seconds)
+        if self.chunk_duration_seconds <= 0:
+            chunks = [TimeSpan(0.0, duration_seconds)] if duration_seconds > 0 else []
+        else:
+            chunks = _chunk_time_spans(duration_seconds, self.chunk_duration_seconds)
+        if self.chunk_batch_size <= 0:
+            raise ValueError(
+                f"chunk_batch_size must be positive, got {self.chunk_batch_size}"
+            )
         self._log(
             f"chunked ASR duration={duration_seconds:.2f}s chunks={len(chunks)} "
-            f"chunk_seconds={self.chunk_duration_seconds:.2f}"
+            f"chunk_seconds={self.chunk_duration_seconds:.2f} "
+            f"chunk_batch_size={self.chunk_batch_size}"
         )
         self._notify_progress(
             phase="asr",
@@ -130,32 +145,53 @@ class LocalQwenASRSpeechRecognizer:
         )
         spans: list[SpeechSpan] = []
 
-        for index, chunk_span in enumerate(chunks, start=1):
-            self._log(f"ASR chunk {index}/{len(chunks)} span={chunk_span.to_display()}")
-            chunk_path = extract_audio_segment(
-                media_path=audio_path,
-                span=chunk_span,
-                output_path=temp_dir / f"chunk_{index:03d}.wav",
-                ffmpeg_bin=self.ffmpeg_bin,
-            )
-            chunk_results = model.transcribe(
-                audio=str(chunk_path),
-                language=None,
-                return_time_stamps=False,
-            )
-            parsed = self._parse_results(chunk_results)
-            self._notify_progress(
-                phase="asr",
-                event="advance",
-                advance=1,
-                index=index,
-                total=len(chunks),
-                status=f"asr {index}/{len(chunks)} parsed_spans={len(parsed)}",
-            )
-            self._log(f"ASR chunk {index}/{len(chunks)} parsed_spans={len(parsed)}")
-            for item in parsed:
-                spans.append(_offset_speech_span(item, chunk_span))
+        for batch_start in range(0, len(chunks), self.chunk_batch_size):
+            batch_chunks = chunks[batch_start : batch_start + self.chunk_batch_size]
+            batch_paths: list[Path] = []
+            for offset, chunk_span in enumerate(batch_chunks):
+                index = batch_start + offset + 1
+                self._log(f"ASR chunk {index}/{len(chunks)} span={chunk_span.to_display()}")
+                batch_paths.append(
+                    extract_audio_segment(
+                        media_path=audio_path,
+                        span=chunk_span,
+                        output_path=temp_dir / f"chunk_{index:03d}.wav",
+                        ffmpeg_bin=self.ffmpeg_bin,
+                    )
+                )
+            chunk_results_batch = self._transcribe_chunk_batch(model, batch_paths)
+            for offset, chunk_results in enumerate(chunk_results_batch):
+                index = batch_start + offset + 1
+                chunk_span = batch_chunks[offset]
+                parsed = self._parse_results(chunk_results)
+                self._notify_progress(
+                    phase="asr",
+                    event="advance",
+                    advance=1,
+                    index=index,
+                    total=len(chunks),
+                    status=f"asr {index}/{len(chunks)} parsed_spans={len(parsed)}",
+                )
+                self._log(f"ASR chunk {index}/{len(chunks)} parsed_spans={len(parsed)}")
+                for item in parsed:
+                    spans.append(_offset_speech_span(item, chunk_span))
         return spans
+
+    def _transcribe_chunk_batch(self, model, batch_paths: list[Path]) -> list[Any]:
+        if len(batch_paths) == 1:
+            return [
+                model.transcribe(
+                    audio=str(batch_paths[0]),
+                    language=None,
+                    return_time_stamps=False,
+                )
+            ]
+        raw_results = model.transcribe(
+            audio=[str(path) for path in batch_paths],
+            language=None,
+            return_time_stamps=False,
+        )
+        return _split_asr_batch_results(raw_results, len(batch_paths))
 
     def _ensure_loaded(self):
         if self.model is not None:
@@ -184,6 +220,12 @@ class LocalQwenASRSpeechRecognizer:
         self.model = Qwen3ASRModel.from_pretrained(self.model_path or self.model_name, **kwargs)
         self._log("ASR model loaded")
         return self.model
+
+    def unload(self) -> None:
+        self.model = None
+        from rlm.video.gpu_memory import clear_torch_cache
+
+        clear_torch_cache()
 
     def _parse_results(self, results: Any) -> list[SpeechSpan]:
         if not results:
@@ -335,6 +377,7 @@ class LocalQwenVisualSummarizer:
     pitome_max_scene_boundary_frames: int = 6
     pitome_scene_sample_rate: float | None = 1.0
     pitome_scene_keyframes_only: bool = True
+    pitome_edge_boundary_frames: bool = True
     frame_embedding_provider: ImageTextEmbeddingProvider | None = None
     summary_granularity: VideoNodeLevel | None = None
     prompt_override: str | None = None
@@ -692,6 +735,7 @@ class LocalQwenVisualSummarizer:
             max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
             scene_sample_rate=self.pitome_scene_sample_rate,
             scene_keyframes_only=self.pitome_scene_keyframes_only,
+            include_edge_boundary_frames=self.pitome_edge_boundary_frames,
         )
 
     def _semantic_frame_metadata(self, frame_paths: list[Path]) -> dict[str, Any]:
@@ -745,6 +789,14 @@ class LocalQwenVisualSummarizer:
         self.processor = AutoProcessor.from_pretrained(model_path)
         self._log("VL model loaded")
         return self.model, self.processor
+
+    def unload(self) -> None:
+        self.model = None
+        self.processor = None
+        from rlm.video.gpu_memory import clear_torch_cache, unload_component
+
+        unload_component(self.frame_embedding_provider)
+        clear_torch_cache()
 
     def _resolve_input_device(self, model):
         try:
@@ -809,6 +861,7 @@ class LazyPiToMeVisualIndexer:
     pitome_max_scene_boundary_frames: int = 6
     pitome_scene_sample_rate: float | None = 1.0
     pitome_scene_keyframes_only: bool = True
+    pitome_edge_boundary_frames: bool = True
     frame_embedding_provider: ImageTextEmbeddingProvider | None = None
     visual_index_batch_size: int = 1
     visual_index_workers: int = 1
@@ -924,6 +977,12 @@ class LazyPiToMeVisualIndexer:
         self._log(f"lazy visual index done summaries={len(summaries)}")
         return summaries
 
+    def unload(self) -> None:
+        from rlm.video.gpu_memory import clear_torch_cache, unload_component
+
+        unload_component(self.frame_embedding_provider)
+        clear_torch_cache()
+
     def _select_visual_index_frames(
         self,
         *,
@@ -985,6 +1044,7 @@ class LazyPiToMeVisualIndexer:
             max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
             scene_sample_rate=self.pitome_scene_sample_rate,
             scene_keyframes_only=self.pitome_scene_keyframes_only,
+            include_edge_boundary_frames=self.pitome_edge_boundary_frames,
         )
 
     def _infer_granularity(self, span: TimeSpan) -> str:
@@ -1115,6 +1175,12 @@ class PaddleOCRTextExtractor:
             device=self.device,
         )
         return self.model
+
+    def unload(self) -> None:
+        self.model = None
+        from rlm.video.gpu_memory import clear_torch_cache
+
+        clear_torch_cache()
 
     def _predict_frame_lines(self, model: Any, frame_path: Path) -> list[str]:
         if hasattr(model, "predict"):
@@ -1317,6 +1383,12 @@ class FasterWhisperSpeechRecognizer:
         )
         self.model = WhisperModel(self.model_name, **kwargs)
         return self.model
+
+    def unload(self) -> None:
+        self.model = None
+        from rlm.video.gpu_memory import clear_torch_cache
+
+        clear_torch_cache()
 
     def _notify_progress(self, **payload: Any) -> None:
         if self.progress_callback is not None:
@@ -1619,6 +1691,7 @@ def _add_boundary_frames_to_selection(
     max_scene_boundary_frames: int,
     scene_sample_rate: float | None,
     scene_keyframes_only: bool,
+    include_edge_boundary_frames: bool,
 ) -> tuple[FrameSelectionResult, dict[str, list[float]]]:
     boundary_metadata = _boundary_timestamps_for_span(
         video_path=video_path,
@@ -1628,6 +1701,7 @@ def _add_boundary_frames_to_selection(
         max_scene_boundary_frames=max_scene_boundary_frames,
         scene_sample_rate=scene_sample_rate,
         scene_keyframes_only=scene_keyframes_only,
+        include_edge_boundary_frames=include_edge_boundary_frames,
     )
     boundary_timestamps = boundary_metadata["all"]
     if not boundary_timestamps:
@@ -1672,8 +1746,15 @@ def _boundary_timestamps_for_span(
     max_scene_boundary_frames: int,
     scene_sample_rate: float | None,
     scene_keyframes_only: bool,
+    include_edge_boundary_frames: bool,
 ) -> dict[str, list[float]]:
-    edge_timestamps = _span_boundary_timestamps(span)
+    edge_timestamps = _span_boundary_timestamps(span) if include_edge_boundary_frames else []
+    if not edge_timestamps and max_scene_boundary_frames == 0:
+        return {
+            "all": [],
+            "edges": [],
+            "scene": [],
+        }
     scene_timestamps = detect_scene_boundary_timestamps(
         video_path,
         span=span,
@@ -2052,6 +2133,7 @@ def _offset_speech_span(span: SpeechSpan, chunk_span: TimeSpan) -> SpeechSpan:
         time_span=time_span,
         speaker=span.speaker,
         language=span.language,
+        metadata=dict(span.metadata),
     )
 
 
@@ -2070,6 +2152,26 @@ def _chunk_time_spans(duration_seconds: float, chunk_duration_seconds: float) ->
     return spans
 
 
+def _split_asr_batch_results(results: Any, batch_size: int) -> list[Any]:
+    if not isinstance(results, (list, tuple)):
+        raise ValueError(
+            "Batched Qwen ASR returned a non-list result. "
+            "Set SPEECH_ASR_CHUNK_BATCH_SIZE=1 to use sequential ASR."
+        )
+    if len(results) != batch_size:
+        raise ValueError(
+            f"Batched Qwen ASR returned {len(results)} results for {batch_size} chunks. "
+            "Set SPEECH_ASR_CHUNK_BATCH_SIZE=1 to use sequential ASR."
+        )
+    grouped: list[Any] = []
+    for item in results:
+        if isinstance(item, (list, tuple)):
+            grouped.append(list(item))
+        else:
+            grouped.append([item])
+    return grouped
+
+
 def _merge_speech_spans(spans: list[SpeechSpan]) -> SpeechSpan:
     if not spans:
         raise ValueError("Cannot merge an empty list of speech spans")
@@ -2079,6 +2181,10 @@ def _merge_speech_spans(spans: list[SpeechSpan]) -> SpeechSpan:
         time_span=TimeSpan(spans[0].time_span.start, spans[-1].time_span.end),
         speaker=spans[0].speaker,
         language=spans[0].language,
+        metadata={
+            "merged_span_count": len(spans),
+            "source_span_times": [span.time_span.to_dict() for span in spans],
+        },
     )
 
 

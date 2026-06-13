@@ -3,13 +3,15 @@ import difflib
 import json
 import re
 import tempfile
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from rlm.clients.base_lm import BaseLM
 from rlm.video.adapters import SpeechRecognizer, VisualSummarizer
+from rlm.video.dynamic_retrieval import select_dynamic_evidence_chain
 from rlm.video.evidence_pipeline import (
     build_question_spec,
     is_reopen_blocked,
@@ -20,6 +22,7 @@ from rlm.video.evidence_pipeline import (
     select_target_slot,
 )
 from rlm.video.index import STOPWORDS, TOKEN_PATTERN, VideoMemoryIndex
+from rlm.video.media import extract_audio_segment, get_videorlm_output_root
 from rlm.video.memory import (
     ACTION_COMPLETION_TERMS,
     ACTION_START_TERMS,
@@ -27,9 +30,9 @@ from rlm.video.memory import (
     CAUSAL_RESOLUTION_TERMS,
     CAUSAL_SETUP_TERMS,
 )
-from rlm.video.media import extract_audio_segment, get_videorlm_output_root
 from rlm.video.question_router import route_from_metadata, route_question, verify_stop_answer
 from rlm.video.rerankers import VideoWindowReranker
+from rlm.video.timing import TimingRecorder
 from rlm.video.types import (
     ControllerAction,
     ControllerState,
@@ -80,9 +83,11 @@ class ControllerEvidenceClassifier:
         client: BaseLM,
         *,
         max_evidence_chars: int = 1800,
+        timing_recorder: TimingRecorder | None = None,
     ):
         self.client = client
         self.max_evidence_chars = max_evidence_chars
+        self.timing_recorder = timing_recorder
         self._cache: dict[str, dict[str, Any] | None] = {}
 
     def classify(
@@ -109,7 +114,14 @@ class ControllerEvidenceClassifier:
             heuristic_role=heuristic_role,
             heuristic_score=heuristic_score,
         )
+        completion_start = time.perf_counter()
         raw_response = self.client.completion(prompt)
+        completion_seconds = time.perf_counter() - completion_start
+        if self.timing_recorder is not None:
+            self.timing_recorder.add(
+                "tool.open.evidence_classifier.controller_completion",
+                completion_seconds,
+            )
         payload = self._parse_json_object(raw_response)
         if payload is None:
             self._cache[cache_key] = None
@@ -255,9 +267,12 @@ class VideoToolExecutor:
         top_k: int = 5,
         *,
         speech_snippet_refiner: BaseLM | None = None,
+        speech_search_reranker: BaseLM | None = None,
         enable_hybrid_speech_refinement: bool = False,
         speech_refine_candidate_count: int = 4,
         speech_refiner: SpeechRecognizer | None = None,
+        enable_targeted_asr_refinement: bool = False,
+        enable_refinement_frontier: bool = True,
         visual_refiner: VisualSummarizer | None = None,
         enable_vrrqa_graph_refinement_expansion: bool = True,
         vrrqa_graph_refinement_neighbor_count: int = 1,
@@ -265,51 +280,81 @@ class VideoToolExecutor:
         evidence_classifier_client: BaseLM | None = None,
         enable_controller_evidence_classifier: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        timing_recorder: TimingRecorder | None = None,
     ):
         self.memory = memory
         self.index = index or VideoMemoryIndex(memory)
         self.top_k = top_k
+        self.timing_recorder = timing_recorder
         self._evidence_counter = 0
         self.speech_snippet_refiner = speech_snippet_refiner
+        self.speech_search_reranker = speech_search_reranker
         self.enable_hybrid_speech_refinement = (
             enable_hybrid_speech_refinement and speech_snippet_refiner is not None
         )
         self.speech_refine_candidate_count = speech_refine_candidate_count
         self.speech_refiner = speech_refiner
+        self.enable_targeted_asr_refinement = enable_targeted_asr_refinement
+        self.enable_refinement_frontier = enable_refinement_frontier
         self.visual_refiner = visual_refiner
         self.enable_vrrqa_graph_refinement_expansion = enable_vrrqa_graph_refinement_expansion
         self.vrrqa_graph_refinement_neighbor_count = vrrqa_graph_refinement_neighbor_count
         self.video_window_reranker = video_window_reranker
         self.evidence_classifier = (
-            ControllerEvidenceClassifier(evidence_classifier_client)
+            ControllerEvidenceClassifier(
+                evidence_classifier_client,
+                timing_recorder=timing_recorder,
+            )
             if enable_controller_evidence_classifier and evidence_classifier_client is not None
             else None
         )
         self.progress_callback = progress_callback
 
     def execute(self, action: ControllerAction, state: ControllerState) -> Observation:
+        start = time.perf_counter()
         if action.action_type == "SEARCH":
-            return self.search(
+            observation = self.search(
                 query=action.query or "",
                 modality=action.modality,
                 top_k=self.top_k,
                 state=state,
                 target_slot=action.target_slot,
             )
-        if action.action_type == "OPEN":
-            return self.open(
-                node_id=action.node_id or "",
-                modality=action.modality,
-                state=state,
-                target_slot=action.target_slot,
-            )
-        if action.action_type == "SPLIT":
-            return self.split(action.node_id or "")
-        if action.action_type == "MERGE":
-            return self.merge(action.evidence_ids, state)
-        if action.action_type == "STOP":
-            return self.stop(action.answer or "", action.evidence_ids, state)
-        raise ValueError(f"Unsupported action type: {action.action_type}")
+        elif action.action_type == "OPEN":
+            chain_items = self._dynamic_chain_bundle_items(action, state)
+            if len(chain_items) > 1:
+                observation = self.open_chain(chain_items=chain_items, state=state)
+            else:
+                observation = self.open(
+                    node_id=action.node_id or "",
+                    modality=action.modality,
+                    state=state,
+                    target_slot=action.target_slot,
+                )
+        elif action.action_type == "SPLIT":
+            observation = self.split(action.node_id or "")
+        elif action.action_type == "MERGE":
+            observation = self.merge(action.evidence_ids, state)
+        elif action.action_type == "STOP":
+            observation = self.stop(action.answer or "", action.evidence_ids, state)
+        else:
+            raise ValueError(f"Unsupported action type: {action.action_type}")
+        elapsed = time.perf_counter() - start
+        self._record_timing(f"tool.execute.{action.action_type.lower()}", elapsed)
+        timing = self._observation_timing(observation)
+        timing["tool_execute_seconds"] = round(elapsed, 6)
+        return observation
+
+    def _record_timing(self, component: str, seconds: float) -> None:
+        if self.timing_recorder is not None:
+            self.timing_recorder.add(component, seconds)
+
+    def _observation_timing(self, observation: Observation) -> dict[str, Any]:
+        timing = observation.metadata.get("timing")
+        if not isinstance(timing, dict):
+            timing = {}
+            observation.metadata["timing"] = timing
+        return timing
 
     def search(
         self,
@@ -319,9 +364,11 @@ class VideoToolExecutor:
         state: ControllerState,
         target_slot: str | None,
     ) -> Observation:
+        total_start = time.perf_counter()
         question_spec = state.question_spec or build_question_spec(state.question, state.task_type)
         selected_slot = target_slot or select_target_slot(question_spec, state.evidence_board)
-        search_top_k = self._search_candidate_count(top_k, modality)
+        search_top_k = self._search_candidate_count(top_k, modality, state)
+        search_start = time.perf_counter()
         frontier, metadata = search_v2(
             index=self.index,
             question_spec=question_spec,
@@ -331,28 +378,71 @@ class VideoToolExecutor:
             query_override=query or None,
             modality=modality,
         )
+        search_seconds = time.perf_counter() - search_start
+        self._record_timing("tool.search.search_v2", search_seconds)
+        dynamic_plan_metadata: dict[str, Any] = {"enabled": False}
+        dynamic_plan = select_dynamic_evidence_chain(
+            index=self.index,
+            state=state,
+            question_spec=question_spec,
+            top_k=max(top_k, 3),
+            query_override=query or None,
+        )
+        dynamic_plan_applied = dynamic_plan is not None
+        if dynamic_plan is not None:
+            frontier = dynamic_plan.frontier
+            dynamic_plan_metadata = dynamic_plan.to_metadata()
+            state.global_context["dynamic_evidence_retrieval"] = dynamic_plan_metadata
         rerank_metadata: dict[str, Any] = {"stage2_rerank_applied": False}
-        if frontier and self._should_apply_video_window_rerank(metadata):
+        speech_rerank_metadata: dict[str, Any] = {"speech_rerank_applied": False}
+        rerank_seconds = 0.0
+        speech_rerank_seconds = 0.0
+        if (
+            frontier
+            and not dynamic_plan_applied
+            and self._should_apply_speech_search_rerank(metadata, state)
+        ):
             rerank_query = self._video_window_rerank_query(query, metadata)
+            speech_rerank_start = time.perf_counter()
+            frontier, speech_rerank_metadata = self._rerank_speech_frontier(
+                query=rerank_query,
+                candidates=frontier,
+                state=state,
+                top_k=min(top_k, 3),
+            )
+            speech_rerank_seconds = time.perf_counter() - speech_rerank_start
+            self._record_timing(
+                "tool.search.postvalid_speech_rerank",
+                speech_rerank_seconds,
+            )
+        elif frontier and not dynamic_plan_applied and self._should_apply_video_window_rerank(metadata):
+            rerank_query = self._video_window_rerank_query(query, metadata)
+            rerank_start = time.perf_counter()
             frontier, rerank_metadata = self.video_window_reranker.rerank(
                 query=rerank_query,
                 candidates=frontier,
                 memory=self.memory,
                 top_k=top_k,
             )
+            rerank_seconds = time.perf_counter() - rerank_start
+            self._record_timing("tool.search.stage2_video_window_rerank", rerank_seconds)
         else:
             frontier = frontier[:top_k]
         zero_hit_temporal_expansion = False
+        zero_hit_seconds = 0.0
         if not frontier and self._should_use_zero_hit_temporal_expansion(
             state,
             metadata.get("modality"),
         ):
+            zero_hit_start = time.perf_counter()
             frontier = self._zero_hit_temporal_frontier(
                 state=state,
                 modality=metadata.get("modality") or modality or "visual",
                 target_slot=selected_slot,
                 limit=min(top_k, 2),
             )
+            zero_hit_seconds = time.perf_counter() - zero_hit_start
+            self._record_timing("tool.search.zero_hit_temporal_expansion", zero_hit_seconds)
             zero_hit_temporal_expansion = bool(frontier)
         summary = (
             f"SEARCH {metadata.get('search_mode', 'lexical')} found {len(frontier)} candidate nodes for "
@@ -360,8 +450,14 @@ class VideoToolExecutor:
         )
         if zero_hit_temporal_expansion:
             summary += " Used zero-hit temporal visual expansion."
+        if speech_rerank_metadata.get("speech_rerank_applied"):
+            summary += " Applied postvalid speech reranking."
         if rerank_metadata.get("stage2_rerank_applied"):
             summary += " Applied stage-2 video-window reranking."
+        if dynamic_plan_applied:
+            summary += " Applied dynamic multi-evidence DP retrieval."
+        total_seconds = time.perf_counter() - total_start
+        self._record_timing("tool.search.total", total_seconds)
         return Observation(
             kind="search",
             summary=summary,
@@ -375,14 +471,31 @@ class VideoToolExecutor:
                 "zero_hit_temporal_expansion": zero_hit_temporal_expansion,
                 "target_slot": selected_slot,
                 "queries": metadata["queries"],
+                "searched_modalities": metadata.get("searched_modalities", []),
+                "dynamic_evidence_retrieval": dynamic_plan_metadata,
+                **speech_rerank_metadata,
                 **rerank_metadata,
+                "timing": {
+                    "search_total_seconds": round(total_seconds, 6),
+                    "search_v2_seconds": round(search_seconds, 6),
+                    "postvalid_speech_rerank_seconds": round(speech_rerank_seconds, 6),
+                    "stage2_video_window_rerank_seconds": round(rerank_seconds, 6),
+                    "zero_hit_temporal_expansion_seconds": round(zero_hit_seconds, 6),
+                },
             },
         )
 
-    def _search_candidate_count(self, top_k: int, modality: Modality | None) -> int:
+    def _search_candidate_count(
+        self,
+        top_k: int,
+        modality: Modality | None,
+        state: ControllerState | None = None,
+    ) -> int:
+        if state is not None and self._is_postvalid_speech_search(state, modality):
+            return max(top_k, 20)
         if self.video_window_reranker is None:
             return top_k
-        if modality not in {"visual", "ocr", "cross_modal", None}:
+        if modality not in {"visual", "cross_modal", None}:
             return top_k
         return max(top_k, self.video_window_reranker.candidate_count)
 
@@ -390,7 +503,256 @@ class VideoToolExecutor:
         if self.video_window_reranker is None:
             return False
         modality = metadata.get("modality")
-        return modality in {"visual", "ocr", "cross_modal"}
+        route = metadata.get("question_route")
+        if isinstance(route, dict) and route.get("label") in {
+            "speech_explanation",
+            "causal_chain",
+            "temporal_occurrence",
+            "rubric_explanation",
+        }:
+            return False
+        return modality in {"visual", "cross_modal", None}
+
+    def _should_apply_speech_search_rerank(
+        self,
+        metadata: dict[str, Any],
+        state: ControllerState,
+    ) -> bool:
+        if self.speech_search_reranker is None:
+            return False
+        if not self._is_postvalid_speech_search(state, metadata.get("modality")):
+            return False
+        route = metadata.get("question_route")
+        return isinstance(route, dict) and route.get("label") in {
+            "speech_explanation",
+            "causal_chain",
+            "temporal_occurrence",
+            "rubric_explanation",
+        }
+
+    def _is_postvalid_speech_search(
+        self,
+        state: ControllerState,
+        modality: Any,
+    ) -> bool:
+        longshot = state.global_context.get("longshot")
+        if not isinstance(longshot, dict):
+            return False
+        if str(longshot.get("dataset_name") or "") != "postvalid_v1":
+            return False
+        if modality not in {"speech", "cross_modal", None}:
+            return False
+        route = state.global_context.get("question_route")
+        if isinstance(route, dict):
+            return route.get("label") in {
+                "speech_explanation",
+                "causal_chain",
+                "temporal_occurrence",
+                "rubric_explanation",
+                "generic",
+            }
+        return True
+
+    def _rerank_speech_frontier(
+        self,
+        *,
+        query: str,
+        candidates: list[FrontierItem],
+        state: ControllerState,
+        top_k: int,
+    ) -> tuple[list[FrontierItem], dict[str, Any]]:
+        speech_candidates = [
+            item
+            for item in candidates
+            if item.recommended_modalities and item.recommended_modalities[0] == "speech"
+        ]
+        speech_candidates, temporal_metadata = self._order_speech_candidates_by_temporal_constraint(
+            query=query or state.question,
+            candidates=speech_candidates,
+            state=state,
+        )
+        if len(speech_candidates) <= top_k:
+            return speech_candidates[:top_k], {
+                "speech_rerank_applied": False,
+                "speech_rerank_reason": "candidate_count_not_above_limit",
+                **temporal_metadata,
+            }
+        prompt = self._build_speech_rerank_prompt(
+            query=query or state.question,
+            state=state,
+            candidates=speech_candidates[:20],
+            top_k=top_k,
+        )
+        raw_response = self.speech_search_reranker.completion(prompt)
+        selected_ids, reason = self._parse_speech_rerank_response(
+            raw_response,
+            speech_candidates,
+        )
+        if not selected_ids:
+            selected = speech_candidates[:top_k]
+            self._boost_postvalid_speech_rerank_scores(selected)
+            return selected, {
+                "speech_rerank_applied": True,
+                "speech_rerank_backend": "controller",
+                "speech_rerank_fallback": "heuristic_top_k",
+                "speech_rerank_raw_response": raw_response,
+                "speech_rerank_selected_node_ids": [item.node_id for item in selected],
+                **temporal_metadata,
+            }
+        by_id = {item.node_id: item for item in speech_candidates}
+        selected = [by_id[node_id] for node_id in selected_ids if node_id in by_id][:top_k]
+        selected_set = {item.node_id for item in selected}
+        for item in speech_candidates:
+            if len(selected) >= top_k:
+                break
+            if item.node_id not in selected_set:
+                selected.append(item)
+                selected_set.add(item.node_id)
+        self._boost_postvalid_speech_rerank_scores(selected)
+        return selected, {
+            "speech_rerank_applied": True,
+            "speech_rerank_backend": "controller",
+            "speech_rerank_raw_response": raw_response,
+            "speech_rerank_reason": reason,
+            "speech_rerank_selected_node_ids": [item.node_id for item in selected],
+            **temporal_metadata,
+        }
+
+    def _boost_postvalid_speech_rerank_scores(self, items: list[FrontierItem]) -> None:
+        for index, item in enumerate(items):
+            item.score = max(item.score, round(1.25 - (index * 0.05), 4))
+            item.why_candidate = f"Postvalid speech reranker selected rank {index + 1}; {item.why_candidate}"
+
+    def _order_speech_candidates_by_temporal_constraint(
+        self,
+        *,
+        query: str,
+        candidates: list[FrontierItem],
+        state: ControllerState,
+    ) -> tuple[list[FrontierItem], dict[str, Any]]:
+        if not candidates:
+            return candidates, {"speech_temporal_constraint_applied": False}
+        constraint = _speech_temporal_constraint(query, state)
+        if constraint is None:
+            return candidates, {"speech_temporal_constraint_applied": False}
+        filtered, filter_metadata = _filter_speech_candidates_by_temporal_constraint(
+            candidates,
+            constraint,
+            self.memory,
+        )
+        scored = [
+            (
+                -_speech_temporal_keyword_score(
+                    self._frontier_transcript_snippet(self.memory.get_node(item.node_id), max_chars=1400),
+                    constraint,
+                ),
+                _speech_occurrence_constraint_score(self.memory.get_node(item.node_id), constraint),
+                _speech_temporal_constraint_score(item, constraint, self.memory.metadata),
+                -item.score,
+                item.time_span.start,
+                item.node_id,
+                item,
+            )
+            for item in filtered
+        ]
+        scored.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4], row[5]))
+        ordered = [item for _, _, _, _, _, _, item in scored]
+        return ordered, {
+            "speech_temporal_constraint_applied": True,
+            "speech_temporal_constraint": constraint,
+            **filter_metadata,
+            "speech_temporal_constraint_top_node_ids": [item.node_id for item in ordered[:5]],
+        }
+
+    def _build_speech_rerank_prompt(
+        self,
+        *,
+        query: str,
+        state: ControllerState,
+        candidates: list[FrontierItem],
+        top_k: int,
+    ) -> str:
+        candidate_lines = []
+        for index, item in enumerate(candidates, start=1):
+            node = self.memory.get_node(item.node_id)
+            transcript = self._frontier_transcript_snippet(node)
+            candidate_lines.append(
+                json.dumps(
+                    {
+                        "rank": index,
+                        "node_id": item.node_id,
+                        "time_span": item.time_span.to_dict(),
+                        "score": item.score,
+                        "why_candidate": item.why_candidate[:320],
+                        "transcript": transcript,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+        dialogue = [
+            turn
+            for turn in state.dialogue_context[-4:]
+            if str(turn.get("content") or "").strip()
+        ]
+        return "\n".join(
+            [
+                "You are reranking transcript windows for LongShotBench postvalid_v1.",
+                "Select the transcript windows that most directly answer the current question.",
+                "Resolve temporal and ordinal constraints first: first/earliest should prefer early relevant windows; after/later should prefer later windows; avoid nearby repeated scenes that miss the requested occurrence.",
+                "For earlier-problem questions, prefer windows that discuss loopholes, hidden influences, doubtful random choices, or the problem before the fix.",
+                "For early-race or stay-ahead questions, prefer race-start and early-gap windows before last-lap or podium summaries.",
+                "For right-after/what-happened-next questions, prefer the immediate aftermath before later recovery steps.",
+                "Prefer causal/mechanism evidence for why/how questions and use dialogue context for follow-ups.",
+                "Return strict JSON: {\"selected_node_ids\":[\"node_id\"],\"reason\":\"short reason\"}.",
+                f"Select at most {top_k} node ids. Do not invent ids.",
+                "",
+                f"Question: {state.question}",
+                f"Search query: {query}",
+                f"Dialogue context: {json.dumps(dialogue, ensure_ascii=True)}",
+                "Candidates:",
+                *candidate_lines,
+            ]
+        )
+
+    def _frontier_transcript_snippet(self, node: VideoNode, max_chars: int = 900) -> str:
+        transcript = " ".join(span.text.strip() for span in node.speech_spans if span.text)
+        normalized = " ".join(transcript.split()).strip()
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[:max_chars].rsplit(" ", maxsplit=1)[0]
+
+    def _parse_speech_rerank_response(
+        self,
+        raw_response: str,
+        candidates: list[FrontierItem],
+    ) -> tuple[list[str], str]:
+        valid_ids = {item.node_id for item in candidates}
+        payload: dict[str, Any] | None = None
+        try:
+            payload = json.loads(raw_response.strip())
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw_response, flags=re.DOTALL)
+            if match:
+                try:
+                    payload = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    payload = None
+        selected: list[str] = []
+        reason = ""
+        if isinstance(payload, dict):
+            raw_ids = payload.get("selected_node_ids")
+            if isinstance(raw_ids, list):
+                selected = [
+                    str(node_id)
+                    for node_id in raw_ids
+                    if isinstance(node_id, str) and node_id in valid_ids
+                ]
+            reason = str(payload.get("reason") or "").strip()
+        if not selected:
+            for node_id in valid_ids:
+                if node_id in raw_response:
+                    selected.append(node_id)
+        return list(dict.fromkeys(selected)), reason
 
     def _video_window_rerank_query(self, query: str, metadata: dict[str, Any]) -> str:
         if query.strip():
@@ -409,6 +771,7 @@ class VideoToolExecutor:
         state: ControllerState,
         target_slot: str | None = None,
     ) -> Observation:
+        total_start = time.perf_counter()
         selected_modality = modality or "visual"
         question_spec = state.question_spec or build_question_spec(state.question, state.task_type)
         selected_slot = target_slot or select_target_slot(question_spec, state.evidence_board)
@@ -465,6 +828,7 @@ class VideoToolExecutor:
 
         detail = ""
         detail_metadata: dict[str, object] = {}
+        raw_evidence_start = time.perf_counter()
         if selected_modality == "speech":
             raw_evidence = self._build_speech_evidence(node, state)
             detail = "\n".join(item.detail for item in raw_evidence if item.detail)
@@ -498,7 +862,19 @@ class VideoToolExecutor:
                 ]
             else:
                 raw_evidence = []
+        raw_evidence_seconds = time.perf_counter() - raw_evidence_start
+        self._record_timing(
+            f"tool.open.build_raw_evidence.{selected_modality}",
+            raw_evidence_seconds,
+        )
 
+        classifier_before = 0.0
+        if self.timing_recorder is not None:
+            classifier_before = self.timing_recorder.components.get(
+                "tool.open.evidence_classifier.controller_completion",
+                0.0,
+            )
+        open_v2_start = time.perf_counter()
         evidence, open_metadata = open_v2(
             question_spec=question_spec,
             target_slot=selected_slot,
@@ -510,6 +886,18 @@ class VideoToolExecutor:
             if self.evidence_classifier is not None
             else None,
         )
+        open_v2_seconds = time.perf_counter() - open_v2_start
+        self._record_timing("tool.open.open_v2_classification", open_v2_seconds)
+        classifier_seconds = 0.0
+        if self.timing_recorder is not None:
+            classifier_seconds = (
+                self.timing_recorder.components.get(
+                    "tool.open.evidence_classifier.controller_completion",
+                    0.0,
+                )
+                - classifier_before
+            )
+        consolidation_start = time.perf_counter()
         consolidation_metadata = self._consolidate_opened_node(
             node=node,
             modality=selected_modality,
@@ -518,6 +906,8 @@ class VideoToolExecutor:
             state=state,
             evidence=evidence,
         )
+        consolidation_seconds = time.perf_counter() - consolidation_start
+        self._record_timing("tool.open.memory_consolidation", consolidation_seconds)
         if consolidation_metadata:
             open_metadata.update(consolidation_metadata)
             for item in evidence:
@@ -528,18 +918,37 @@ class VideoToolExecutor:
             or open_metadata.get("no_new_information")
             or open_metadata.get("result") == "support_only"
         )
-        if needs_refinement:
+        refinement_seconds = 0.0
+        if needs_refinement and self.enable_refinement_frontier:
+            refinement_start = time.perf_counter()
             refinement_frontier = self._build_refinement_frontier(
                 node=node,
                 state=state,
                 modality=selected_modality,
                 target_slot=selected_slot,
             )
+            refinement_seconds = time.perf_counter() - refinement_start
+            self._record_timing("tool.open.refinement_frontier", refinement_seconds)
             open_metadata["refinement_node_ids"] = [item.node_id for item in refinement_frontier]
             if refinement_frontier and not open_metadata.get("progress_made"):
                 open_metadata["progress_made"] = True
         else:
             open_metadata["refinement_node_ids"] = []
+            if needs_refinement and not self.enable_refinement_frontier:
+                open_metadata["refinement_frontier_disabled"] = True
+        bundle_metadata = self._attach_evidence_bundle_metadata(
+            evidence_items=evidence,
+            state=state,
+            opened_targets=[
+                {
+                    "node_id": node.node_id,
+                    "modality": selected_modality,
+                    "target_slot": selected_slot,
+                    "result": open_metadata.get("result", "unknown"),
+                }
+            ],
+            aggregation_rule="single_node_open",
+        )
         if evidence:
             summary = (
                 f"OPEN v2 gathered {len(evidence)} {selected_modality} evidence items "
@@ -551,6 +960,17 @@ class VideoToolExecutor:
                 f"slot '{selected_slot or 'generic'}' in node {node.node_id}."
             )
 
+        total_seconds = time.perf_counter() - total_start
+        self._record_timing("tool.open.total", total_seconds)
+        open_metadata["timing"] = {
+            **dict(open_metadata.get("timing", {}) if isinstance(open_metadata.get("timing"), dict) else {}),
+            "open_total_seconds": round(total_seconds, 6),
+            "raw_evidence_build_seconds": round(raw_evidence_seconds, 6),
+            "open_v2_classification_seconds": round(open_v2_seconds, 6),
+            "controller_evidence_classifier_seconds": round(classifier_seconds, 6),
+            "memory_consolidation_seconds": round(consolidation_seconds, 6),
+            "refinement_frontier_seconds": round(refinement_seconds, 6),
+        }
         return Observation(
             kind="open",
             summary=summary,
@@ -562,8 +982,409 @@ class VideoToolExecutor:
                 "clip_path": node.clip_path,
                 **open_redirect_metadata,
                 **open_metadata,
+                **bundle_metadata,
             },
         )
+
+    def open_chain(
+        self,
+        *,
+        chain_items: list[dict[str, object]],
+        state: ControllerState,
+    ) -> Observation:
+        total_start = time.perf_counter()
+        observations: list[Observation] = []
+        opened_targets: list[dict[str, object]] = []
+        all_evidence: list[Evidence] = []
+        frontier: list[FrontierItem] = []
+        timing: dict[str, float] = {}
+        for item in chain_items:
+            node_id = str(item.get("node_id") or "")
+            modality = str(item.get("modality") or "speech")
+            target_slot = str(item.get("target_slot") or "") or None
+            if modality not in {"speech", "visual", "ocr", "audio", "cross_modal"}:
+                modality = "speech"
+            observation = self.open(
+                node_id=node_id,
+                modality=cast(Modality, modality),
+                state=state,
+                target_slot=target_slot,
+            )
+            observations.append(observation)
+            opened_targets.append(
+                {
+                    "node_id": observation.node_id or node_id,
+                    "modality": observation.metadata.get("modality") or modality,
+                    "target_slot": observation.metadata.get("target_slot") or target_slot,
+                    "result": observation.metadata.get("result", "unknown"),
+                    "dynamic_target_id": item.get("target_id"),
+                    "dynamic_target_label": item.get("label"),
+                    "dynamic_target_query": item.get("query"),
+                    "temporal_role": item.get("temporal_role"),
+                }
+            )
+            all_evidence.extend(observation.evidence)
+            frontier.extend(observation.frontier)
+            observation_timing = observation.metadata.get("timing")
+            if isinstance(observation_timing, dict):
+                for key, value in observation_timing.items():
+                    try:
+                        timing[key] = round(timing.get(key, 0.0) + float(value), 6)
+                    except (TypeError, ValueError):
+                        continue
+
+        evidence = self._dedupe_chain_evidence(all_evidence)
+        chain_metadata = self._attach_evidence_bundle_metadata(
+            evidence_items=evidence,
+            state=state,
+            opened_targets=opened_targets,
+            aggregation_rule="dynamic_dp_chain_open",
+        )
+        filled_slots = sorted(
+            {
+                str(slot)
+                for observation in observations
+                for slot in observation.metadata.get("filled_slots", [])
+                if slot
+            }
+        )
+        missing_slots = sorted(
+            {
+                str(slot)
+                for observation in observations
+                for slot in observation.metadata.get("missing_slots", [])
+                if slot and slot not in filled_slots
+            }
+        )
+        duplicate_count = sum(
+            int(observation.metadata.get("duplicate_evidence_count", 0) or 0)
+            for observation in observations
+        )
+        total_seconds = time.perf_counter() - total_start
+        self._record_timing("tool.open_chain.total", total_seconds)
+        timing["open_chain_total_seconds"] = round(total_seconds, 6)
+        result = self._chain_open_result(evidence)
+        return Observation(
+            kind="open",
+            summary=(
+                f"OPEN_CHAIN gathered {len(evidence)} evidence items from "
+                f"{len(opened_targets)} DP-selected spans."
+            ),
+            evidence=evidence,
+            frontier=frontier,
+            node_id=str(opened_targets[0].get("node_id")) if opened_targets else None,
+            metadata={
+                "modality": "cross_modal",
+                "target_slot": opened_targets[0].get("target_slot") if opened_targets else None,
+                "result": result,
+                "open_chain_applied": True,
+                "chain_opened_targets": opened_targets,
+                "chain_opened_node_ids": [
+                    str(item.get("node_id")) for item in opened_targets if item.get("node_id")
+                ],
+                "filled_slots": filled_slots,
+                "missing_slots": missing_slots,
+                "background_only": bool(evidence)
+                and all(item.metadata.get("role") == "background" for item in evidence),
+                "no_new_information": not evidence,
+                "duplicate_evidence_count": duplicate_count,
+                "suggested_queries": [],
+                "progress_made": bool(filled_slots)
+                or any(item.metadata.get("role") in {"core", "support"} for item in evidence),
+                "timing": timing,
+                **chain_metadata,
+            },
+        )
+
+    def _dynamic_chain_bundle_items(
+        self,
+        action: ControllerAction,
+        state: ControllerState,
+    ) -> list[dict[str, object]]:
+        metadata = state.global_context.get("dynamic_evidence_retrieval")
+        if not isinstance(metadata, dict) or not metadata.get("enabled"):
+            return []
+        if metadata.get("requires_all_selected") is not True:
+            return []
+        selected = metadata.get("selected")
+        if not isinstance(selected, list):
+            return []
+        opened_node_ids = self._opened_node_ids_for_state(state)
+        selected_items: list[dict[str, object]] = []
+        selected_node_ids: set[str] = set()
+        for raw in selected:
+            if not isinstance(raw, dict):
+                continue
+            node_id = str(raw.get("node_id") or "")
+            if not node_id or node_id in opened_node_ids or node_id not in self.memory.nodes:
+                continue
+            selected_node_ids.add(node_id)
+            selected_items.append(
+                {
+                    "node_id": node_id,
+                    "modality": raw.get("modality") or action.modality or "speech",
+                    "target_slot": raw.get("target_slot") or action.target_slot,
+                    "target_id": raw.get("target_id"),
+                    "label": raw.get("label"),
+                    "query": raw.get("query"),
+                    "temporal_role": raw.get("temporal_role"),
+                }
+            )
+        if len(selected_items) <= 1:
+            return []
+        if action.node_id and action.node_id not in selected_node_ids:
+            return []
+        selected_items.sort(
+            key=lambda item: (
+                self.memory.nodes[str(item["node_id"])].time_span.start,
+                str(item["node_id"]),
+            )
+        )
+        return selected_items[:4]
+
+    def _opened_node_ids_for_state(self, state: ControllerState) -> set[str]:
+        opened = {
+            str(action.get("node_id"))
+            for action in state.action_history
+            if action.get("action_type") == "OPEN" and action.get("node_id")
+        }
+        if state.evidence_board is not None:
+            opened.update(item.node_id for item in state.evidence_board.opened_targets)
+        return opened
+
+    def _dedupe_chain_evidence(self, evidence_items: list[Evidence]) -> list[Evidence]:
+        selected: list[Evidence] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in evidence_items:
+            key = (
+                item.source_node_id,
+                item.modality,
+                " ".join((item.claim or item.detail).split()).lower()[:240],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(item)
+        return selected
+
+    def _chain_open_result(self, evidence_items: list[Evidence]) -> str:
+        roles = {str(item.metadata.get("role") or "") for item in evidence_items}
+        if "core" in roles:
+            return "chain_core"
+        if "support" in roles:
+            return "chain_support_only"
+        if "background" in roles:
+            return "chain_background_only"
+        return "chain_no_evidence"
+
+    def _attach_evidence_bundle_metadata(
+        self,
+        *,
+        evidence_items: list[Evidence],
+        state: ControllerState,
+        opened_targets: list[dict[str, object]],
+        aggregation_rule: str,
+    ) -> dict[str, object]:
+        route = (
+            route_from_metadata(state.global_context)
+            or route_from_metadata(state.question_spec.metadata if state.question_spec else None)
+            or route_question(state.question, state.task_type)
+        )
+        bundle_id = self._evidence_bundle_id(opened_targets, aggregation_rule)
+        source_events: list[str] = []
+        answer_spans: list[str] = []
+        evidence_kinds: list[str] = []
+        for item in evidence_items:
+            node = self.memory.nodes.get(item.source_node_id)
+            target_metadata = self._dynamic_selected_metadata_for_node(
+                state,
+                item.source_node_id,
+            )
+            self._enrich_evidence_provenance(
+                item=item,
+                node=node,
+                state=state,
+                route_label=route.label,
+                aggregation_rule=aggregation_rule,
+                target_metadata=target_metadata,
+            )
+            item.metadata["evidence_bundle_id"] = bundle_id
+            item.metadata["evidence_bundle_role"] = str(
+                target_metadata.get("label")
+                or target_metadata.get("target_id")
+                or item.metadata.get("slot")
+                or "answer_part"
+            )
+            item_source_events = [
+                str(event_id)
+                for event_id in item.metadata.get("source_events", [])
+                if event_id
+            ]
+            source_events.extend(item_source_events)
+            answer_span = str(item.metadata.get("answer_span") or "").strip()
+            if answer_span:
+                answer_spans.append(answer_span)
+            evidence_kind = str(item.metadata.get("evidence_kind") or "").strip()
+            if evidence_kind:
+                evidence_kinds.append(evidence_kind)
+        opened_node_ids = [
+            str(item.get("node_id")) for item in opened_targets if item.get("node_id")
+        ]
+        bundle = {
+            "bundle_id": bundle_id,
+            "route": route.label,
+            "aggregation_rule": aggregation_rule,
+            "opened_node_ids": opened_node_ids,
+            "opened_targets": opened_targets,
+            "evidence_ids": [item.evidence_id for item in evidence_items],
+            "evidence_kinds": list(dict.fromkeys(evidence_kinds)),
+            "answer_spans": list(dict.fromkeys(answer_spans))[:8],
+            "source_events": list(dict.fromkeys(source_events))[:16],
+            "confidence": round(
+                sum(item.confidence for item in evidence_items) / max(len(evidence_items), 1),
+                4,
+            ),
+            "time_span": self._bundle_time_span(evidence_items),
+            "temporal_constraints": self._bundle_temporal_constraints(evidence_items, state),
+        }
+        for item in evidence_items:
+            item.metadata["evidence_bundle"] = bundle
+        return {
+            "evidence_bundle": bundle,
+            "evidence_bundle_id": bundle_id,
+            "evidence_bundle_count": 1 if evidence_items else 0,
+        }
+
+    def _enrich_evidence_provenance(
+        self,
+        *,
+        item: Evidence,
+        node: VideoNode | None,
+        state: ControllerState,
+        route_label: str,
+        aggregation_rule: str,
+        target_metadata: dict[str, object],
+    ) -> None:
+        evidence_kind = str(item.metadata.get("evidence_kind") or "").strip()
+        if not evidence_kind:
+            evidence_kind = self._default_evidence_kind(item, node)
+            item.metadata["evidence_kind"] = evidence_kind
+        source_events = item.metadata.get("source_events")
+        if not isinstance(source_events, list) or not source_events:
+            item.metadata["source_events"] = self._source_events_for_node(node, item.modality)
+        item.metadata.setdefault("route", route_label)
+        item.metadata.setdefault("aggregation_rule", aggregation_rule)
+        temporal_constraint = (
+            target_metadata.get("temporal_role")
+            or item.metadata.get("temporal_constraint")
+            or self._state_temporal_constraint(state)
+        )
+        if temporal_constraint:
+            item.metadata["temporal_constraint"] = str(temporal_constraint)
+        item.metadata["evidence_provenance"] = {
+            "answer_span": str(item.metadata.get("answer_span") or "").strip(),
+            "evidence_kind": evidence_kind,
+            "route": route_label,
+            "section_time_constraint": item.metadata.get("temporal_constraint"),
+            "source_events": list(item.metadata.get("source_events", [])),
+            "aggregation_rule": item.metadata.get("aggregation_rule"),
+            "confidence": item.confidence,
+            "source_node_id": item.source_node_id,
+            "time_span": item.time_span.to_dict(),
+        }
+
+    def _default_evidence_kind(self, item: Evidence, node: VideoNode | None) -> str:
+        if item.modality == "speech":
+            if item.metadata.get("fine_speech_window"):
+                return "fine_asr_window"
+            return "speech_transcript"
+        if item.modality == "visual":
+            if node is not None and node.metadata.get("visual_summary_mode") == "on_demand_refined":
+                return "refined_visual_summary"
+            return "visual_summary"
+        if item.modality == "ocr":
+            return "screen_text_ocr"
+        if item.modality == "audio":
+            return "audio_event"
+        return "cross_modal_evidence"
+
+    def _source_events_for_node(self, node: VideoNode | None, modality: Modality) -> list[str]:
+        if node is None:
+            return []
+        event_ids: list[str] = []
+        index = self.memory.cross_modal_index
+        if index is not None:
+            for event in index.all_events():
+                if event.source_node_id and event.source_node_id != node.node_id:
+                    continue
+                if not event.source_node_id and not event.time_span.overlaps(node.time_span):
+                    continue
+                if modality != "cross_modal" and event.modality != modality:
+                    continue
+                event_ids.append(event.event_id)
+                if len(event_ids) >= 8:
+                    break
+        if not event_ids and modality == "audio":
+            for event in node.audio_events[:8]:
+                label = " ".join(event.label.split()).strip()
+                if label:
+                    event_ids.append(f"audio:{label}:{event.time_span.to_display()}")
+        return event_ids
+
+    def _state_temporal_constraint(self, state: ControllerState) -> str:
+        intents = state.global_context.get("postvalid_temporal_intents")
+        if isinstance(intents, list) and intents:
+            return ",".join(str(item) for item in intents[:3] if item)
+        return ""
+
+    def _dynamic_selected_metadata_for_node(
+        self,
+        state: ControllerState,
+        node_id: str,
+    ) -> dict[str, object]:
+        metadata = state.global_context.get("dynamic_evidence_retrieval")
+        if not isinstance(metadata, dict):
+            return {}
+        selected = metadata.get("selected")
+        if not isinstance(selected, list):
+            return {}
+        for raw in selected:
+            if isinstance(raw, dict) and str(raw.get("node_id") or "") == node_id:
+                return dict(raw)
+        return {}
+
+    def _evidence_bundle_id(
+        self,
+        opened_targets: list[dict[str, object]],
+        aggregation_rule: str,
+    ) -> str:
+        node_part = "_".join(
+            str(item.get("node_id") or "node") for item in opened_targets[:4]
+        )
+        return f"{aggregation_rule}:{node_part or 'empty'}"
+
+    def _bundle_time_span(self, evidence_items: list[Evidence]) -> dict[str, float] | None:
+        if not evidence_items:
+            return None
+        return TimeSpan(
+            min(item.time_span.start for item in evidence_items),
+            max(item.time_span.end for item in evidence_items),
+        ).to_dict()
+
+    def _bundle_temporal_constraints(
+        self,
+        evidence_items: list[Evidence],
+        state: ControllerState,
+    ) -> list[str]:
+        constraints = [
+            str(item.metadata.get("temporal_constraint") or "")
+            for item in evidence_items
+            if str(item.metadata.get("temporal_constraint") or "").strip()
+        ]
+        state_constraint = self._state_temporal_constraint(state)
+        if state_constraint:
+            constraints.append(state_constraint)
+        return list(dict.fromkeys(constraints))
 
     def split(self, node_id: str) -> Observation:
         node = self._get_node_or_none(node_id)
@@ -1042,8 +1863,55 @@ class VideoToolExecutor:
             return detail, {}
         if modality == "audio":
             labels = [item.label.strip() for item in node.audio_events if item.label]
-            return ", ".join(labels).strip(), {}
+            event_lines = [
+                self._audio_event_detail_line(item)
+                for item in node.audio_events
+                if item.label.strip()
+            ]
+            visual_context = node.visual_summary.strip()
+            metadata: dict[str, object] = {
+                "evidence_kind": "audio_event",
+                "audio_evidence_kind": "audio_event",
+                "answer_span": ", ".join(labels).strip(),
+                "audio_event_labels": labels,
+                "audio_event_count": len(labels),
+                "source_events": [
+                    f"audio:{item.label.strip()}:{item.time_span.to_display()}"
+                    for item in node.audio_events
+                    if item.label.strip()
+                ],
+            }
+            detail = "\n".join(event_lines).strip()
+            if labels and visual_context:
+                metadata.update(
+                    {
+                        "evidence_kind": "audio_visual_alignment",
+                        "audio_evidence_kind": "audio_visual_alignment",
+                        "aligned_visual_summary": visual_context[:500],
+                    }
+                )
+                detail = "\n".join(
+                    [
+                        detail,
+                        f"Aligned visual context: {visual_context[:500]}",
+                    ]
+                ).strip()
+            return detail or ", ".join(labels).strip(), metadata
         return "", {}
+
+    def _audio_event_detail_line(self, event) -> str:
+        label = " ".join(event.label.split()).strip()
+        confidence = ""
+        if event.confidence is not None:
+            confidence = f" confidence={float(event.confidence):.2f}"
+        tags = event.metadata.get("audio_tags") if isinstance(event.metadata, dict) else None
+        tag_text = ""
+        if isinstance(tags, list) and tags:
+            tag_text = " tags=" + ", ".join(str(tag) for tag in tags[:6])
+        caption = ""
+        if isinstance(event.metadata, dict) and event.metadata.get("audio_caption"):
+            caption = f" caption={str(event.metadata.get('audio_caption'))[:220]}"
+        return f"[{event.time_span.to_display()}] audio_event={label}{confidence}{tag_text}{caption}"
 
     def _build_ocr_evidence(
         self,
@@ -1349,7 +2217,7 @@ class VideoToolExecutor:
             return []
         route = (
             route_from_metadata(state.global_context)
-            or route_from_metadata((state.question_spec.metadata if state.question_spec else {}))
+            or route_from_metadata(state.question_spec.metadata if state.question_spec else {})
             or route_question(state.question, state.task_type)
         )
         if route.label == "assignment_count":
@@ -3838,8 +4706,11 @@ class VideoToolExecutor:
 
     def _build_speech_evidence(self, node, state: ControllerState) -> list[Evidence]:
         if self._should_refine_speech_node(node):
-            self._refine_speech_node(node)
+            self._refine_speech_node(node, reason="lazy_asr")
         selected_spans = self._select_relevant_speech_spans(node.speech_spans, state)
+        if self._should_target_refine_speech_node(node, selected_spans, state):
+            self._refine_speech_node(node, reason="targeted_asr")
+            selected_spans = self._select_relevant_speech_spans(node.speech_spans, state)
         if not selected_spans:
             return []
 
@@ -3873,8 +4744,22 @@ class VideoToolExecutor:
                 prefer_start=prefer_start,
                 prefer_end=prefer_end,
             )
+            speech_window_metadata = self._fine_speech_window_evidence_metadata(
+                node=node,
+                span=span,
+                detail=detail,
+            )
+            if speech_window_metadata:
+                detail = self._detail_with_fine_speech_context(
+                    detail,
+                    speech_window_metadata,
+                )
             if self._is_duplicate_speech_evidence(state, span, detail):
                 continue
+            clip_path = speech_window_metadata.get("clip_path") or self._clip_path_for_span(
+                node.clip_path,
+                span.time_span,
+            )
             evidence.append(
                 Evidence(
                     evidence_id=self._next_evidence_id(),
@@ -3885,15 +4770,119 @@ class VideoToolExecutor:
                     confidence=self._confidence_from_speech_score(detail, score),
                     detail=detail,
                     metadata={
-                        "clip_path": self._clip_path_for_span(node.clip_path, span.time_span),
+                        "clip_path": clip_path,
                         "parent_node_id": node.node_id,
                         "selection_score": round(score, 4),
                         "search_query": query_hint,
+                        **speech_window_metadata,
                         **selection_metadata,
                     },
                 )
             )
         return evidence
+
+    def _fine_speech_window_evidence_metadata(
+        self,
+        *,
+        node,
+        span: SpeechSpan,
+        detail: str,
+    ) -> dict[str, object]:
+        if node.metadata.get("speech_window_kind") != "fine_asr_window":
+            return {}
+        answer_span = " ".join(span.text.split()).strip() or " ".join(detail.split()).strip()
+        context_text = self._fine_speech_context_text(node)
+        context_node_id = str(node.metadata.get("context_node_id") or "")
+        context_node = self.memory.nodes.get(context_node_id) if context_node_id else None
+        source_events = self._fine_speech_source_events(node)
+        clip_path = node.clip_path
+        if context_node is not None and not clip_path:
+            clip_path = context_node.clip_path
+        metadata: dict[str, object] = {
+            "evidence_kind": "fine_asr_window",
+            "speech_window_kind": "fine_asr_window",
+            "answer_span": answer_span,
+            "answer_span_role": "retrieved_fine_window_text",
+            "answer_span_is_exact_answer": False,
+            "context_span": context_text,
+            "context_time_span": node.metadata.get("context_time_span"),
+            "context_node_id": context_node_id,
+            "context_node_level": node.metadata.get("context_node_level"),
+            "context_window_node_ids": list(node.metadata.get("context_window_node_ids", [])),
+            "previous_speech_window_node_id": node.metadata.get(
+                "previous_speech_window_node_id"
+            ),
+            "next_speech_window_node_id": node.metadata.get("next_speech_window_node_id"),
+            "source_events": source_events,
+            "aggregation_rule": "fine_asr_window_with_neighbor_and_parent_context",
+            "fallback_used": False,
+            "fine_speech_window": True,
+        }
+        if clip_path:
+            metadata["clip_path"] = self._clip_path_for_span(clip_path, span.time_span)
+        return metadata
+
+    def _detail_with_fine_speech_context(
+        self,
+        detail: str,
+        metadata: dict[str, object],
+    ) -> str:
+        answer_span = str(metadata.get("answer_span") or "").strip()
+        context_span = str(metadata.get("context_span") or "").strip()
+        parts = []
+        if answer_span:
+            parts.append(f"Fine ASR window: {answer_span}")
+        elif detail.strip():
+            parts.append(f"Fine ASR window: {' '.join(detail.split())}")
+        if context_span and context_span != answer_span:
+            parts.append(f"Nearby speech context: {context_span}")
+        return "\n".join(parts).strip() or detail
+
+    def _fine_speech_context_text(self, node, max_chars: int = 2200) -> str:
+        texts: list[str] = []
+        raw_window_ids = node.metadata.get("context_window_node_ids", [])
+        if isinstance(raw_window_ids, list):
+            for node_id in raw_window_ids:
+                candidate = self.memory.nodes.get(str(node_id))
+                if candidate is None:
+                    continue
+                texts.append(self._node_speech_text(candidate))
+        context_text = str(node.metadata.get("context_text") or "").strip()
+        if context_text:
+            texts.append(context_text)
+        return self._dedupe_context_text(texts, max_chars=max_chars)
+
+    def _node_speech_text(self, node) -> str:
+        return " ".join(span.text.strip() for span in node.speech_spans if span.text).strip()
+
+    def _dedupe_context_text(self, texts: list[str], max_chars: int) -> str:
+        seen: set[str] = set()
+        pieces: list[str] = []
+        for text in texts:
+            normalized = " ".join(text.split()).strip()
+            if not normalized:
+                continue
+            key = re.sub(r"\W+", "", normalized.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            pieces.append(normalized)
+        combined = " ".join(pieces).strip()
+        if len(combined) > max_chars:
+            return combined[:max_chars].rsplit(" ", maxsplit=1)[0]
+        return combined
+
+    def _fine_speech_source_events(self, node) -> list[str]:
+        source_events: list[str] = []
+        for item in node.metadata.get("speech_occurrences", []):
+            if isinstance(item, dict) and item.get("event_id"):
+                source_events.append(str(item["event_id"]))
+        if source_events:
+            return self._dedupe_ids(source_events)
+        window_index = node.metadata.get("speech_window_index")
+        if window_index is None:
+            return []
+        return [f"fine_asr_window_{int(window_index):05d}"]
 
     def _should_refine_speech_node(self, node) -> bool:
         if self.speech_refiner is None:
@@ -3902,18 +4891,57 @@ class VideoToolExecutor:
             return False
         return any(_is_lazy_speech_span(span) for span in node.speech_spans)
 
-    def _refine_speech_node(self, node) -> None:
+    def _should_target_refine_speech_node(
+        self,
+        node,
+        selected_spans: list[tuple[SpeechSpan, float]],
+        state: ControllerState,
+    ) -> bool:
+        if not self.enable_targeted_asr_refinement or self.speech_refiner is None:
+            return False
+        if node.metadata.get("speech_summary_mode") == "on_demand_refined":
+            return False
+        if node.metadata.get("targeted_asr_refinement") == "done":
+            return False
+        if node.time_span.duration <= 0 or node.time_span.duration > 210:
+            return False
+        question_tokens = self._tokenize(state.question)
+        explanation_query = bool(
+            {
+                "why",
+                "how",
+                "reason",
+                "because",
+                "cause",
+                "after",
+                "before",
+                "first",
+                "later",
+                "next",
+            }
+            & question_tokens
+        )
+        weak_selection = not selected_spans or all(score < 0.35 for _, score in selected_spans)
+        long_or_sparse = (
+            len(" ".join(span.text for span in node.speech_spans).split()) < 18
+            or any(len(span.text) > 900 for span in node.speech_spans)
+        )
+        return explanation_query and (weak_selection or long_or_sparse)
+
+    def _refine_speech_node(self, node, *, reason: str) -> None:
         source_video_path = self.memory.metadata.get("source_video_path")
         if not source_video_path:
             node.metadata["speech_refinement"] = "skipped_missing_source_video_path"
             return
+        original_span = node.time_span
+        refinement_span = self._targeted_asr_span(node) if reason == "targeted_asr" else original_span
 
         temp_root = get_videorlm_output_root() / "tmp"
         temp_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="videorlm_lazy_asr_", dir=str(temp_root)) as name:
             audio_path = extract_audio_segment(
                 media_path=str(source_video_path),
-                span=node.time_span,
+                span=refinement_span,
                 output_path=Path(name) / f"{node.node_id}.wav",
                 ffmpeg_bin=getattr(self.speech_refiner, "ffmpeg_bin", "ffmpeg"),
             )
@@ -3924,15 +4952,27 @@ class VideoToolExecutor:
                 refined_spans = self.speech_refiner.recognize(str(audio_path))
 
         refined_spans = [
-            _offset_on_demand_speech_span(span, node.time_span)
+            _offset_on_demand_speech_span(span, refinement_span)
             for span in refined_spans
             if span.text.strip() and not _is_lazy_speech_span(span)
         ]
+        if reason == "targeted_asr":
+            refined_spans = [span for span in refined_spans if span.time_span.overlaps(original_span)]
         node.speech_spans = refined_spans
         node.metadata["speech_summary_mode"] = "on_demand_refined"
-        node.metadata["speech_refinement"] = "asr_on_demand"
+        node.metadata["speech_refinement"] = reason
         node.metadata["on_demand_speech_refinement"] = False
         node.metadata["speech_refined_span_count"] = len(refined_spans)
+        node.metadata["speech_refinement_window"] = refinement_span.to_dict()
+        node.metadata["targeted_asr_refinement"] = "done" if reason == "targeted_asr" else "not_targeted"
+
+    def _targeted_asr_span(self, node) -> TimeSpan:
+        duration = float(self.memory.metadata.get("duration_seconds") or node.time_span.end)
+        padding = 15.0
+        return TimeSpan(
+            max(0.0, node.time_span.start - padding),
+            min(duration, node.time_span.end + padding),
+        )
 
     def _select_relevant_speech_spans(
         self,
@@ -4768,6 +5808,7 @@ def _offset_on_demand_speech_span(span: SpeechSpan, parent_span) -> SpeechSpan:
         time_span=time_span,
         speaker=span.speaker,
         language=span.language,
+        metadata=dict(span.metadata),
     )
 
 
@@ -4866,6 +5907,319 @@ def _is_longshot_context(state: ControllerState) -> bool:
     if benchmark in {"longshot", "longshotbench"}:
         return True
     return state.global_context.get("longshot") is not None
+
+
+def _speech_temporal_constraint(
+    query: str,
+    state: ControllerState,
+) -> str | None:
+    lowered = " ".join(
+        [
+            query,
+            state.question,
+            " ".join(
+                str(item)
+                for item in state.global_context.get("postvalid_temporal_intents", [])
+                if isinstance(item, str)
+            ),
+        ]
+    ).lower()
+    if any(
+        cue in lowered
+        for cue in (
+            "first real sign",
+            "first sign",
+            "first thing",
+            "first piece",
+            "earliest",
+            "beginning",
+            "initial",
+            "first_piece",
+        )
+    ):
+        return "early"
+    if any(
+        cue in lowered
+        for cue in (
+            "right after",
+            "immediately after",
+            "just after",
+            "what happened next",
+            "next happened",
+            "after that",
+            "immediate_after",
+        )
+    ):
+        return "after"
+    if any(
+        cue in lowered
+        for cue in (
+            "early in the race",
+            "early lead",
+            "big lead early",
+            "strong start",
+            "stay ahead",
+            "pull away",
+            "early_race",
+        )
+    ):
+        return "early"
+    if any(cue in lowered for cue in ("later", "rest of", "final", "ending", "last")):
+        return "late"
+    if any(
+        cue in lowered
+        for cue in (
+            "before",
+            "previous",
+            "earlier experiment",
+            "earlier experiments",
+            "big problem",
+            "wanted to fix",
+            "made people doubt",
+            "loophole",
+            "earlier_problem",
+        )
+    ):
+        return "before"
+    return None
+
+
+def _speech_temporal_constraint_score(
+    item: FrontierItem,
+    constraint: str,
+    memory_metadata: dict[str, Any],
+) -> float:
+    duration = float(memory_metadata.get("duration_seconds") or 0.0)
+    midpoint = duration / 2.0 if duration > 0 else 0.0
+    start = item.time_span.start
+    if constraint == "early":
+        return start
+    if constraint == "late":
+        return -start
+    if constraint == "before":
+        return start if midpoint <= 0 or start <= midpoint else start + duration
+    if constraint == "after":
+        return abs(start - midpoint) if midpoint > 0 else -start
+    return 0.0
+
+
+def _filter_speech_candidates_by_temporal_constraint(
+    candidates: list[FrontierItem],
+    constraint: str,
+    memory: VideoMemory,
+) -> tuple[list[FrontierItem], dict[str, Any]]:
+    memory_metadata = memory.metadata
+    duration = float(memory_metadata.get("duration_seconds") or 0.0)
+    if duration <= 0 or len(candidates) < 5:
+        return candidates, {
+            "speech_temporal_filter_applied": False,
+            "speech_temporal_filter_reason": "insufficient_duration_or_candidates",
+        }
+    local_candidates = [
+        item
+        for item in candidates
+        if item.time_span.duration <= max(duration * 0.5, 1.0)
+    ]
+    leaf_candidates = [
+        item
+        for item in local_candidates
+        if item.level in {"clip", "event"}
+    ]
+    if len(leaf_candidates) >= 3:
+        local_candidates = leaf_candidates
+    if len(local_candidates) >= 3:
+        candidates = local_candidates
+    occurrence_filtered = _filter_by_speech_occurrences(candidates, constraint, memory)
+    if len(occurrence_filtered) >= 3:
+        return occurrence_filtered, {
+            "speech_temporal_filter_applied": True,
+            "speech_temporal_filter_reason": "occurrence_metadata",
+            "speech_temporal_filter_before_count": len(candidates),
+            "speech_temporal_filter_after_count": len(occurrence_filtered),
+        }
+    midpoint = duration / 2.0
+    early_cutoff = max(midpoint, duration * 0.4)
+    late_cutoff = min(midpoint, duration * 0.6)
+    if constraint in {"early", "before"}:
+        filtered = [item for item in candidates if item.time_span.start <= early_cutoff]
+    elif constraint == "late":
+        filtered = [item for item in candidates if item.time_span.end >= late_cutoff]
+    else:
+        filtered = candidates
+    if len(filtered) < 3:
+        return candidates, {
+            "speech_temporal_filter_applied": False,
+            "speech_temporal_filter_reason": "filtered_too_few_candidates",
+            "speech_temporal_filter_candidate_count": len(filtered),
+        }
+    return filtered, {
+        "speech_temporal_filter_applied": True,
+        "speech_temporal_filter_reason": "timestamp_band",
+        "speech_temporal_filter_before_count": len(candidates),
+        "speech_temporal_filter_after_count": len(filtered),
+    }
+
+
+def _filter_by_speech_occurrences(
+    candidates: list[FrontierItem],
+    constraint: str,
+    memory: VideoMemory,
+) -> list[FrontierItem]:
+    filtered: list[FrontierItem] = []
+    for item in candidates:
+        node = memory.get_node(item.node_id)
+        occurrences = _node_speech_occurrences(node)
+        if not occurrences:
+            continue
+        if any(_speech_occurrence_matches_constraint(occurrence, constraint) for occurrence in occurrences):
+            filtered.append(item)
+    return filtered
+
+
+def _node_speech_occurrences(node: VideoNode) -> list[dict[str, Any]]:
+    raw_occurrences = node.metadata.get("speech_occurrences")
+    if isinstance(raw_occurrences, list):
+        return [item for item in raw_occurrences if isinstance(item, dict)]
+    return []
+
+
+def _speech_occurrence_matches_constraint(
+    occurrence: dict[str, Any],
+    constraint: str,
+) -> bool:
+    occurrence_index = _optional_int(occurrence.get("occurrence_index"))
+    occurrence_count = _optional_int(occurrence.get("occurrence_count"))
+    section_ordinal = _optional_int(occurrence.get("section_ordinal"))
+    tags = {str(item) for item in occurrence.get("section_tags", []) if item}
+    if constraint in {"early", "before"}:
+        return (
+            (occurrence_count is not None and occurrence_count > 1 and occurrence_index == 1)
+            or section_ordinal == 1
+            or "first_half" in tags
+            or "early_race" in tags
+        )
+    if constraint == "late":
+        return (
+            (occurrence_index is not None and occurrence_count is not None and occurrence_index == occurrence_count)
+            or "second_half" in tags
+        )
+    if constraint == "after":
+        return (
+            occurrence_index is not None
+            and occurrence_count is not None
+            and occurrence_index > 1
+        ) or "second_half" in tags
+    return False
+
+
+def _speech_occurrence_constraint_score(node: VideoNode, constraint: str) -> float:
+    occurrences = _node_speech_occurrences(node)
+    if not occurrences:
+        return 0.0
+    scores = [_single_speech_occurrence_constraint_score(item, constraint) for item in occurrences]
+    return min(scores) if scores else 0.0
+
+
+def _single_speech_occurrence_constraint_score(
+    occurrence: dict[str, Any],
+    constraint: str,
+) -> float:
+    occurrence_index = _optional_int(occurrence.get("occurrence_index"))
+    occurrence_count = _optional_int(occurrence.get("occurrence_count"))
+    section_ordinal = _optional_int(occurrence.get("section_ordinal"))
+    section_local_ordinal = _optional_int(occurrence.get("section_local_ordinal"))
+    first_seen = _optional_float(occurrence.get("first_seen"))
+    event_start = _optional_float((occurrence.get("time_span") or {}).get("start"))
+    if constraint in {"early", "before"}:
+        repeated_occurrence_rank = (
+            occurrence_index
+            if occurrence_count is not None and occurrence_count > 1 and occurrence_index is not None
+            else 99
+        )
+        return float(
+            repeated_occurrence_rank * 10
+            + (section_ordinal or 99)
+            + ((section_local_ordinal or 99) / 100.0)
+        )
+    if constraint == "late":
+        missing_penalty = 99 if occurrence_count is None or occurrence_index is None else 0
+        reverse_index = (
+            occurrence_count - occurrence_index
+            if occurrence_count is not None and occurrence_index is not None
+            else 99
+        )
+        return float(missing_penalty + reverse_index - (event_start or 0.0) / 100000.0)
+    if constraint == "after":
+        after_rank = 99 if occurrence_index is None else max(0, occurrence_index - 2)
+        return float(after_rank + (event_start or first_seen or 0.0) / 100000.0)
+    return 0.0
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _speech_temporal_keyword_score(transcript: str, constraint: str) -> float:
+    lowered = transcript.lower()
+    keyword_groups = {
+        "before": (
+            "loophole",
+            "hidden influence",
+            "random choices",
+            "not truly random",
+            "doubt",
+            "problem",
+            "fix",
+            "filter",
+        ),
+        "early": (
+            "start",
+            "early",
+            "lead",
+            "gap",
+            "pull away",
+            "stay ahead",
+            "same bikes",
+            "first",
+        ),
+        "after": (
+            "right after",
+            "immediately",
+            "exploded",
+            "leaking",
+            "damaged",
+            "warning",
+            "next",
+            "after",
+        ),
+        "late": (
+            "rest of",
+            "after",
+            "later",
+            "finished",
+            "final",
+            "ending",
+            "consequence",
+        ),
+    }
+    return float(sum(1 for keyword in keyword_groups.get(constraint, ()) if keyword in lowered))
 
 
 def _clean_vrrqa_question(question: str) -> str:

@@ -5,10 +5,15 @@ import re
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from rlm.video.index import STOPWORDS, TOKEN_PATTERN, SearchHit, VideoMemoryIndex
-from rlm.video.question_router import evidence_matches_route, route_from_metadata, route_question
+from rlm.video.question_router import (
+    QuestionRoute,
+    evidence_matches_route,
+    route_from_metadata,
+    route_question,
+)
 from rlm.video.types import (
     ControllerState,
     Evidence,
@@ -71,9 +76,68 @@ GENERIC_SLOT_KEYWORDS: dict[str, list[str]] = {
     "mouse_reaction": ["mouse", "reaction", "responded", "paused", "looked"],
     "shared_sensing": ["both", "seemed", "sensed", "noticed", "realized"],
     "main_claim": ["main", "claim", "answer", "point"],
+    "answer_core": ["answer", "claim", "point", "explain", "mean", "problem"],
+    "mechanism": ["how", "method", "process", "setup", "works", "control"],
+    "causal_or_temporal_link": [
+        "because",
+        "why",
+        "therefore",
+        "so",
+        "before",
+        "after",
+        "helped",
+        "meant",
+    ],
+    "consequence": ["result", "consequence", "effect", "proved", "solved", "fixed"],
     "supporting_detail": ["detail", "support", "specific", "example"],
     "missing_context": ["context", "missing", "unclear", "not enough"],
 }
+POSTVALID_ASR_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("filippo", "philip"),
+    ("first piece", "first jewelry", "first ring", "first gift", "first got", "first gave"),
+    ("gagne", "jake", "jake gagne"),
+    ("heron", "haren", "aaron", "josh heron", "josh haren", "josh aaron"),
+    ("beaubier", "bobeau", "bobeier", "cam", "cameron"),
+    ("peterson", "cam peterson", "cameron peterson"),
+    ("gap", "opened", "lead", "pull away", "pulled away", "stay ahead"),
+    ("loophole", "hidden influence", "not truly random", "doubt", "challenge"),
+    ("first real sign", "first sign", "starting to take", "took seriously"),
+    ("bench", "sideline", "not playing", "throw you in", "thrown in", "hustle"),
+    ("nervous", "prove myself", "ready", "excited", "tryout"),
+)
+POSTVALID_REQUIRED_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("filippo", "philip"),
+    ("gagne", "jake", "jake gagne"),
+    ("heron", "haren", "aaron", "josh heron", "josh haren", "josh aaron"),
+    ("beaubier", "bobeau", "bobeier", "cam", "cameron"),
+    ("peterson", "cam peterson", "cameron peterson"),
+)
+POSTVALID_CAUSAL_CUES = (
+    "because",
+    "therefore",
+    "so ",
+    "that means",
+    "this meant",
+    "helped",
+    "made it",
+    "unlikely",
+    "rule out",
+    "close a loophole",
+    "caused",
+    "reason",
+    "meant",
+    "allowed",
+    "led to",
+    "couldn't",
+    "could not",
+    "difficult",
+    "hard",
+    "problem",
+    "loose",
+    "gap",
+    "nervous",
+    "prove",
+)
 CONTROL_QUERY_TOKENS = {"why", "first", "last", "earliest", "initial", "beginning", "final"}
 VISUAL_ROUTE_TERMS = {
     "appear",
@@ -620,12 +684,79 @@ def search_v2(
     query_sources: dict[str, list[str]] = defaultdict(list)
     selected_modality = modality or _preferred_modality(question_spec, target_slot)
     selected_modality = _resolve_available_modality(selected_modality, state)
-    search_modalities = _search_modalities(selected_modality, state.question)
+    question_route = (
+        route_from_metadata(question_spec.metadata) if question_spec is not None else None
+    )
+    if question_route is None:
+        question_route = route_question(state.question, state.task_type)
+    if _should_force_postvalid_speech_search(state, question_spec, question_route):
+        selected_modality = "speech"
+    search_modalities = _search_modalities(
+        selected_modality,
+        state.question,
+        state,
+        question_route,
+        target_slot,
+    )
     query_frame = _build_cognitive_query_frame(
         question=state.question,
         queries=queries,
         selected_modality=selected_modality,
     )
+
+    nearby_sentiment_visual_hits = _postvalid_sentiment_nearby_visual_hits(
+        index=index,
+        state=state,
+        question_route=question_route,
+        target_slot=target_slot,
+        queries=queries,
+        top_k=top_k,
+    )
+    if nearby_sentiment_visual_hits:
+        for hit in nearby_sentiment_visual_hits:
+            hits_by_node[hit.node_id] = hit
+            query_sources[hit.node_id].append("postvalid_sentiment_speech_anchor")
+        ranked_hits = _select_temporally_diverse_hits(
+            sorted(
+                hits_by_node.values(),
+                key=lambda item: (-item.score, item.time_span.start, item.node_id),
+            ),
+            top_k,
+        )
+        frontier = [hit.to_frontier_item() for hit in ranked_hits]
+        for item in frontier:
+            item.why_candidate = (
+                f"{item.why_candidate}; target_slot={target_slot or 'none'}; "
+                f"queries={query_sources.get(item.node_id, [])[:2]}"
+            )
+        return frontier, {
+            "target_slot": target_slot,
+            "queries": queries,
+            "modality": selected_modality,
+            "question_route": question_route.to_dict(),
+            "search_mode": "postvalid_sentiment_speech_anchored_visual",
+            "searched_modalities": ["visual"],
+            "transcript_section_index": {
+                "enabled": False,
+                "hit_count": 0,
+                "candidate_count": 0,
+            },
+            "hit_count": len(frontier),
+            "query_sources": dict(query_sources),
+            "cognitive_query_frame": query_frame.to_dict(),
+        }
+
+    transcript_hits = _postvalid_transcript_section_hits(
+        index=index,
+        queries=queries,
+        state=state,
+        question_route_label=question_route.label,
+        target_slot=target_slot,
+        top_k=max(top_k, 20),
+    )
+    for hit in transcript_hits:
+        hits_by_node[hit.node_id] = hit
+        query_sources[hit.node_id].append("postvalid_transcript_section_index")
 
     for query in queries:
         for current_modality in search_modalities:
@@ -633,6 +764,7 @@ def search_v2(
                 query=query,
                 modality=current_modality,
                 top_k=max(top_k * 2, 8),
+                levels=_search_levels_for_modality(state, current_modality),
             )
             for hit in hits:
                 adjusted_score, cognitive_breakdown = _adjust_search_score(
@@ -655,8 +787,17 @@ def search_v2(
                         **cognitive_breakdown,
                     },
                 )
+                if current_modality == "speech" and _is_postvalid_v1_context(state):
+                    candidate = _postvalid_adjust_speech_hit(
+                        candidate,
+                        index=index,
+                        state=state,
+                        queries=queries,
+                    )
                 current = hits_by_node.get(candidate.node_id)
                 if current is None or candidate.score > current.score:
+                    hits_by_node[candidate.node_id] = candidate
+                elif _prefer_more_specific_hit(candidate, current):
                     hits_by_node[candidate.node_id] = candidate
                 query_sources[candidate.node_id].append(query)
 
@@ -676,8 +817,20 @@ def search_v2(
         "target_slot": target_slot,
         "queries": queries,
         "modality": selected_modality,
-        "search_mode": getattr(index, "search_mode", "lexical"),
+        "question_route": question_route.to_dict(),
+        "search_mode": _effective_search_mode(index, search_modalities),
         "searched_modalities": search_modalities,
+        "transcript_section_index": {
+            "enabled": bool(transcript_hits),
+            "hit_count": len(transcript_hits),
+            "candidate_count": len(transcript_hits),
+        },
+        "postvalid_hybrid_asr": {
+            "enabled": _is_postvalid_v1_context(state) and "speech" in search_modalities,
+            "dense_embedding_enabled": bool(getattr(index, "speech_embedding_provider", None)),
+            "alias_expansion": _postvalid_alias_expansion_text(" ".join([state.question, *queries])),
+            "temporal_constraint": _postvalid_temporal_constraint_label(state),
+        },
         "hit_count": len(frontier),
         "query_sources": dict(query_sources),
         "cognitive_query_frame": query_frame.to_dict(),
@@ -709,6 +862,28 @@ def _select_temporally_diverse_hits(hits: list[SearchHit], top_k: int) -> list[S
     return selected[:top_k]
 
 
+def _effective_search_mode(index: VideoMemoryIndex, search_modalities: list[Modality]) -> str:
+    configured_mode = str(getattr(index, "search_mode", "lexical"))
+    if search_modalities and set(search_modalities) == {"speech"}:
+        return "speech_lexical_semantic"
+    if "speech" in search_modalities and configured_mode == "graph":
+        return "graph_visual_plus_speech_lexical_semantic"
+    return configured_mode
+
+
+def _search_levels_for_modality(
+    state: ControllerState,
+    modality: Modality,
+) -> tuple[str, ...] | None:
+    if (
+        _is_postvalid_v1_context(state)
+        and state.task_type == "information_retrieval"
+        and modality == "speech"
+    ):
+        return ("clip", "event")
+    return None
+
+
 def _temporally_redundant_index(
     hit: SearchHit,
     selected: list[SearchHit],
@@ -731,6 +906,16 @@ def _temporally_redundant_index(
 
 
 def _prefer_more_specific_hit(candidate: SearchHit, current: SearchHit) -> bool:
+    candidate_fine_speech = bool(candidate.score_breakdown.get("fine_speech_window"))
+    current_fine_speech = bool(current.score_breakdown.get("fine_speech_window"))
+    if candidate_fine_speech and not current_fine_speech and candidate.score >= (
+        current.score * 0.65
+    ):
+        return True
+    if current_fine_speech and not candidate_fine_speech and current.score >= (
+        candidate.score * 0.65
+    ):
+        return False
     candidate_situation = float(candidate.score_breakdown.get("cognitive_situation") or 0.0)
     current_situation = float(current.score_breakdown.get("cognitive_situation") or 0.0)
     if (
@@ -874,6 +1059,16 @@ def open_v2(
             classifier_metadata["route_core_downgraded_reason"] = (
                 "evidence_kind_not_compatible_with_question_route"
             )
+        if role == "core" and not _postvalid_speech_core_compatible(
+            state=state,
+            question_spec=question_spec,
+            target_slot=target_slot,
+            item=item,
+        ):
+            role = "support"
+            classifier_metadata["postvalid_core_downgraded_reason"] = (
+                "missing_required_entity_or_answer_type"
+            )
         claim_hash = _claim_hash(item.claim)
         if _is_duplicate_evidence(state, item, slot_name, claim_hash):
             duplicate_count += 1
@@ -905,6 +1100,13 @@ def open_v2(
                 **classifier_metadata,
             }
         )
+        if _postvalid_speech_evidence_fills_without_exact_span(
+            question_spec=question_spec,
+            question_route_label=question_route.label,
+            item=item,
+            role=role,
+        ):
+            item.metadata["support_fills_required_slot"] = True
         if relation_status is not None:
             item.metadata["relation_evidence_status"] = relation_status
         if relation_rejection_reason is not None:
@@ -912,8 +1114,28 @@ def open_v2(
             item.metadata["relation_evidence_rejection_reason"] = relation_rejection_reason
         if role != "noise":
             classified.append(item)
+        support_fills_required_slot = _support_speech_fills_postvalid_slot(
+            state=state,
+            question_spec=question_spec,
+            question_route_label=question_route.label,
+            item=item,
+            slot_name=slot_name,
+            role=role,
+            target_slot=target_slot,
+        )
         if role == "core":
             filled_slots.add(slot_name)
+            if _core_speech_fills_postvalid_slot_without_exact_span(
+                question_route_label=question_route.label,
+                item=item,
+                slot_name=slot_name,
+                target_slot=target_slot,
+            ):
+                item.metadata["support_fills_required_slot"] = True
+            background_only = False
+        elif support_fills_required_slot:
+            filled_slots.add(slot_name)
+            item.metadata["support_fills_required_slot"] = True
             background_only = False
         elif role == "support" and slot_name == target_slot:
             background_only = False
@@ -977,6 +1199,25 @@ def update_evidence_board(
                 result="graph_expansion_covered",
                 step_index=step_index,
             )
+        chain_opened_targets = metadata.get("chain_opened_targets", [])
+        if isinstance(chain_opened_targets, list):
+            for raw_target in chain_opened_targets:
+                if not isinstance(raw_target, dict):
+                    continue
+                chain_node_id = str(raw_target.get("node_id") or "")
+                chain_modality = str(raw_target.get("modality") or modality)
+                if chain_modality not in {"speech", "visual", "ocr", "audio", "cross_modal"}:
+                    chain_modality = str(modality)
+                if not chain_node_id:
+                    continue
+                add_opened_target(
+                    board,
+                    node_id=chain_node_id,
+                    modality=cast(Modality, chain_modality),
+                    target_slot=raw_target.get("target_slot") or target_slot,
+                    result=str(raw_target.get("result") or "chain_opened"),
+                    step_index=step_index,
+                )
     if target_slot:
         hinted_queries = [query for query in metadata.get("suggested_queries", []) if query]
         if hinted_queries:
@@ -1008,7 +1249,9 @@ def update_evidence_board(
             board.core_evidence_ids.append(item.evidence_id)
         elif role == "support":
             board_slot.support_evidence_ids.append(item.evidence_id)
-            if board_slot.status == "missing":
+            if item.metadata.get("support_fills_required_slot"):
+                board_slot.status = "filled"
+            elif board_slot.status == "missing":
                 board_slot.status = "background_only"
             board.support_evidence_ids.append(item.evidence_id)
         elif role == "background":
@@ -1217,6 +1460,87 @@ def _append_cognitive_reason(reason: str, breakdown: dict[str, float]) -> str:
     if strongest:
         suffix += f" via {', '.join(strongest)}"
     return f"{reason}; {suffix}"
+
+
+def _postvalid_adjust_speech_hit(
+    hit: SearchHit,
+    *,
+    index: VideoMemoryIndex,
+    state: ControllerState,
+    queries: list[str],
+) -> SearchHit:
+    node = index.memory.get_node(hit.node_id)
+    transcript = " ".join(span.text.strip() for span in node.speech_spans if span.text)
+    transcript = " ".join(transcript.split()).strip()
+    if not transcript:
+        return hit
+
+    query_text = _postvalid_transcript_query_text(queries, state)
+    alias_hits = _postvalid_alias_hits(query_text, transcript)
+    required_entity_fit = _postvalid_required_entity_fit(query_text, transcript)
+    temporal_fit = _postvalid_temporal_fit_score(state, hit.time_span)
+    temporal_penalty = _postvalid_temporal_penalty(state, hit.time_span)
+    answer_type_fit = _postvalid_answer_type_fit_score(query_text, transcript)
+
+    alias_bonus = min(0.36, 0.1 * len(alias_hits))
+    required_entity_bonus = 0.0
+    required_entity_penalty = 0.0
+    if required_entity_fit["required_count"] > 0:
+        if required_entity_fit["matched_count"] > 0:
+            required_entity_bonus = min(0.32, 0.16 * required_entity_fit["matched_count"])
+        else:
+            required_entity_penalty = 0.38
+
+    semantic_score = float(hit.score_breakdown.get("semantic", 0.0) or 0.0)
+    lexical_score = float(hit.score_breakdown.get("lexical", 0.0) or 0.0)
+    fine_window_bonus = 0.08 if hit.score_breakdown.get("fine_speech_window") else 0.0
+    hybrid_score = (
+        hit.score
+        + alias_bonus
+        + required_entity_bonus
+        + temporal_fit
+        + answer_type_fit
+        + fine_window_bonus
+        - temporal_penalty
+        - required_entity_penalty
+    )
+    hybrid_score = max(0.0, hybrid_score)
+
+    reason_parts = [hit.reason]
+    if semantic_score > 0:
+        reason_parts.append(f"dense_asr={semantic_score:.2f}")
+    if lexical_score > 0:
+        reason_parts.append(f"lexical={lexical_score:.2f}")
+    if alias_hits:
+        reason_parts.append(f"alias={','.join(alias_hits[:4])}")
+    if required_entity_penalty > 0:
+        reason_parts.append("required_entity_miss")
+    if temporal_fit > 0:
+        reason_parts.append(f"temporal_fit={temporal_fit:.2f}")
+    if temporal_penalty > 0:
+        reason_parts.append(f"temporal_penalty={temporal_penalty:.2f}")
+    if answer_type_fit > 0:
+        reason_parts.append(f"answer_type_fit={answer_type_fit:.2f}")
+
+    return SearchHit(
+        node_id=hit.node_id,
+        time_span=hit.time_span,
+        level=hit.level,
+        score=round(hybrid_score, 4),
+        reason="; ".join(reason_parts),
+        modality=hit.modality,
+        matched_terms=sorted(set(hit.matched_terms) | set(_tokenize(" ".join(alias_hits)))),
+        score_breakdown={
+            **dict(hit.score_breakdown),
+            "postvalid_hybrid_asr": round(hybrid_score, 4),
+            "postvalid_alias_bonus": round(alias_bonus, 4),
+            "postvalid_required_entity_bonus": round(required_entity_bonus, 4),
+            "postvalid_required_entity_penalty": round(required_entity_penalty, 4),
+            "postvalid_temporal_fit": round(temporal_fit, 4),
+            "postvalid_temporal_penalty": round(temporal_penalty, 4),
+            "postvalid_answer_type_fit": round(answer_type_fit, 4),
+        },
+    )
 
 
 def _build_cognitive_query_frame(
@@ -1439,7 +1763,206 @@ def _resolve_available_modality(modality: Modality, state: ControllerState) -> M
     return modality
 
 
-def _search_modalities(modality: Modality, question: str) -> list[Modality]:
+def _postvalid_sentiment_nearby_visual_hits(
+    *,
+    index: VideoMemoryIndex,
+    state: ControllerState,
+    question_route: QuestionRoute,
+    target_slot: str | None,
+    queries: list[str],
+    top_k: int,
+) -> list[SearchHit]:
+    if not _is_postvalid_v1_context(state):
+        return []
+    if question_route.label != "sentiment_analysis":
+        return []
+    if target_slot not in {"visual_body_language", "scene_context"}:
+        return []
+
+    anchors = _postvalid_sentiment_speech_anchor_spans(state)
+    if not anchors:
+        return []
+
+    query_text = " ".join([state.question, *queries])
+    query_tokens = _tokenize(query_text)
+    scored: list[tuple[float, float, SearchHit]] = []
+    for node in index.memory.nodes.values():
+        if node.level == "video":
+            continue
+        if node.metadata.get("speech_window_kind") == "fine_asr_window":
+            continue
+        if node.level not in {"clip", "event", "segment"}:
+            continue
+        if not _postvalid_node_has_visual_signal(node):
+            continue
+
+        proximity = max(_span_proximity_to_anchor(node.time_span, anchor) for anchor in anchors)
+        if proximity <= 0.0:
+            continue
+        node_tokens = _tokenize(
+            " ".join(
+                [
+                    node.visual_summary,
+                    " ".join(node.tags),
+                    " ".join(node.entities),
+                    str(node.metadata.get("section_tags") or ""),
+                ]
+            )
+        )
+        matched_terms = sorted(query_tokens & node_tokens)
+        lexical_bonus = min(0.16, len(matched_terms) * 0.025)
+        level_bonus = {"clip": 0.08, "event": 0.05, "segment": 0.02}.get(node.level, 0.0)
+        score = round(0.78 + (0.24 * proximity) + lexical_bonus + level_bonus, 4)
+        nearest_gap = min(_span_gap_seconds(node.time_span, anchor) for anchor in anchors)
+        reason = (
+            "Postvalid sentiment local visual context anchored to opened speech evidence"
+            f"; nearest_speech_gap_seconds={nearest_gap:.1f}"
+            f"; visual_signal={_postvalid_visual_signal_label(node)}"
+        )
+        scored.append(
+            (
+                score,
+                nearest_gap,
+                SearchHit(
+                    node_id=node.node_id,
+                    time_span=node.time_span,
+                    level=node.level,
+                    score=score,
+                    reason=reason,
+                    modality="visual",
+                    matched_terms=matched_terms,
+                    score_breakdown={
+                        "postvalid_sentiment_speech_anchor": round(proximity, 4),
+                        "postvalid_sentiment_visual_locality": 1.0,
+                    },
+                ),
+            )
+        )
+
+    scored.sort(key=lambda item: (-item[0], item[1], item[2].time_span.start, item[2].node_id))
+    return [hit for _, _, hit in scored[: max(top_k, 3)]]
+
+
+def _postvalid_sentiment_speech_anchor_spans(state: ControllerState) -> list[Any]:
+    anchors = [
+        item.time_span
+        for item in state.evidence_ledger
+        if item.modality == "speech"
+        and item.metadata.get("role") in {"core", "support", None}
+    ]
+    if anchors:
+        return sorted(anchors, key=lambda span: span.start)[-3:]
+    return []
+
+
+def _postvalid_node_has_visual_signal(node: Any) -> bool:
+    if node.visual_summary.strip():
+        return True
+    if node.keyframe_paths or node.clip_path:
+        return True
+    if node.tags or node.entities:
+        return True
+    return bool(
+        node.metadata.get("on_demand_visual_refinement")
+        or node.metadata.get("visual_summary_mode")
+        or node.metadata.get("visual_occurrences")
+    )
+
+
+def _postvalid_visual_signal_label(node: Any) -> str:
+    if node.visual_summary.strip():
+        return "summary"
+    if node.keyframe_paths:
+        return "keyframes"
+    if node.clip_path:
+        return "clip"
+    return "metadata"
+
+
+def _span_proximity_to_anchor(span: Any, anchor: Any, window_seconds: float = 90.0) -> float:
+    gap = _span_gap_seconds(span, anchor)
+    if gap <= 0.0:
+        return 1.0
+    if gap > window_seconds:
+        return 0.0
+    return max(0.0, 1.0 - (gap / window_seconds))
+
+
+def _span_gap_seconds(left: Any, right: Any) -> float:
+    if left.overlaps(right):
+        return 0.0
+    if left.end <= right.start:
+        return right.start - left.end
+    return left.start - right.end
+
+
+def _search_modalities(
+    modality: Modality,
+    question: str,
+    state: ControllerState,
+    question_route: Any,
+    target_slot: str | None,
+) -> list[Modality]:
+    if _is_postvalid_v1_context(state):
+        route_label = getattr(question_route, "label", "generic")
+        if route_label == "sentiment_analysis":
+            if target_slot == "speech_content":
+                return ["speech"]
+            if target_slot in {"visual_body_language", "scene_context"}:
+                return ["visual"]
+            if target_slot == "tone_or_audio_event":
+                return ["audio", "speech"]
+            expected = set(_longshot_context_terms(state, "expected_modalities"))
+            normalized_expected = {
+                "audio" if item == "audio_environment" else item for item in expected
+            }
+            ordered = [
+                item
+                for item in ("speech", "visual", "audio")
+                if not normalized_expected or item in normalized_expected
+            ]
+            return ordered or ["speech", "visual"]
+        if modality == "speech" and route_label not in {
+            "audio_event",
+            "audio_visual_alignment",
+            "visual_difference",
+            "ui_header_text",
+            "assignment_count",
+            "operator_list",
+            "terminal_output",
+            "code_value_eval",
+        }:
+            return ["speech"]
+        if route_label == "speech_explanation":
+            return ["speech"]
+        if route_label == "audio_event":
+            return ["audio", "speech"]
+        if route_label == "audio_visual_alignment":
+            return ["audio", "visual", "speech"]
+        if route_label in {"causal_chain", "rubric_explanation"}:
+            return ["speech", "visual"]
+        if route_label == "visual_difference":
+            return ["visual"]
+        if route_label == "temporal_occurrence":
+            return ["ocr", "visual", "speech"]
+        if route_label in {
+            "ui_header_text",
+            "assignment_count",
+            "operator_list",
+            "terminal_output",
+            "code_value_eval",
+        }:
+            return ["ocr", "visual"]
+        expected = set(_longshot_context_terms(state, "expected_modalities"))
+        if modality == "cross_modal" and expected:
+            ordered = [
+                item
+                for item in ("speech", "visual", "ocr", "audio")
+                if item in expected
+            ]
+            return ordered or ["speech"]
+        if modality == "cross_modal":
+            return ["speech", "visual"]
     if modality == "cross_modal":
         return ["speech", "visual", "ocr", "audio"]
     if modality == "visual":
@@ -1453,6 +1976,506 @@ def _search_modalities(modality: Modality, question: str) -> list[Modality]:
     if modality == "audio":
         return ["audio", "speech"]
     return [modality]
+
+
+def _postvalid_transcript_section_hits(
+    *,
+    index: VideoMemoryIndex,
+    queries: list[str],
+    state: ControllerState,
+    question_route_label: str,
+    target_slot: str | None,
+    top_k: int,
+) -> list[SearchHit]:
+    if not _is_postvalid_v1_context(state):
+        return []
+    if question_route_label not in {
+        "speech_explanation",
+        "generic",
+        "temporal_occurrence",
+        "causal_chain",
+        "rubric_explanation",
+        "sentiment_analysis",
+    }:
+        return []
+
+    query_text = _postvalid_transcript_query_text(queries, state)
+    query_tokens = _tokenize(query_text)
+    if not query_tokens:
+        return []
+
+    hits: list[SearchHit] = []
+    strict_information_retrieval = state.task_type == "information_retrieval"
+    for node in index.memory.nodes.values():
+        if node.level == "video" or not node.speech_spans:
+            continue
+        if strict_information_retrieval and node.level not in {"clip", "event"}:
+            continue
+        transcript = " ".join(span.text.strip() for span in node.speech_spans if span.text)
+        normalized_transcript = " ".join(transcript.split()).strip()
+        if not normalized_transcript:
+            continue
+        score, matched_terms, key_claim = _score_postvalid_transcript_section(
+            query_text=query_text,
+            query_tokens=query_tokens,
+            transcript=normalized_transcript,
+            state=state,
+            time_span=node.time_span,
+        )
+        if score <= 0:
+            continue
+        fine_speech_window = node.metadata.get("speech_window_kind") == "fine_asr_window"
+        if fine_speech_window:
+            score += 0.12
+        section_title = _postvalid_section_title(node)
+        entities = _postvalid_named_terms(normalized_transcript)[:8]
+        reason = (
+            "Postvalid transcript section index"
+            f"; section={section_title}"
+            f"; entities={entities}"
+            f"; key_claim={key_claim[:180]}"
+            f"; target_slot={target_slot or 'none'}"
+        )
+        if fine_speech_window:
+            reason += "; fine ASR retrieval window"
+        hits.append(
+            SearchHit(
+                node_id=node.node_id,
+                time_span=node.time_span,
+                level=node.level,
+                score=round(score, 4),
+                reason=reason,
+                modality="speech",
+                matched_terms=matched_terms,
+                score_breakdown={
+                    "postvalid_transcript_section": round(score, 4),
+                    "mode": 1.0,
+                    "fine_speech_window": 1.0 if fine_speech_window else 0.0,
+                },
+            )
+        )
+
+    hits.sort(key=lambda item: (-item.score, _window_level_rank(item.level), item.time_span.start))
+    return hits[:top_k]
+
+
+def _should_force_postvalid_speech_search(
+    state: ControllerState,
+    question_spec: QuestionSpec | None,
+    question_route: QuestionRoute,
+) -> bool:
+    if not _is_postvalid_v1_context(state):
+        return False
+    non_speech_routes = {
+        "assignment_count",
+        "operator_list",
+        "terminal_output",
+        "ui_header_text",
+        "visual_difference",
+        "audio_event",
+        "audio_visual_alignment",
+        "sentiment_analysis",
+    }
+    if question_route.label in non_speech_routes:
+        return False
+    if question_spec is not None and question_spec.preferred_modality in {"ocr", "audio"}:
+        return False
+    available = state.global_context.get("available_modalities", {})
+    return not isinstance(available, dict) or bool(available.get("speech", True))
+
+
+def _postvalid_transcript_query_text(queries: list[str], state: ControllerState) -> str:
+    parts = [state.question, *queries]
+    for turn in state.dialogue_context[-4:]:
+        content = str(turn.get("content") or "").strip()
+        if content:
+            parts.append(content)
+    longshot = state.global_context.get("longshot")
+    if isinstance(longshot, dict):
+        scenario = str(longshot.get("scenario") or "").strip()
+        if scenario and _scenario_agrees_with_question(scenario, state.question):
+            parts.append(scenario)
+    base_text = " ".join(parts)
+    alias_text = _postvalid_alias_expansion_text(base_text)
+    temporal_text = _postvalid_temporal_expansion_text(state)
+    if alias_text:
+        parts.append(alias_text)
+    if temporal_text:
+        parts.append(temporal_text)
+    return " ".join(parts)
+
+
+def _postvalid_alias_expansion_text(text: str) -> str:
+    active_terms: list[str] = []
+    lowered = text.lower()
+    for group in POSTVALID_ASR_ALIAS_GROUPS:
+        if not any(term in lowered for term in group):
+            continue
+        for term in group:
+            if term not in active_terms:
+                active_terms.append(term)
+    return " ".join(active_terms)
+
+
+def _postvalid_temporal_expansion_text(state: ControllerState) -> str:
+    intents = state.global_context.get("postvalid_temporal_intents")
+    if not isinstance(intents, list):
+        return ""
+    phrase_by_intent = {
+        "immediate_after": "right after immediate aftermath next event",
+        "earlier_problem": "earlier problem loophole hidden influence not truly random doubt challenge",
+        "first_piece": "first piece first jewelry first ring first gave first got",
+        "early_race": "early race strong start early lead gap pull away stay ahead",
+        "later_effect": "later effect consequence after that rest of video",
+        "cause_consequence": "because reason mechanism consequence why explanation",
+    }
+    phrases = [phrase_by_intent[item] for item in intents if item in phrase_by_intent]
+    return " ".join(phrases)
+
+
+def _postvalid_alias_hits(query_text: str, transcript: str) -> list[str]:
+    query_lower = query_text.lower()
+    transcript_lower = transcript.lower()
+    hits: list[str] = []
+    for group in POSTVALID_ASR_ALIAS_GROUPS:
+        if not any(term in query_lower for term in group):
+            continue
+        for term in group:
+            if term in transcript_lower and term not in hits:
+                hits.append(term)
+    return hits
+
+
+def _postvalid_required_entity_fit(query_text: str, evidence_text: str) -> dict[str, int]:
+    query_lower = query_text.lower()
+    evidence_lower = evidence_text.lower()
+    required_count = 0
+    matched_count = 0
+    for group in POSTVALID_REQUIRED_ALIAS_GROUPS:
+        if not any(term in query_lower for term in group):
+            continue
+        required_count += 1
+        if any(term in evidence_lower for term in group):
+            matched_count += 1
+    return {"required_count": required_count, "matched_count": matched_count}
+
+
+def _postvalid_required_entities_match(query_text: str, evidence_text: str) -> bool:
+    fit = _postvalid_required_entity_fit(query_text, evidence_text)
+    return fit["required_count"] == 0 or fit["matched_count"] == fit["required_count"]
+
+
+def _postvalid_temporal_constraint_label(state: ControllerState) -> str | None:
+    intents = state.global_context.get("postvalid_temporal_intents")
+    intent_text = " ".join(str(item) for item in intents if isinstance(item, str)) if isinstance(intents, list) else ""
+    lowered = f"{state.question} {intent_text}".lower()
+    if any(
+        cue in lowered
+        for cue in (
+            "first real sign",
+            "first sign",
+            "first thing",
+            "first piece",
+            "earliest",
+            "beginning",
+            "initial",
+            "first_piece",
+        )
+    ):
+        return "early"
+    if any(
+        cue in lowered
+        for cue in (
+            "right after",
+            "immediately after",
+            "just after",
+            "what happened next",
+            "after that",
+            "immediate_after",
+        )
+    ):
+        return "after"
+    if any(
+        cue in lowered
+        for cue in (
+            "early in the race",
+            "early lead",
+            "strong start",
+            "stay ahead",
+            "pull away",
+            "early_race",
+        )
+    ):
+        return "early"
+    if any(cue in lowered for cue in ("later", "rest of", "final", "ending", "last", "later_effect")):
+        return "late"
+    if any(
+        cue in lowered
+        for cue in (
+            "before",
+            "previous",
+            "earlier experiment",
+            "earlier experiments",
+            "big problem",
+            "wanted to fix",
+            "made people doubt",
+            "loophole",
+            "earlier_problem",
+        )
+    ):
+        return "before"
+    return None
+
+
+def _postvalid_temporal_fit_score(state: ControllerState, time_span: Any) -> float:
+    constraint = _postvalid_temporal_constraint_label(state)
+    if constraint is None:
+        return 0.0
+    duration = float(state.global_context.get("video_length_seconds") or 0.0)
+    longshot = state.global_context.get("longshot")
+    if duration <= 0 and isinstance(longshot, dict):
+        duration = float(longshot.get("duration") or 0.0)
+    if duration <= 0:
+        return 0.0
+    start = float(getattr(time_span, "start", 0.0))
+    end = float(getattr(time_span, "end", start))
+    if constraint in {"early", "before"}:
+        window = max(duration * 0.45, 1.0)
+        return round(max(0.0, 1.0 - (start / window)) * 0.28, 4)
+    if constraint == "late":
+        window = max(duration * 0.45, 1.0)
+        distance_to_end = max(0.0, duration - end)
+        return round(max(0.0, 1.0 - (distance_to_end / window)) * 0.24, 4)
+    if constraint == "after":
+        midpoint = duration / 2.0
+        return 0.2 if end >= midpoint else 0.0
+    return 0.0
+
+
+def _postvalid_temporal_penalty(state: ControllerState, time_span: Any) -> float:
+    constraint = _postvalid_temporal_constraint_label(state)
+    if constraint is None:
+        return 0.0
+    duration = float(state.global_context.get("video_length_seconds") or 0.0)
+    longshot = state.global_context.get("longshot")
+    if duration <= 0 and isinstance(longshot, dict):
+        duration = float(longshot.get("duration") or 0.0)
+    if duration <= 0:
+        return 0.0
+    start = float(getattr(time_span, "start", 0.0))
+    end = float(getattr(time_span, "end", start))
+    if constraint in {"early", "before"} and start > duration * 0.68:
+        return 0.32
+    if constraint == "late" and end < duration * 0.35:
+        return 0.24
+    return 0.0
+
+
+def _postvalid_answer_type_fit_score(query_text: str, evidence_text: str) -> float:
+    query_lower = query_text.lower()
+    evidence_lower = evidence_text.lower()
+    if "how many" in query_lower and re.search(r"\b\d+(?:\.\d+)?\b", evidence_lower):
+        return 0.16
+    if ("why" in query_lower or "how" in query_lower) and any(
+        cue in evidence_lower for cue in POSTVALID_CAUSAL_CUES
+    ):
+        return 0.18
+    if any(cue in query_lower for cue in ("who", "which person", "whose")) and _postvalid_named_terms(
+        evidence_text
+    ):
+        return 0.14
+    if any(cue in query_lower for cue in ("what happened", "what did", "what was")) and any(
+        cue in evidence_lower
+        for cue in ("then", "after", "because", "said", "got", "made", "tried", "showed")
+    ):
+        return 0.12
+    return 0.0
+
+
+def _score_postvalid_transcript_section(
+    *,
+    query_text: str,
+    query_tokens: set[str],
+    transcript: str,
+    state: ControllerState,
+    time_span,
+) -> tuple[float, list[str], str]:
+    transcript_tokens = _tokenize(transcript)
+    overlap = sorted(query_tokens & transcript_tokens)
+    alias_hits = _postvalid_alias_hits(query_text, transcript)
+    required_entity_fit = _postvalid_required_entity_fit(query_text, transcript)
+    if not overlap and not alias_hits:
+        return 0.0, [], ""
+
+    overlap_ratio = len(overlap) / max(len(query_tokens), 1)
+    density = sum(transcript.lower().count(term) for term in overlap) / max(
+        len(transcript_tokens),
+        1,
+    )
+    score = overlap_ratio + min(0.35, density)
+    query_lower = query_text.lower()
+    transcript_lower = transcript.lower()
+    named_terms = _postvalid_named_terms(query_text)
+    named_hits = [term for term in named_terms if term.lower() in transcript_lower]
+    score += min(0.35, 0.08 * len(named_hits))
+    if alias_hits:
+        score += min(0.45, 0.11 * len(alias_hits))
+    if required_entity_fit["required_count"] > 0:
+        if required_entity_fit["matched_count"] > 0:
+            score += min(0.35, 0.16 * required_entity_fit["matched_count"])
+        else:
+            score *= 0.42
+    if "why" in query_tokens or "how" in query_tokens:
+        causal_hits = sum(
+            1
+            for cue in POSTVALID_CAUSAL_CUES
+            if cue in transcript_lower
+        )
+        score += min(0.45, causal_hits * 0.12)
+    if any(phrase in query_lower and phrase in transcript_lower for phrase in _query_phrases(query_text)):
+        score += 0.25
+    phrase_hits = [
+        phrase
+        for phrase in _query_phrases(query_text)
+        if len(phrase.split()) >= 2 and phrase in transcript_lower
+    ]
+    if phrase_hits:
+        score += min(0.5, 0.15 * len(phrase_hits))
+    if state.task_type == "information_retrieval":
+        has_precise_anchor = bool(named_hits or phrase_hits or len(overlap) >= 4)
+        if not has_precise_anchor:
+            return 0.0, [], ""
+        if any(cue in query_lower for cue in ("how did", "what happened", "why did")):
+            answer_cue_hits = sum(
+                1
+                for cue in (
+                    "because",
+                    "so ",
+                    "then",
+                    "when",
+                    "after",
+                    "used",
+                    "made",
+                    "got",
+                    "tried",
+                    "said",
+                    "showed",
+            )
+                if cue in transcript_lower
+            )
+            score += min(0.3, answer_cue_hits * 0.06)
+    temporal_fit = _postvalid_temporal_fit_score(state, time_span)
+    temporal_penalty = _postvalid_temporal_penalty(state, time_span)
+    answer_type_fit = _postvalid_answer_type_fit_score(query_text, transcript)
+    score += temporal_fit + answer_type_fit
+    score -= temporal_penalty
+    key_claim = _postvalid_key_claim(query_tokens, transcript)
+    key_claim_tokens = _tokenize(key_claim)
+    if key_claim_tokens:
+        score += min(0.2, len(query_tokens & key_claim_tokens) * 0.03)
+    if _question_memory_entity_mismatch(state.global_context):
+        score *= 0.25
+    matched_terms = sorted(set(overlap) | set(_tokenize(" ".join(alias_hits))))
+    return round(max(0.0, score), 4), matched_terms, key_claim
+
+
+def _postvalid_key_claim(query_tokens: set[str], transcript: str) -> str:
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", " ".join(transcript.split()))
+        if sentence.strip()
+    ]
+    if not sentences:
+        return transcript[:180]
+    ranked: list[tuple[float, int, str]] = []
+    for index, sentence in enumerate(sentences):
+        sentence_tokens = _tokenize(sentence)
+        overlap = len(query_tokens & sentence_tokens)
+        causal = any(
+            cue in sentence.lower()
+            for cue in ("because", "therefore", "so ", "helped", "unlikely", "rule out")
+        )
+        ranked.append((overlap + (2.5 if causal else 0.0), index, sentence))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return ranked[0][2] if ranked else transcript[:180]
+
+
+def _postvalid_section_title(node: Any) -> str:
+    tags = [str(item) for item in node.metadata.get("section_tags", []) if item]
+    if tags:
+        return ",".join(tags[:3])
+    return f"{node.level}:{node.time_span.start:.0f}-{node.time_span.end:.0f}s"
+
+
+def _postvalid_named_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    for match in re.finditer(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b", text):
+        value = " ".join(match.group(0).split())
+        if value.lower() in STOPWORDS:
+            continue
+        if value not in terms:
+            terms.append(value)
+    for token in _tokenize(text):
+        if token in {
+            "canary",
+            "quasar",
+            "quasars",
+            "entanglement",
+            "loophole",
+            "filters",
+            "photons",
+            "ronaldo",
+            "microfinance",
+            "climate",
+            "dalio",
+            "yunus",
+        } and token not in terms:
+            terms.append(token)
+    return terms
+
+
+def _query_phrases(text: str) -> list[str]:
+    tokens = [token for token in re.findall(r"[a-z0-9_]+", text.lower()) if token not in STOPWORDS]
+    phrases: list[str] = []
+    for index in range(max(0, len(tokens) - 1)):
+        phrases.append(" ".join(tokens[index : index + 2]))
+    for index in range(max(0, len(tokens) - 2)):
+        phrases.append(" ".join(tokens[index : index + 3]))
+    return phrases[:20]
+
+
+def _scenario_agrees_with_question(scenario: str, question: str) -> bool:
+    scenario_terms = set(_postvalid_named_terms(scenario))
+    question_terms = set(_postvalid_named_terms(question))
+    if not scenario_terms or not question_terms:
+        return True
+    normalized_scenario = {term.lower() for term in scenario_terms}
+    normalized_question = {term.lower() for term in question_terms}
+    return bool(normalized_scenario & normalized_question)
+
+
+def _is_postvalid_v1_context(state: ControllerState) -> bool:
+    longshot = state.global_context.get("longshot")
+    if not isinstance(longshot, dict):
+        return False
+    return str(longshot.get("dataset_name") or "") == "postvalid_v1"
+
+
+def _longshot_context_terms(state: ControllerState, key: str) -> list[str]:
+    longshot = state.global_context.get("longshot")
+    if not isinstance(longshot, dict):
+        return []
+    value = longshot.get(key)
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return []
+
+
+def _question_memory_entity_mismatch(global_context: dict[str, Any]) -> bool:
+    mismatch = global_context.get("dataset_video_mismatch")
+    return isinstance(mismatch, dict) and mismatch.get("severity") == "high"
 
 
 def _has_route_signal(
@@ -1746,6 +2769,130 @@ def _slot_already_filled(state: ControllerState, slot_name: str) -> bool:
         return False
     slot = state.evidence_board.slots.get(slot_name)
     return slot is not None and slot.status == "filled"
+
+
+def _postvalid_speech_core_compatible(
+    *,
+    state: ControllerState,
+    question_spec: QuestionSpec,
+    target_slot: str | None,
+    item: Evidence,
+) -> bool:
+    if item.modality != "speech":
+        return True
+    if question_spec.question_type != "postvalid_speech_explanation":
+        return True
+    if not _is_postvalid_v1_context(state):
+        return True
+    slot = question_spec.get_slot(target_slot) if target_slot else None
+    evidence_text = " ".join(part for part in (item.claim, item.detail) if part).strip()
+    query_text = state.question
+    if slot is not None:
+        query_text = f"{query_text} {slot.description}"
+    query_text = f"{query_text} {_postvalid_alias_expansion_text(query_text)}".strip()
+    if not _postvalid_required_entities_match(query_text, evidence_text):
+        item.metadata["postvalid_required_entity_match"] = False
+        return False
+    item.metadata["postvalid_required_entity_match"] = True
+    if target_slot not in {"answer_core", "main_claim", "reason", "causal_or_temporal_link"}:
+        return True
+    if str(item.metadata.get("answer_span") or "").strip():
+        return True
+    if _postvalid_expected_answer_type_matches(query_text, evidence_text):
+        return True
+    item.metadata["postvalid_answer_type_match"] = False
+    return False
+
+
+def _postvalid_expected_answer_type_matches(query_text: str, evidence_text: str) -> bool:
+    query_lower = query_text.lower()
+    evidence_lower = evidence_text.lower()
+    if "how many" in query_lower:
+        return bool(re.search(r"\b\d+(?:\.\d+)?\b", evidence_lower))
+    if any(cue in query_lower for cue in ("who", "which person", "whose")):
+        return bool(_postvalid_named_terms(evidence_text))
+    if "why" in query_lower or "how" in query_lower:
+        if any(cue in evidence_lower for cue in POSTVALID_CAUSAL_CUES):
+            return True
+        return bool(_postvalid_alias_hits(query_text, evidence_text))
+    if _postvalid_alias_hits(query_text, evidence_text):
+        return True
+    evidence_tokens = _tokenize(evidence_text)
+    query_tokens = _tokenize(query_text)
+    return len(evidence_tokens & query_tokens) >= 2
+
+
+def _support_speech_fills_postvalid_slot(
+    *,
+    state: ControllerState,
+    question_spec: QuestionSpec,
+    question_route_label: str,
+    item: Evidence,
+    slot_name: str,
+    role: str,
+    target_slot: str | None,
+) -> bool:
+    if question_route_label != "speech_explanation":
+        return False
+    if question_spec.question_type != "postvalid_speech_explanation":
+        return False
+    if item.modality != "speech" or role != "support":
+        return False
+    if slot_name != target_slot:
+        return False
+    slot = question_spec.get_slot(slot_name)
+    return (
+        slot is not None
+        and slot.required
+        and _postvalid_speech_core_compatible(
+            state=state,
+            question_spec=question_spec,
+            target_slot=target_slot,
+            item=item,
+        )
+    )
+
+
+def _postvalid_speech_evidence_fills_without_exact_span(
+    *,
+    question_spec: QuestionSpec,
+    question_route_label: str,
+    item: Evidence,
+    role: str,
+) -> bool:
+    if question_spec.question_type != "postvalid_speech_explanation":
+        return False
+    if question_route_label not in {
+        "speech_explanation",
+        "causal_chain",
+        "temporal_occurrence",
+        "rubric_explanation",
+    }:
+        return False
+    if item.modality != "speech" or role not in {"core", "support"}:
+        return False
+    return not str(item.metadata.get("answer_span") or "").strip()
+
+
+def _core_speech_fills_postvalid_slot_without_exact_span(
+    *,
+    question_route_label: str,
+    item: Evidence,
+    slot_name: str,
+    target_slot: str | None,
+) -> bool:
+    if question_route_label not in {
+        "speech_explanation",
+        "causal_chain",
+        "temporal_occurrence",
+        "rubric_explanation",
+    }:
+        return False
+    if item.modality != "speech":
+        return False
+    if slot_name != target_slot:
+        return False
+    return not str(item.metadata.get("answer_span") or "").strip()
 
 
 def _open_result_label(

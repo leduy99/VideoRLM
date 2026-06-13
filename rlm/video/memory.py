@@ -12,6 +12,7 @@ from rlm.video.adapters import (
     SpeechRecognizer,
     VisualSummarizer,
 )
+from rlm.video.gpu_memory import unload_component
 from rlm.video.types import (
     AudioEvent,
     OCRSpan,
@@ -189,12 +190,16 @@ class VideoMemoryBuilder:
         scene_duration_seconds: float = 180.0,
         segment_duration_seconds: float = 45.0,
         clip_duration_seconds: float = 15.0,
+        enable_fine_speech_windows: bool = False,
+        fine_speech_window_seconds: float = 15.0,
+        fine_speech_window_stride_seconds: float = 5.0,
         visual_span_mode: Literal["scene_and_clip", "clip"] = "scene_and_clip",
         aggregate_child_visual_summaries: bool = False,
         parent_visual_summary_mode: ParentVisualSummaryMode = "full",
         enable_cognitive_events: bool = True,
         cognitive_event_boundary_threshold: float = COGNITIVE_EVENT_BOUNDARY_THRESHOLD,
         cognitive_event_max_duration_seconds: float | None = None,
+        offload_components_after_phase: bool = False,
         verbose: bool = False,
     ):
         if parent_visual_summary_mode not in {"full", "compact"}:
@@ -222,12 +227,26 @@ class VideoMemoryBuilder:
         self.scene_duration_seconds = scene_duration_seconds
         self.segment_duration_seconds = segment_duration_seconds
         self.clip_duration_seconds = clip_duration_seconds
+        self.enable_fine_speech_windows = enable_fine_speech_windows
+        self.fine_speech_window_seconds = fine_speech_window_seconds
+        self.fine_speech_window_stride_seconds = fine_speech_window_stride_seconds
+        if self.fine_speech_window_seconds <= 0:
+            raise ValueError(
+                "fine_speech_window_seconds must be positive, "
+                f"got {fine_speech_window_seconds}"
+            )
+        if self.fine_speech_window_stride_seconds <= 0:
+            raise ValueError(
+                "fine_speech_window_stride_seconds must be positive, "
+                f"got {fine_speech_window_stride_seconds}"
+            )
         self.visual_span_mode = visual_span_mode
         self.aggregate_child_visual_summaries = aggregate_child_visual_summaries
         self.parent_visual_summary_mode = parent_visual_summary_mode
         self.enable_cognitive_events = enable_cognitive_events
         self.cognitive_event_boundary_threshold = cognitive_event_boundary_threshold
         self.cognitive_event_max_duration_seconds = cognitive_event_max_duration_seconds
+        self.offload_components_after_phase = offload_components_after_phase
         self.verbose = verbose
 
     def prepare_artifacts(
@@ -253,6 +272,7 @@ class VideoMemoryBuilder:
             speech_spans = (
                 self.speech_recognizer.recognize(video_path) if self.speech_recognizer else []
             )
+        self._offload_component("speech recognizer", self.speech_recognizer)
         self._log(f"speech recognition done spans={len(speech_spans)}")
         self._log("visual summarization start")
         with _temporary_progress_callback(self.visual_summarizer, progress_callback):
@@ -261,12 +281,15 @@ class VideoMemoryBuilder:
                 if self.visual_summarizer
                 else []
             )
+        self._offload_component("visual summarizer", self.visual_summarizer)
         self._log(f"visual summarization done summaries={len(visual_summaries)}")
         self._log("ocr extraction start")
         ocr_spans = self.ocr_extractor.extract(video_path) if self.ocr_extractor else []
+        self._offload_component("ocr extractor", self.ocr_extractor)
         self._log(f"ocr extraction done spans={len(ocr_spans)}")
         self._log("audio event extraction start")
         audio_events = self.audio_extractor.extract(video_path) if self.audio_extractor else []
+        self._offload_component("audio extractor", self.audio_extractor)
         self._log(f"audio event extraction done events={len(audio_events)}")
 
         payload = dict(metadata or {})
@@ -299,6 +322,12 @@ class VideoMemoryBuilder:
         )
         self._log(f"prepare_artifacts done video_id={video_id}")
         return artifacts
+
+    def _offload_component(self, name: str, component: object | None) -> None:
+        if not self.offload_components_after_phase:
+            return
+        if unload_component(component):
+            self._log(f"offloaded {name}")
 
     def build(
         self,
@@ -430,9 +459,15 @@ class VideoMemoryBuilder:
                 "cognitive_event_max_duration_seconds",
                 self.cognitive_event_max_duration_seconds,
             )
+        metadata.setdefault("fine_speech_windows_enabled", self.enable_fine_speech_windows)
+        metadata.setdefault("fine_speech_window_seconds", self.fine_speech_window_seconds)
+        metadata.setdefault(
+            "fine_speech_window_stride_seconds",
+            self.fine_speech_window_stride_seconds,
+        )
+        metadata.setdefault("speech_spans_clipped_to_node_intervals", True)
         metadata["cognitive_events_built"] = build_cognitive_events
         metadata["cognitive_event_count"] = cognitive_event_count
-        metadata.setdefault("node_count", len(nodes))
         memory = VideoMemory(
             video_id=artifacts.video_id,
             root_id=root_id,
@@ -455,8 +490,11 @@ class VideoMemoryBuilder:
                 0,
             ),
         }
+        self._attach_temporal_occurrence_metadata(memory)
+        self._ensure_fine_speech_windows(memory, artifacts.speech_spans)
         self._link_cognitive_events(memory)
         self._attach_compact_visual_detail_pointers(memory)
+        memory.metadata["node_count"] = len(memory.nodes)
         self._log(f"build_memory done video_id={artifacts.video_id} nodes={len(nodes)}")
         return memory
 
@@ -466,7 +504,358 @@ class VideoMemoryBuilder:
 
     def load_memory(self, path: str | Path) -> VideoMemory:
         input_path = Path(path)
-        return VideoMemory.from_dict(json.loads(input_path.read_text(encoding="utf-8")))
+        memory = VideoMemory.from_dict(json.loads(input_path.read_text(encoding="utf-8")))
+        self._clip_memory_speech_spans_to_nodes(memory)
+        self._ensure_fine_speech_windows(memory)
+        memory.metadata["node_count"] = len(memory.nodes)
+        return memory
+
+    def memory_matches_builder_config(self, memory: VideoMemory) -> bool:
+        expected_float_values = {
+            "scene_duration_seconds": self.scene_duration_seconds,
+            "segment_duration_seconds": self.segment_duration_seconds,
+            "clip_duration_seconds": self.clip_duration_seconds,
+        }
+        for key, expected in expected_float_values.items():
+            actual = memory.metadata.get(key)
+            if actual is None or abs(float(actual) - float(expected)) > 1e-6:
+                return False
+        fine_enabled = bool(memory.metadata.get("fine_speech_windows_enabled", False))
+        if fine_enabled != self.enable_fine_speech_windows:
+            return False
+        if self.enable_fine_speech_windows:
+            fine_config = {
+                "fine_speech_window_seconds": self.fine_speech_window_seconds,
+                "fine_speech_window_stride_seconds": self.fine_speech_window_stride_seconds,
+            }
+            for key, expected in fine_config.items():
+                actual = memory.metadata.get(key)
+                if actual is None or abs(float(actual) - float(expected)) > 1e-6:
+                    return False
+        return True
+
+    def _ensure_fine_speech_windows(
+        self,
+        memory: VideoMemory,
+        source_spans: list[SpeechSpan] | None = None,
+    ) -> None:
+        if not self.enable_fine_speech_windows:
+            return
+        duration_seconds = float(memory.metadata.get("duration_seconds") or 0.0)
+        if duration_seconds <= 0:
+            root = memory.get_node(memory.root_id)
+            duration_seconds = root.time_span.end
+        if duration_seconds <= 0:
+            return
+
+        expected_config = {
+            "fine_speech_window_seconds": self.fine_speech_window_seconds,
+            "fine_speech_window_stride_seconds": self.fine_speech_window_stride_seconds,
+        }
+        current_config = {
+            key: memory.metadata.get(key)
+            for key in (
+                "fine_speech_window_seconds",
+                "fine_speech_window_stride_seconds",
+            )
+        }
+        existing = [
+            node_id
+            for node_id, node in memory.nodes.items()
+            if node.metadata.get("speech_window_kind") == "fine_asr_window"
+        ]
+        if existing and current_config == expected_config:
+            return
+        if existing:
+            self._remove_fine_speech_window_nodes(memory, existing)
+
+        spans = source_spans if source_spans is not None else self._base_speech_spans(memory)
+        spans = [span for span in spans if span.text.strip()]
+        if not spans:
+            memory.metadata.update(
+                {
+                    "fine_speech_windows_enabled": True,
+                    **expected_config,
+                    "fine_speech_window_count": 0,
+                }
+            )
+            return
+
+        windows = self._overlapping_time_windows(
+            TimeSpan(0.0, duration_seconds),
+            window_seconds=self.fine_speech_window_seconds,
+            stride_seconds=self.fine_speech_window_stride_seconds,
+        )
+        fine_nodes: list[VideoNode] = []
+        for window in windows:
+            text, source_refs = self._speech_text_for_window(spans, window)
+            if not text:
+                continue
+            context_node = self._fine_speech_context_node(memory, window)
+            node_id = f"{memory.video_id}_asrwin_{len(fine_nodes) + 1:05d}"
+            speech_span = SpeechSpan(
+                text=text,
+                time_span=window,
+                metadata={
+                    "speech_window_kind": "fine_asr_window",
+                    "source_span_refs": source_refs,
+                },
+            )
+            metadata: dict[str, Any] = {
+                "speech_window_kind": "fine_asr_window",
+                "speech_window_index": len(fine_nodes) + 1,
+                "speech_window_duration_seconds": self.fine_speech_window_seconds,
+                "speech_window_stride_seconds": self.fine_speech_window_stride_seconds,
+                "retrieval_only": True,
+                "source_span_refs": source_refs,
+            }
+            if context_node is not None:
+                metadata.update(
+                    {
+                        "context_node_id": context_node.node_id,
+                        "context_node_level": context_node.level,
+                        "context_time_span": context_node.time_span.to_dict(),
+                        "context_text": self._node_speech_text(context_node, max_chars=2200),
+                    }
+                )
+                metadata.update(
+                    {
+                        key: value
+                        for key, value in context_node.metadata.items()
+                        if key
+                        in {
+                            "temporal_section_tags",
+                            "content_section_tags",
+                            "section_tags",
+                            "speech_occurrences",
+                            "temporal_occurrences",
+                        }
+                    }
+                )
+            node = VideoNode(
+                node_id=node_id,
+                level="clip",
+                time_span=window,
+                visual_summary="",
+                speech_spans=[speech_span],
+                ocr_spans=[],
+                audio_events=[],
+                tags=[],
+                entities=[],
+                clip_path=None,
+                parent_id=context_node.node_id if context_node is not None else None,
+                metadata=metadata,
+            )
+            memory.nodes[node_id] = node
+            fine_nodes.append(node)
+            if context_node is not None:
+                context_node.metadata.setdefault("fine_speech_window_node_ids", []).append(
+                    node_id
+                )
+
+        self._link_fine_speech_windows(fine_nodes)
+        memory.metadata.update(
+            {
+                "fine_speech_windows_enabled": True,
+                **expected_config,
+                "fine_speech_window_count": len(fine_nodes),
+                "fine_speech_window_node_ids": [node.node_id for node in fine_nodes],
+            }
+        )
+        self._log(f"fine speech windows built count={len(fine_nodes)}")
+
+    def _remove_fine_speech_window_nodes(
+        self,
+        memory: VideoMemory,
+        node_ids: list[str],
+    ) -> None:
+        node_id_set = set(node_ids)
+        for node in memory.nodes.values():
+            node.children = [child_id for child_id in node.children if child_id not in node_id_set]
+            existing = node.metadata.get("fine_speech_window_node_ids")
+            if isinstance(existing, list):
+                node.metadata["fine_speech_window_node_ids"] = [
+                    item for item in existing if item not in node_id_set
+                ]
+        for node_id in node_ids:
+            memory.nodes.pop(node_id, None)
+
+    def _base_speech_spans(self, memory: VideoMemory) -> list[SpeechSpan]:
+        root = memory.get_node(memory.root_id)
+        if root.speech_spans:
+            return list(root.speech_spans)
+        seen: set[tuple[float, float, str]] = set()
+        spans: list[SpeechSpan] = []
+        for node in memory.nodes.values():
+            if node.metadata.get("speech_window_kind") == "fine_asr_window":
+                continue
+            for span in node.speech_spans:
+                key = (round(span.time_span.start, 3), round(span.time_span.end, 3), span.text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                spans.append(span)
+        spans.sort(key=lambda item: (item.time_span.start, item.time_span.end, item.text))
+        return spans
+
+    def _overlapping_time_windows(
+        self,
+        span: TimeSpan,
+        *,
+        window_seconds: float,
+        stride_seconds: float,
+    ) -> list[TimeSpan]:
+        if window_seconds <= 0:
+            raise ValueError(f"window_seconds must be positive, got {window_seconds}")
+        if stride_seconds <= 0:
+            raise ValueError(f"stride_seconds must be positive, got {stride_seconds}")
+        windows: list[TimeSpan] = []
+        cursor = span.start
+        while cursor < span.end:
+            window_end = min(span.end, cursor + window_seconds)
+            if window_end - cursor >= 0.25:
+                windows.append(TimeSpan(cursor, window_end))
+            if window_end >= span.end:
+                break
+            cursor += stride_seconds
+        return windows
+
+    def _speech_text_for_window(
+        self,
+        spans: list[SpeechSpan],
+        window: TimeSpan,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        pieces: list[str] = []
+        source_refs: list[dict[str, Any]] = []
+        for span in spans:
+            if not span.time_span.overlaps(window):
+                continue
+            overlap_start = max(span.time_span.start, window.start)
+            overlap_end = min(span.time_span.end, window.end)
+            if overlap_end - overlap_start <= 0.05:
+                continue
+            text = self._speech_text_slice_for_overlap(span, overlap_start, overlap_end)
+            if not text:
+                continue
+            pieces.append(text)
+            source_refs.append(
+                {
+                    "source_time_span": span.time_span.to_dict(),
+                    "overlap_time_span": TimeSpan(overlap_start, overlap_end).to_dict(),
+                    "speaker": span.speaker,
+                    "language": span.language,
+                }
+            )
+        return self._dedupe_joined_text(pieces), source_refs
+
+    def _speech_text_slice_for_overlap(
+        self,
+        span: SpeechSpan,
+        overlap_start: float,
+        overlap_end: float,
+    ) -> str:
+        text = " ".join(span.text.split()).strip()
+        if not text:
+            return ""
+        duration = max(span.time_span.duration, 1e-6)
+        words = text.split()
+        if duration <= max(self.fine_speech_window_seconds * 1.5, 1.0) or len(words) <= 24:
+            return text
+        start_ratio = max(0.0, min(1.0, (overlap_start - span.time_span.start) / duration))
+        end_ratio = max(0.0, min(1.0, (overlap_end - span.time_span.start) / duration))
+        start_index = max(0, int(len(words) * start_ratio) - 2)
+        end_index = min(len(words), int(len(words) * end_ratio + 0.999) + 2)
+        if end_index <= start_index:
+            end_index = min(len(words), start_index + 1)
+        return " ".join(words[start_index:end_index]).strip()
+
+    def _dedupe_joined_text(self, pieces: list[str]) -> str:
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for piece in pieces:
+            normalized = " ".join(piece.split()).strip()
+            if not normalized:
+                continue
+            key = re.sub(r"\W+", "", normalized.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(normalized)
+        return " ".join(deduped).strip()
+
+    def _fine_speech_context_node(
+        self,
+        memory: VideoMemory,
+        window: TimeSpan,
+    ) -> VideoNode | None:
+        candidates = [
+            node
+            for node in memory.nodes.values()
+            if node.level in {"clip", "event", "segment"}
+            and node.metadata.get("speech_window_kind") != "fine_asr_window"
+            and node.time_span.overlaps(window)
+        ]
+        if not candidates:
+            return None
+        level_rank = {"clip": 0, "event": 1, "segment": 2}
+
+        def rank(node: VideoNode) -> tuple[int, float, float, str]:
+            overlap = min(node.time_span.end, window.end) - max(node.time_span.start, window.start)
+            return (
+                level_rank.get(node.level, 3),
+                -overlap,
+                node.time_span.duration,
+                node.node_id,
+            )
+
+        return sorted(candidates, key=rank)[0]
+
+    def _node_speech_text(self, node: VideoNode, max_chars: int | None = None) -> str:
+        text = " ".join(span.text.strip() for span in node.speech_spans if span.text).strip()
+        normalized = " ".join(text.split())
+        if max_chars is not None and len(normalized) > max_chars:
+            return normalized[:max_chars].rsplit(" ", maxsplit=1)[0]
+        return normalized
+
+    def _link_fine_speech_windows(self, fine_nodes: list[VideoNode]) -> None:
+        ordered = sorted(fine_nodes, key=lambda node: (node.time_span.start, node.node_id))
+        for index, node in enumerate(ordered):
+            previous_id = ordered[index - 1].node_id if index > 0 else None
+            next_id = ordered[index + 1].node_id if index + 1 < len(ordered) else None
+            context_window_ids = [
+                item
+                for item in (previous_id, node.node_id, next_id)
+                if item is not None
+            ]
+            node.metadata["previous_speech_window_node_id"] = previous_id
+            node.metadata["next_speech_window_node_id"] = next_id
+            node.metadata["context_window_node_ids"] = context_window_ids
+
+    def _clip_memory_speech_spans_to_nodes(
+        self,
+        memory: VideoMemory,
+        source_spans: list[SpeechSpan] | None = None,
+    ) -> None:
+        if memory.metadata.get("speech_spans_clipped_to_node_intervals") is True:
+            return
+        root = memory.get_node(memory.root_id)
+        base_spans = source_spans if source_spans is not None else list(root.speech_spans)
+        if not base_spans:
+            base_spans = self._base_speech_spans(memory)
+        if not base_spans:
+            return
+        for node in memory.nodes.values():
+            if node.level == "video" or node.metadata.get("speech_window_kind") == "fine_asr_window":
+                continue
+            node.speech_spans = self._speech_spans_for_node(base_spans, node.time_span, node.level)
+        for node in memory.nodes.values():
+            if node.metadata.get("speech_window_kind") != "fine_asr_window":
+                continue
+            context_node_id = str(node.metadata.get("context_node_id") or "")
+            context_node = memory.nodes.get(context_node_id) if context_node_id else None
+            if context_node is not None:
+                node.metadata["context_text"] = self._node_speech_text(context_node, max_chars=2200)
+        memory.metadata["speech_spans_clipped_to_node_intervals"] = True
 
     def save_artifacts(self, artifacts: PreparedVideoArtifacts, path: str | Path) -> None:
         output_path = Path(path)
@@ -495,7 +884,7 @@ class VideoMemoryBuilder:
         parent_id: str | None,
     ) -> VideoNode:
         summaries = self._matching_visual_summaries(artifacts, time_span, level)
-        speech_spans = self._overlapping_items(artifacts.speech_spans, time_span)
+        speech_spans = self._speech_spans_for_node(artifacts.speech_spans, time_span, level)
         ocr_spans = self._overlapping_items(artifacts.ocr_spans, time_span)
         audio_events = self._overlapping_items(artifacts.audio_events, time_span)
         tags = sorted({tag for item in summaries for tag in item.tags})
@@ -588,6 +977,46 @@ class VideoMemoryBuilder:
             "temporal_section_tags": temporal_tags,
             "content_section_tags": content_tags,
             "section_tags": tags,
+        }
+
+    def _attach_temporal_occurrence_metadata(self, memory: VideoMemory) -> None:
+        temporal_index = memory.cross_modal_index
+        if temporal_index is None:
+            return
+        for event in temporal_index.all_events():
+            if event.source_node_id is None or event.source_node_id not in memory.nodes:
+                continue
+            source_node = memory.nodes[event.source_node_id]
+            compact = self._compact_temporal_event_metadata(event)
+            source_node.metadata.setdefault("temporal_occurrences", []).append(compact)
+            if event.modality == "asr":
+                source_node.metadata.setdefault("speech_occurrences", []).append(compact)
+            elif event.modality == "audio":
+                source_node.metadata.setdefault("audio_occurrences", []).append(compact)
+            elif event.modality == "ocr":
+                source_node.metadata.setdefault("ocr_occurrences", []).append(compact)
+            elif event.modality == "visual":
+                source_node.metadata.setdefault("visual_occurrences", []).append(compact)
+
+    def _compact_temporal_event_metadata(self, event) -> dict[str, Any]:
+        metadata = event.metadata
+        return {
+            "event_id": event.event_id,
+            "modality": event.modality,
+            "event_type": event.event_type,
+            "time_span": event.time_span.to_dict(),
+            "section_id": event.section_id,
+            "occurrence_index": metadata.get("occurrence_index"),
+            "occurrence_count": metadata.get("occurrence_count"),
+            "section_local_ordinal": metadata.get("section_local_ordinal"),
+            "section_ordinal": metadata.get("section_ordinal"),
+            "first_seen": metadata.get("first_seen"),
+            "last_seen": metadata.get("last_seen"),
+            "previous_same_entity_event": metadata.get("previous_same_entity_event"),
+            "next_same_entity_event": metadata.get("next_same_entity_event"),
+            "change_type": metadata.get("change_type"),
+            "section_tags": list(metadata.get("section_tags", [])),
+            "text_preview": (event.text or "")[:180],
         }
 
     def _temporal_section_tags(
@@ -1171,7 +1600,7 @@ class VideoMemoryBuilder:
         child_nodes: list[VideoNode],
         split_scores: list[float],
     ) -> VideoNode:
-        speech_spans = self._overlapping_items(artifacts.speech_spans, time_span)
+        speech_spans = self._speech_spans_for_node(artifacts.speech_spans, time_span, "event")
         ocr_spans = self._overlapping_items(artifacts.ocr_spans, time_span)
         audio_events = self._overlapping_items(artifacts.audio_events, time_span)
         tags = sorted({tag for child in child_nodes for tag in child.tags})
@@ -1805,6 +2234,49 @@ class VideoMemoryBuilder:
 
     def _overlapping_items(self, items: list[Any], span: TimeSpan) -> list[Any]:
         return [item for item in items if item.time_span.overlaps(span)]
+
+    def _speech_spans_for_node(
+        self,
+        speech_spans: list[SpeechSpan],
+        node_span: TimeSpan,
+        level: VideoNodeLevel,
+    ) -> list[SpeechSpan]:
+        if level == "video":
+            return list(speech_spans)
+        clipped_spans: list[SpeechSpan] = []
+        for source_index, span in enumerate(speech_spans):
+            if not span.time_span.overlaps(node_span):
+                continue
+            overlap_start = max(span.time_span.start, node_span.start)
+            overlap_end = min(span.time_span.end, node_span.end)
+            if overlap_end - overlap_start <= 0.05:
+                continue
+            text = self._speech_text_slice_for_overlap(span, overlap_start, overlap_end)
+            if not text:
+                continue
+            source_text = " ".join(span.text.split()).strip()
+            metadata = dict(span.metadata)
+            metadata.update(
+                {
+                    "source_speech_span_index": source_index,
+                    "source_speech_time_span": span.time_span.to_dict(),
+                    "node_time_span": node_span.to_dict(),
+                    "overlap_time_span": TimeSpan(overlap_start, overlap_end).to_dict(),
+                    "speech_text_clipped_to_node": True,
+                    "speech_text_slice_method": "proportional_word_overlap",
+                    "source_text_was_sliced": text != source_text,
+                }
+            )
+            clipped_spans.append(
+                SpeechSpan(
+                    text=text,
+                    time_span=TimeSpan(overlap_start, overlap_end),
+                    speaker=span.speaker,
+                    language=span.language,
+                    metadata=metadata,
+                )
+            )
+        return clipped_spans
 
     def _matching_visual_summaries(
         self,

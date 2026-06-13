@@ -28,6 +28,7 @@ from rlm.video.memory import VideoMemoryBuilder
 from rlm.video.semantic_embeddings import (
     LocalImageTextEmbeddingProvider,
     LocalInternVideoWindowEmbeddingProvider,
+    LocalSentenceTransformerEmbeddingProvider,
 )
 
 
@@ -84,6 +85,7 @@ class QwenVideoRuntimeBundle:
     visual_refiner: VisualSummarizer | None = None
     ocr_extractor: OCRExtractor | None = None
     embedding_provider: EmbeddingProvider | None = None
+    speech_embedding_provider: EmbeddingProvider | None = None
     image_text_embedding_provider: ImageTextEmbeddingProvider | None = None
     video_window_embedding_provider: VideoWindowEmbeddingProvider | None = None
 
@@ -101,6 +103,9 @@ class QwenVideoStackConfig:
     scene_duration_seconds: float = 180.0
     segment_duration_seconds: float = 45.0
     clip_duration_seconds: float = 15.0
+    enable_fine_speech_windows: bool = False
+    fine_speech_window_seconds: float = 15.0
+    fine_speech_window_stride_seconds: float = 5.0
     use_pitome: bool = False
     pitome_dense_frame_rate: float = 1.0
     pitome_min_frame_count: int | None = None
@@ -118,6 +123,7 @@ class QwenVideoStackConfig:
     pitome_max_scene_boundary_frames: int = 6
     pitome_scene_sample_rate: float | None = 1.0
     pitome_scene_keyframes_only: bool = True
+    pitome_edge_boundary_frames: bool = True
     visual_index_batch_size: int = 1
     visual_index_workers: int = 1
     vl_max_input_frames: int | None = None
@@ -127,6 +133,8 @@ class QwenVideoStackConfig:
     vrrqa_graph_refinement_neighbor_count: int = 1
     enable_vrrqa_visual_answer_verifier: bool = True
     vrrqa_visual_verifier_frame_count: int = 8
+    enable_refinement_frontier: bool = True
+    enable_dynamic_evidence_retrieval: bool = True
     visual_image_url_format: Literal["object", "string"] = "object"
     verbose: bool = False
 
@@ -247,11 +255,12 @@ class QwenVideoStackConfig:
                 pitome_max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
                 pitome_scene_sample_rate=self.pitome_scene_sample_rate,
                 pitome_scene_keyframes_only=self.pitome_scene_keyframes_only,
-            visual_index_batch_size=self.visual_index_batch_size,
-            visual_index_workers=self.visual_index_workers,
-            summary_granularity="clip",
-            verbose=self.verbose,
-        )
+                pitome_edge_boundary_frames=self.pitome_edge_boundary_frames,
+                visual_index_batch_size=self.visual_index_batch_size,
+                visual_index_workers=self.visual_index_workers,
+                summary_granularity="clip",
+                verbose=self.verbose,
+            )
             visual_refiner = openai_visual_summarizer
         elif self.enable_vrrqa_visual_answer_verifier:
             visual_refiner = openai_visual_summarizer
@@ -270,6 +279,9 @@ class QwenVideoStackConfig:
             scene_duration_seconds=self.scene_duration_seconds,
             segment_duration_seconds=self.segment_duration_seconds,
             clip_duration_seconds=self.clip_duration_seconds,
+            enable_fine_speech_windows=self.enable_fine_speech_windows,
+            fine_speech_window_seconds=self.fine_speech_window_seconds,
+            fine_speech_window_stride_seconds=self.fine_speech_window_stride_seconds,
             visual_span_mode="clip" if lazy_pitome_mode else "scene_and_clip",
             aggregate_child_visual_summaries=lazy_pitome_mode,
             parent_visual_summary_mode=self.parent_visual_summary_mode
@@ -295,6 +307,8 @@ class QwenVideoStackConfig:
             vrrqa_graph_refinement_neighbor_count=self.vrrqa_graph_refinement_neighbor_count,
             enable_vrrqa_visual_answer_verifier=self.enable_vrrqa_visual_answer_verifier,
             vrrqa_visual_verifier_frame_count=self.vrrqa_visual_verifier_frame_count,
+            enable_refinement_frontier=self.enable_refinement_frontier,
+            enable_dynamic_evidence_retrieval=self.enable_dynamic_evidence_retrieval,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
@@ -317,6 +331,7 @@ class QwenLocalVideoStackConfig:
     api_controller: OpenAICompatibleModelConfig | None = None
     forced_aligner: LocalModelConfig | None = None
     semantic_frame_embedding: LocalModelConfig | None = None
+    speech_embedding: LocalModelConfig | None = None
     video_window_embedding: LocalModelConfig | None = None
     enable_speech_recognition: bool = True
     speech_backend: Literal["qwen", "faster-whisper"] = "qwen"
@@ -324,6 +339,7 @@ class QwenLocalVideoStackConfig:
     faster_whisper_device: str = "cpu"
     faster_whisper_compute_type: str = "default"
     lazy_speech_refinement: bool = False
+    force_eager_speech_recognition: bool = False
     lazy_visual_refinement: bool = False
     ffmpeg_bin: str = "ffmpeg"
     frame_count: int = 3
@@ -333,6 +349,10 @@ class QwenLocalVideoStackConfig:
     segment_duration_seconds: float = 45.0
     clip_duration_seconds: float = 15.0
     speech_chunk_duration_seconds: float = 60.0
+    speech_asr_chunk_batch_size: int = 1
+    enable_fine_speech_windows: bool = False
+    fine_speech_window_seconds: float = 15.0
+    fine_speech_window_stride_seconds: float = 5.0
     controller_enable_thinking: bool = False
     use_pitome: bool = False
     pitome_dense_frame_rate: float = 1.0
@@ -351,6 +371,7 @@ class QwenLocalVideoStackConfig:
     pitome_max_scene_boundary_frames: int = 6
     pitome_scene_sample_rate: float | None = 1.0
     pitome_scene_keyframes_only: bool = True
+    pitome_edge_boundary_frames: bool = True
     visual_index_batch_size: int = 1
     visual_index_workers: int = 1
     enable_paddle_ocr: bool = False
@@ -384,6 +405,10 @@ class QwenLocalVideoStackConfig:
     enable_vrrqa_visual_answer_verifier: bool = True
     vrrqa_visual_verifier_frame_count: int = 8
     enable_controller_evidence_classifier: bool = False
+    enable_targeted_asr_refinement: bool = False
+    enable_refinement_frontier: bool = True
+    offload_components_after_use: bool = False
+    enable_dynamic_evidence_retrieval: bool = True
     verbose: bool = False
 
     @classmethod
@@ -400,6 +425,8 @@ class QwenLocalVideoStackConfig:
         semantic_frame_embedding_model: str | None = None,
         semantic_frame_embedding_device: str = "cpu",
         semantic_frame_embedding_torch_dtype: str = "float32",
+        speech_embedding_model: str | None = None,
+        speech_embedding_device: str = "cpu",
         video_window_embedding_model: str | None = None,
         video_window_embedding_device: str = "cuda:0",
         video_window_embedding_torch_dtype: str = "float32",
@@ -449,6 +476,14 @@ class QwenLocalVideoStackConfig:
                 device=semantic_frame_embedding_device,
                 torch_dtype=semantic_frame_embedding_torch_dtype,
             )
+        speech_embedding = None
+        if speech_embedding_model is not None:
+            speech_embedding = LocalModelConfig(
+                model_name=speech_embedding_model,
+                model_path=None,
+                device=speech_embedding_device,
+                torch_dtype="float32",
+            )
         video_window_embedding = None
         if video_window_embedding_model is not None:
             video_window_embedding = LocalModelConfig(
@@ -464,6 +499,7 @@ class QwenLocalVideoStackConfig:
             speech=speech,
             forced_aligner=forced_aligner,
             semantic_frame_embedding=semantic_frame_embedding,
+            speech_embedding=speech_embedding,
             video_window_embedding=video_window_embedding,
         )
 
@@ -480,6 +516,8 @@ class QwenLocalVideoStackConfig:
             downloads["forced_aligner"] = self.forced_aligner.download()
         if self.semantic_frame_embedding is not None:
             downloads["semantic_frame_embedding"] = self.semantic_frame_embedding.download()
+        if self.speech_embedding is not None:
+            downloads["speech_embedding"] = self.speech_embedding.download()
         if self.video_window_embedding is not None:
             downloads["video_window_embedding"] = self.video_window_embedding.download()
         return downloads
@@ -496,9 +534,8 @@ class QwenLocalVideoStackConfig:
     ) -> QwenVideoRuntimeBundle:
         if self.speech_backend not in {"qwen", "faster-whisper"}:
             raise ValueError(f"Unsupported speech backend: {self.speech_backend}")
-        lazy_pitome_mode = (
-            self.use_pitome or self.lazy_visual_refinement or self.lazy_speech_refinement
-        )
+        lazy_visual_mode = self.use_pitome or self.lazy_visual_refinement
+        lazy_speech_mode = self.lazy_speech_refinement and not self.force_eager_speech_recognition
 
         if self.api_controller is not None:
             from rlm.clients.openai import OpenAIClient
@@ -544,10 +581,11 @@ class QwenLocalVideoStackConfig:
                     torch_dtype=self.speech.torch_dtype,
                     ffmpeg_bin=self.ffmpeg_bin,
                     chunk_duration_seconds=self.speech_chunk_duration_seconds,
+                    chunk_batch_size=self.speech_asr_chunk_batch_size,
                     max_new_tokens=self.speech.max_new_tokens,
                     verbose=self.verbose,
                 )
-            if self.lazy_speech_refinement or lazy_pitome_mode:
+            if lazy_speech_mode:
                 speech_recognizer = LazySpeechRecognizer(
                     chunk_duration_seconds=self.speech_chunk_duration_seconds,
                     verbose=self.verbose,
@@ -555,7 +593,10 @@ class QwenLocalVideoStackConfig:
                 speech_refiner = full_speech_recognizer
             else:
                 speech_recognizer = full_speech_recognizer
+                if self.enable_targeted_asr_refinement:
+                    speech_refiner = full_speech_recognizer
         frame_embedding_provider = self._build_semantic_frame_embedding_provider()
+        speech_embedding_provider = self._build_speech_embedding_provider()
         video_window_embedding_provider = self._build_video_window_embedding_provider()
         visual_refiner = None
         visual_summarizer: VisualSummarizer
@@ -571,7 +612,7 @@ class QwenLocalVideoStackConfig:
             frame_width=self.frame_width,
             scene_threshold_seconds=self.scene_threshold_seconds,
             max_new_tokens=self.visual.max_new_tokens,
-            use_pitome=lazy_pitome_mode,
+            use_pitome=lazy_visual_mode,
             pitome_dense_frame_rate=self.pitome_dense_frame_rate,
             pitome_min_frame_count=self.pitome_min_frame_count,
             pitome_protect_ratio=self.pitome_protect_ratio,
@@ -588,12 +629,13 @@ class QwenLocalVideoStackConfig:
             pitome_max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
             pitome_scene_sample_rate=self.pitome_scene_sample_rate,
             pitome_scene_keyframes_only=self.pitome_scene_keyframes_only,
-            frame_embedding_provider=None if lazy_pitome_mode else frame_embedding_provider,
-            summary_granularity="clip" if lazy_pitome_mode else None,
+            pitome_edge_boundary_frames=self.pitome_edge_boundary_frames,
+            frame_embedding_provider=None if lazy_visual_mode else frame_embedding_provider,
+            summary_granularity="clip" if lazy_visual_mode else None,
             vl_max_input_frames=self.vl_max_input_frames,
             verbose=self.verbose,
         )
-        if lazy_pitome_mode:
+        if lazy_visual_mode:
             visual_summarizer = LazyPiToMeVisualIndexer(
                 ffmpeg_bin=self.ffmpeg_bin,
                 frame_width=self.frame_width,
@@ -614,6 +656,7 @@ class QwenLocalVideoStackConfig:
                 pitome_max_scene_boundary_frames=self.pitome_max_scene_boundary_frames,
                 pitome_scene_sample_rate=self.pitome_scene_sample_rate,
                 pitome_scene_keyframes_only=self.pitome_scene_keyframes_only,
+                pitome_edge_boundary_frames=self.pitome_edge_boundary_frames,
                 frame_embedding_provider=frame_embedding_provider,
                 visual_index_batch_size=self.visual_index_batch_size,
                 visual_index_workers=self.visual_index_workers,
@@ -653,10 +696,14 @@ class QwenLocalVideoStackConfig:
             scene_duration_seconds=self.scene_duration_seconds,
             segment_duration_seconds=self.segment_duration_seconds,
             clip_duration_seconds=self.clip_duration_seconds,
-            visual_span_mode="clip" if lazy_pitome_mode else "scene_and_clip",
-            aggregate_child_visual_summaries=lazy_pitome_mode,
+            enable_fine_speech_windows=self.enable_fine_speech_windows,
+            fine_speech_window_seconds=self.fine_speech_window_seconds,
+            fine_speech_window_stride_seconds=self.fine_speech_window_stride_seconds,
+            visual_span_mode="clip" if lazy_visual_mode else "scene_and_clip",
+            aggregate_child_visual_summaries=lazy_visual_mode,
             parent_visual_summary_mode=self.parent_visual_summary_mode
-            or ("compact" if lazy_pitome_mode else "full"),
+            or ("compact" if lazy_visual_mode else "full"),
+            offload_components_after_phase=self.offload_components_after_use,
             verbose=self.verbose,
         )
         controller = VideoRLM(
@@ -667,7 +714,9 @@ class QwenLocalVideoStackConfig:
             max_frontier_items=max_frontier_items,
             enable_hybrid_speech_refinement=enable_hybrid_speech_refinement,
             speech_refine_candidate_count=speech_refine_candidate_count,
-            search_mode=self.search_mode or ("graph" if lazy_pitome_mode else "lexical"),
+            search_mode=self.search_mode or ("graph" if lazy_visual_mode else "lexical"),
+            embedding_provider=None,
+            speech_embedding_provider=speech_embedding_provider,
             image_text_embedding_provider=image_text_embedding_provider,
             video_window_embedding_provider=video_window_embedding_provider,
             enable_video_window_reranking=self.enable_video_window_reranking,
@@ -676,6 +725,7 @@ class QwenLocalVideoStackConfig:
             video_window_rerank_window_seconds=self.video_window_rerank_window_seconds,
             video_window_rerank_min_score=self.video_window_rerank_min_score,
             speech_refiner=speech_refiner,
+            enable_targeted_asr_refinement=self.enable_targeted_asr_refinement,
             visual_refiner=visual_refiner,
             enable_vrrqa_graph_refinement_expansion=(
                 self.enable_vrrqa_graph_refinement_expansion
@@ -684,6 +734,9 @@ class QwenLocalVideoStackConfig:
             enable_vrrqa_visual_answer_verifier=self.enable_vrrqa_visual_answer_verifier,
             vrrqa_visual_verifier_frame_count=self.vrrqa_visual_verifier_frame_count,
             enable_controller_evidence_classifier=self.enable_controller_evidence_classifier,
+            enable_refinement_frontier=self.enable_refinement_frontier,
+            offload_components_after_use=self.offload_components_after_use,
+            enable_dynamic_evidence_retrieval=self.enable_dynamic_evidence_retrieval,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
@@ -694,6 +747,7 @@ class QwenLocalVideoStackConfig:
             visual_refiner=visual_refiner,
             ocr_extractor=ocr_extractor,
             embedding_provider=None,
+            speech_embedding_provider=speech_embedding_provider,
             image_text_embedding_provider=image_text_embedding_provider,
             video_window_embedding_provider=video_window_embedding_provider,
         )
@@ -710,6 +764,15 @@ class QwenLocalVideoStackConfig:
             torch_dtype=self.semantic_frame_embedding.torch_dtype,
             batch_size=self.semantic_frame_embedding_batch_size,
             trust_remote_code=self.semantic_frame_embedding.trust_remote_code,
+        )
+
+    def _build_speech_embedding_provider(self) -> EmbeddingProvider | None:
+        if self.speech_embedding is None:
+            return None
+        return LocalSentenceTransformerEmbeddingProvider(
+            model_name=self.speech_embedding.model_name,
+            model_path=self.speech_embedding.model_path,
+            device=self.speech_embedding.device,
         )
 
     def _build_video_window_embedding_provider(

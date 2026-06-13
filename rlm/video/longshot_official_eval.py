@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -79,7 +80,9 @@ Instructions:
 
 - If the Model Response satisfies the criterion, set "criteria_met" to true; otherwise, set it to false.
 
-- Focus on video content understanding, temporal relationships, and multimodal analysis. /no_think"""
+- Focus on video content understanding, temporal relationships, and multimodal analysis. /no_think
+
+Return strict JSON exactly like {{"criteria_met": true}} or {{"criteria_met": false}}. Do not include any explanation."""
 
 
 @dataclass
@@ -199,6 +202,20 @@ def parse_criteria_met(response_text: str) -> bool:
     raise ValueError(f"Could not parse judge response: {response_text[:200]}")
 
 
+def turn_ground_truth_response(turn: dict[str, Any]) -> str:
+    return str(
+        turn.get("ground_truth_response")
+        or turn.get("reference_response")
+        or turn.get("gold_response")
+        or turn.get("content")
+        or ""
+    )
+
+
+def turn_model_response(turn: dict[str, Any]) -> str:
+    return str(turn.get("candidate_response") or turn.get("content") or "")
+
+
 def build_local_judge(
     *,
     model_name: str,
@@ -274,12 +291,15 @@ def evaluate_predictions_official_style(
     evaluated_samples = 0
     evaluated_turns = 0
     evaluated_criteria = 0
+    eval_run_start = time.perf_counter()
+    total_judge_seconds = 0.0
 
     remaining_samples = [
         sample for sample in predictions if sample.get("sample_id") not in completed_ids
     ]
 
     for index, sample in enumerate(remaining_samples, start=1):
+        sample_eval_start = time.perf_counter()
         sample_id = sample.get("sample_id")
         print(
             f"[official-eval] {index}/{len(remaining_samples)} "
@@ -295,27 +315,45 @@ def evaluate_predictions_official_style(
             if turn.get("role") != "assistant" or "candidate_response" not in turn:
                 continue
             evaluated_turns += 1
+            model_response = turn_model_response(turn)
+            blank_model_response = not model_response.strip()
             for criterion in turn.get("criteria", []):
-                prompt = build_official_criterion_prompt(
-                    user_question=current_user_question,
-                    ground_truth_response=str(turn.get("content", "")),
-                    model_response=str(turn.get("candidate_response", "")),
-                    criterion_description=str(criterion.get("description", "")),
-                )
-                criteria_met, evaluation_error, completion = judge_boolean_prompt(
-                    judge_client=judge_client,
-                    prompt=prompt,
-                )
+                if blank_model_response:
+                    criteria_met = False
+                    evaluation_error = "blank_candidate_response"
+                    completion = ""
+                    judge_seconds = 0.0
+                else:
+                    prompt = build_official_criterion_prompt(
+                        user_question=current_user_question,
+                        ground_truth_response=turn_ground_truth_response(turn),
+                        model_response=model_response,
+                        criterion_description=str(criterion.get("description", "")),
+                    )
+                    judge_start = time.perf_counter()
+                    criteria_met, evaluation_error, completion = judge_boolean_prompt(
+                        judge_client=judge_client,
+                        prompt=prompt,
+                    )
+                    judge_seconds = time.perf_counter() - judge_start
+                    total_judge_seconds += judge_seconds
                 criterion["criteria_met"] = criteria_met
                 if evaluation_error is not None:
                     criterion["evaluation_error"] = evaluation_error
                     criterion["evaluation_raw"] = completion[:1000]
                 criterion["evaluation_model"] = config.judge_model_name
+                criterion["evaluation_timing"] = {
+                    "judge_seconds": round(judge_seconds, 6),
+                }
                 evaluated_criteria += 1
 
+        sample["evaluation_timing"] = {
+            "sample_eval_seconds": round(time.perf_counter() - sample_eval_start, 6),
+        }
         append_jsonl(config.eval_path, sample)
         evaluated_samples += 1
 
+    eval_run_seconds = time.perf_counter() - eval_run_start
     summary = calculate_official_scores(load_jsonl(config.eval_path))
     write_score_report(
         score_path=config.score_path,
@@ -334,6 +372,16 @@ def evaluate_predictions_official_style(
             "evaluated_samples_this_run": evaluated_samples,
             "evaluated_turns_this_run": evaluated_turns,
             "evaluated_criteria_this_run": evaluated_criteria,
+            "evaluation_timing": {
+                "run_seconds": round(eval_run_seconds, 6),
+                "judge_seconds": round(total_judge_seconds, 6),
+                "avg_judge_seconds_per_criterion": round(
+                    total_judge_seconds / evaluated_criteria,
+                    6,
+                )
+                if evaluated_criteria
+                else 0.0,
+            },
         },
     )
     return LongShOTOfficialEvalResult(
@@ -383,12 +431,15 @@ def evaluate_predictions_answer_only(
     evaluated_samples = 0
     evaluated_turns = 0
     evaluated_criteria = 0
+    eval_run_start = time.perf_counter()
+    total_judge_seconds = 0.0
 
     remaining_samples = [
         sample for sample in predictions if sample.get("sample_id") not in completed_ids
     ]
 
     for index, sample in enumerate(remaining_samples, start=1):
+        sample_eval_start = time.perf_counter()
         sample_id = sample.get("sample_id")
         print(
             f"[answer-only-eval] {index}/{len(remaining_samples)} "
@@ -416,27 +467,44 @@ def evaluate_predictions_answer_only(
                 "weight": 1.0,
                 "evaluation_mode": "answer_only",
             }
-            prompt = build_answer_only_prompt(
-                user_question=current_user_question,
-                ground_truth_response=str(turn.get("content", "")),
-                model_response=str(turn.get("candidate_response", "")),
-            )
-            criteria_met, evaluation_error, completion = judge_boolean_prompt(
-                judge_client=judge_client,
-                prompt=prompt,
-            )
+            model_response = turn_model_response(turn)
+            if not model_response.strip():
+                criteria_met = False
+                evaluation_error = "blank_candidate_response"
+                completion = ""
+                judge_seconds = 0.0
+            else:
+                prompt = build_answer_only_prompt(
+                    user_question=current_user_question,
+                    ground_truth_response=turn_ground_truth_response(turn),
+                    model_response=model_response,
+                )
+                judge_start = time.perf_counter()
+                criteria_met, evaluation_error, completion = judge_boolean_prompt(
+                    judge_client=judge_client,
+                    prompt=prompt,
+                )
+                judge_seconds = time.perf_counter() - judge_start
+                total_judge_seconds += judge_seconds
             criterion["criteria_met"] = criteria_met
             if evaluation_error is not None:
                 criterion["evaluation_error"] = evaluation_error
                 criterion["evaluation_raw"] = completion[:1000]
             criterion["evaluation_model"] = config.judge_model_name
+            criterion["evaluation_timing"] = {
+                "judge_seconds": round(judge_seconds, 6),
+            }
             turn["answer_only_ignored_criteria_count"] = ignored_criteria_count
             turn["criteria"] = [criterion]
             evaluated_criteria += 1
 
+        sample["evaluation_timing"] = {
+            "sample_eval_seconds": round(time.perf_counter() - sample_eval_start, 6),
+        }
         append_jsonl(config.eval_path, sample)
         evaluated_samples += 1
 
+    eval_run_seconds = time.perf_counter() - eval_run_start
     summary = calculate_official_scores(load_jsonl(config.eval_path))
     write_score_report(
         score_path=config.score_path,
@@ -456,6 +524,16 @@ def evaluate_predictions_answer_only(
             "evaluated_samples_this_run": evaluated_samples,
             "evaluated_turns_this_run": evaluated_turns,
             "evaluated_criteria_this_run": evaluated_criteria,
+            "evaluation_timing": {
+                "run_seconds": round(eval_run_seconds, 6),
+                "judge_seconds": round(total_judge_seconds, 6),
+                "avg_judge_seconds_per_criterion": round(
+                    total_judge_seconds / evaluated_criteria,
+                    6,
+                )
+                if evaluated_criteria
+                else 0.0,
+            },
         },
     )
     return LongShOTOfficialEvalResult(

@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_memory.add_argument("--scene-duration-seconds", type=float, default=180.0)
     build_memory.add_argument("--segment-duration-seconds", type=float, default=45.0)
     build_memory.add_argument("--clip-duration-seconds", type=float, default=15.0)
+    _add_fine_speech_window_args(build_memory)
     build_memory.add_argument(
         "--use-pitome",
         action="store_true",
@@ -95,9 +96,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--video-dir", required=True, help="Directory containing benchmark videos"
     )
     longshot.add_argument("--dataset-path", default="MBZUAI/longshot-bench")
-    longshot.add_argument("--dataset-name", default="postvalid_v1")
+    longshot.add_argument(
+        "--dataset-name",
+        default="postvalid_v2",
+        help=(
+            "Optional Hugging Face dataset config name. The current "
+            "MBZUAI/longshot-bench benchmark config is postvalid_v2."
+        ),
+    )
+    longshot.add_argument(
+        "--longshot-context-dataset-name",
+        default="postvalid_v1",
+        help=(
+            "Internal LongShot variant name passed to VideoRLM prompts/routing. "
+            "This is separate from the Hugging Face config name."
+        ),
+    )
     longshot.add_argument("--split", default="test")
     longshot.add_argument("--sample-limit", type=int)
+    longshot.add_argument(
+        "--sample-start-index",
+        type=int,
+        help="1-based inclusive sample index after filtering/sorting.",
+    )
+    longshot.add_argument(
+        "--sample-end-index",
+        type=int,
+        help="1-based inclusive sample index after filtering/sorting.",
+    )
     longshot.add_argument("--sample-id", action="append", default=[])
     longshot.add_argument("--video-id", action="append", default=[])
     longshot.add_argument("--task-filter", action="append", default=[])
@@ -157,9 +183,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--video-dir", required=True, help="Directory containing benchmark videos"
     )
     longshot_local.add_argument("--dataset-path", default="MBZUAI/longshot-bench")
-    longshot_local.add_argument("--dataset-name", default="postvalid_v1")
+    longshot_local.add_argument(
+        "--dataset-name",
+        default="postvalid_v2",
+        help=(
+            "Optional Hugging Face dataset config name. The current "
+            "MBZUAI/longshot-bench benchmark config is postvalid_v2."
+        ),
+    )
+    longshot_local.add_argument(
+        "--longshot-context-dataset-name",
+        default="postvalid_v1",
+        help=(
+            "Internal LongShot variant name passed to VideoRLM prompts/routing. "
+            "This is separate from the Hugging Face config name."
+        ),
+    )
     longshot_local.add_argument("--split", default="test")
     longshot_local.add_argument("--sample-limit", type=int)
+    longshot_local.add_argument(
+        "--sample-start-index",
+        type=int,
+        help="1-based inclusive sample index after filtering/sorting.",
+    )
+    longshot_local.add_argument(
+        "--sample-end-index",
+        type=int,
+        help="1-based inclusive sample index after filtering/sorting.",
+    )
     longshot_local.add_argument("--sample-id", action="append", default=[])
     longshot_local.add_argument("--video-id", action="append", default=[])
     longshot_local.add_argument("--task-filter", action="append", default=[])
@@ -268,6 +319,13 @@ def _cmd_build_memory(args: argparse.Namespace) -> int:
         scene_duration_seconds=args.scene_duration_seconds,
         segment_duration_seconds=args.segment_duration_seconds,
         clip_duration_seconds=args.clip_duration_seconds,
+        enable_fine_speech_windows=getattr(args, "enable_fine_speech_windows", False),
+        fine_speech_window_seconds=getattr(args, "fine_speech_window_seconds", 15.0),
+        fine_speech_window_stride_seconds=getattr(
+            args,
+            "fine_speech_window_stride_seconds",
+            5.0,
+        ),
         visual_span_mode="clip" if args.use_pitome else "scene_and_clip",
         aggregate_child_visual_summaries=args.use_pitome,
         parent_visual_summary_mode=_resolve_parent_visual_summary_mode(args),
@@ -317,6 +375,8 @@ def _cmd_run_longshot(args: argparse.Namespace) -> int:
         artifact_cache_dir=artifact_dir,
         memory_cache_dir=memory_dir,
         trace_dir=trace_dir,
+        dataset_name=args.dataset_name,
+        context_dataset_name=args.longshot_context_dataset_name,
         history_mode=args.history_mode,
         verbose=args.verbose,
         show_progress=not args.no_progress,
@@ -328,6 +388,8 @@ def _cmd_run_longshot(args: argparse.Namespace) -> int:
         dataset_name=args.dataset_name,
         split=args.split,
         sample_limit=args.sample_limit,
+        sample_start_index=args.sample_start_index,
+        sample_end_index=args.sample_end_index,
         sample_ids=args.sample_id,
         video_ids=args.video_id,
         task_filters=args.task_filter,
@@ -373,6 +435,8 @@ def _cmd_run_longshot_local(args: argparse.Namespace) -> int:
         artifact_cache_dir=artifact_dir,
         memory_cache_dir=memory_dir,
         trace_dir=trace_dir,
+        dataset_name=args.dataset_name,
+        context_dataset_name=args.longshot_context_dataset_name,
         history_mode=args.history_mode,
         verbose=args.verbose,
         show_progress=not args.no_progress,
@@ -384,6 +448,8 @@ def _cmd_run_longshot_local(args: argparse.Namespace) -> int:
         dataset_name=args.dataset_name,
         split=args.split,
         sample_limit=args.sample_limit,
+        sample_start_index=args.sample_start_index,
+        sample_end_index=args.sample_end_index,
         sample_ids=args.sample_id,
         video_ids=args.video_id,
         task_filters=args.task_filter,
@@ -458,7 +524,24 @@ def _build_qwen_bundle(args: argparse.Namespace, logger: VideoRLMLogger | None):
     stack.scene_duration_seconds = getattr(args, "scene_duration_seconds", 180.0)
     stack.segment_duration_seconds = getattr(args, "segment_duration_seconds", 45.0)
     stack.clip_duration_seconds = getattr(args, "clip_duration_seconds", 15.0)
+    stack.enable_fine_speech_windows = getattr(args, "enable_fine_speech_windows", False)
+    stack.fine_speech_window_seconds = getattr(args, "fine_speech_window_seconds", 15.0)
+    stack.fine_speech_window_stride_seconds = getattr(
+        args,
+        "fine_speech_window_stride_seconds",
+        5.0,
+    )
     stack.verbose = getattr(args, "verbose", False)
+    stack.enable_refinement_frontier = not getattr(
+        args,
+        "disable_refinement_frontier",
+        False,
+    )
+    stack.enable_dynamic_evidence_retrieval = not getattr(
+        args,
+        "disable_dynamic_evidence_retrieval",
+        False,
+    )
     _apply_visual_preprocessing_args(stack, args)
     return stack.build_bundle(
         logger=logger,
@@ -488,6 +571,8 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
             "semantic_frame_embedding_torch_dtype",
             "float32",
         ),
+        speech_embedding_model=getattr(args, "speech_embedding_repo", None),
+        speech_embedding_device=getattr(args, "speech_embedding_device", "cpu"),
         video_window_embedding_model=(
             getattr(args, "video_window_reranker_repo", None)
             if getattr(args, "enable_video_window_reranking", False)
@@ -512,6 +597,9 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     controller_max_new_tokens = getattr(args, "controller_max_new_tokens", None)
     if controller_max_new_tokens is not None:
         config.controller.max_new_tokens = controller_max_new_tokens
+    speech_model_path = getattr(args, "speech_model_path", None)
+    if speech_model_path:
+        config.speech.model_path = speech_model_path
     if getattr(args, "controller_trust_remote_code", False):
         config.controller.trust_remote_code = True
     controller_api_base_url = getattr(args, "controller_api_base_url", None)
@@ -538,6 +626,9 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     semantic_model_path = getattr(args, "semantic_frame_embedding_model_path", None)
     if config.semantic_frame_embedding is not None and semantic_model_path:
         config.semantic_frame_embedding.model_path = semantic_model_path
+    speech_embedding_model_path = getattr(args, "speech_embedding_model_path", None)
+    if config.speech_embedding is not None and speech_embedding_model_path:
+        config.speech_embedding.model_path = speech_embedding_model_path
     video_window_model_path = getattr(args, "video_window_reranker_model_path", None)
     if config.video_window_embedding is not None and video_window_model_path:
         config.video_window_embedding.model_path = video_window_model_path
@@ -580,6 +671,7 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     config.segment_duration_seconds = getattr(args, "segment_duration_seconds", 45.0)
     config.clip_duration_seconds = getattr(args, "clip_duration_seconds", 15.0)
     config.speech_chunk_duration_seconds = getattr(args, "speech_chunk_duration_seconds", 60.0)
+    config.speech_asr_chunk_batch_size = getattr(args, "speech_asr_chunk_batch_size", 1)
     config.speech.max_new_tokens = getattr(args, "speech_max_new_tokens", 512)
     config.enable_speech_recognition = not getattr(args, "no_speech_recognition", False)
     config.speech_backend = getattr(args, "speech_backend", "qwen")
@@ -591,7 +683,36 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
         "default",
     )
     config.lazy_speech_refinement = getattr(args, "lazy_speech_refinement", False)
+    config.enable_targeted_asr_refinement = getattr(
+        args,
+        "enable_targeted_asr_refinement",
+        False,
+    )
+    config.force_eager_speech_recognition = getattr(
+        args,
+        "eager_speech_recognition",
+        False,
+    )
+    if config.lazy_speech_refinement and config.force_eager_speech_recognition:
+        raise ValueError(
+            "--lazy-speech-refinement and --eager-speech-recognition cannot both be set"
+        )
     config.lazy_visual_refinement = getattr(args, "lazy_visual_refinement", False)
+    config.offload_components_after_use = getattr(
+        args,
+        "offload_components_after_use",
+        False,
+    )
+    config.enable_dynamic_evidence_retrieval = not getattr(
+        args,
+        "disable_dynamic_evidence_retrieval",
+        False,
+    )
+    config.enable_refinement_frontier = not getattr(
+        args,
+        "disable_refinement_frontier",
+        False,
+    )
     config.enable_paddle_ocr = getattr(args, "enable_paddle_ocr", False)
     config.paddle_ocr_lang = getattr(args, "paddle_ocr_lang", "en")
     config.paddle_ocr_version = getattr(args, "paddle_ocr_version", "PP-OCRv5")
@@ -717,10 +838,22 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
         help="Use decoder keyframes only for faster PiToMe scene-boundary detection.",
     )
     parser.add_argument(
+        "--pitome-edge-boundary-frames",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add cheap start/end boundary frames to each PiToMe span.",
+    )
+    parser.add_argument(
         "--visual-index-batch-size",
         type=int,
         default=1,
         help="Number of lazy visual-index spans to batch for semantic frame embedding.",
+    )
+    parser.add_argument(
+        "--visual-index-workers",
+        type=int,
+        default=1,
+        help="Parallel workers for lazy visual-index frame selection.",
     )
     parser.add_argument(
         "--parent-visual-summary-mode",
@@ -739,6 +872,30 @@ def _add_visual_preprocessing_args(parser: argparse.ArgumentParser) -> None:
             "Search backend. auto uses graph search for the lazy PiToMe strategy and "
             "lexical search for original VideoRLM."
         ),
+    )
+    _add_fine_speech_window_args(parser)
+
+
+def _add_fine_speech_window_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--enable-fine-speech-windows",
+        action="store_true",
+        help=(
+            "Build overlapping fine ASR retrieval windows while keeping scene/segment/clip "
+            "nodes as context."
+        ),
+    )
+    parser.add_argument(
+        "--fine-speech-window-seconds",
+        type=float,
+        default=15.0,
+        help="Duration of each fine ASR retrieval window.",
+    )
+    parser.add_argument(
+        "--fine-speech-window-stride-seconds",
+        type=float,
+        default=5.0,
+        help="Stride between fine ASR retrieval windows.",
     )
 
 
@@ -769,7 +926,16 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
     scene_sample_rate = getattr(args, "pitome_scene_sample_rate", 1.0)
     config.pitome_scene_sample_rate = None if scene_sample_rate == 0 else scene_sample_rate
     config.pitome_scene_keyframes_only = getattr(args, "pitome_scene_keyframes_only", True)
+    config.pitome_edge_boundary_frames = getattr(args, "pitome_edge_boundary_frames", True)
     config.visual_index_batch_size = getattr(args, "visual_index_batch_size", 1)
+    config.visual_index_workers = getattr(args, "visual_index_workers", 1)
+    config.enable_fine_speech_windows = getattr(args, "enable_fine_speech_windows", False)
+    config.fine_speech_window_seconds = getattr(args, "fine_speech_window_seconds", 15.0)
+    config.fine_speech_window_stride_seconds = getattr(
+        args,
+        "fine_speech_window_stride_seconds",
+        5.0,
+    )
     parent_mode = getattr(args, "parent_visual_summary_mode", "auto")
     config.parent_visual_summary_mode = None if parent_mode == "auto" else parent_mode
     search_mode = getattr(args, "search_mode", "auto")
@@ -777,16 +943,19 @@ def _apply_visual_preprocessing_args(config, args: argparse.Namespace) -> None:
 
 
 def _apply_official_video_strategy(config) -> None:
-    lazy_pitome_requested = (
+    lazy_visual_requested = (
         bool(getattr(config, "use_pitome", False))
         or bool(getattr(config, "lazy_visual_refinement", False))
-        or bool(getattr(config, "lazy_speech_refinement", False))
     )
-    if not lazy_pitome_requested:
+    lazy_speech_requested = bool(getattr(config, "lazy_speech_refinement", False))
+    if not lazy_visual_requested and not lazy_speech_requested:
         return
     config.use_pitome = True
     config.lazy_visual_refinement = True
-    if getattr(config, "enable_speech_recognition", True):
+    if (
+        getattr(config, "enable_speech_recognition", True)
+        and not getattr(config, "force_eager_speech_recognition", False)
+    ):
         config.lazy_speech_refinement = True
 
 
@@ -812,6 +981,10 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--controller-api-timeout", type=float, default=300.0)
     parser.add_argument("--visual-repo", default="Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--speech-repo", default="Qwen/Qwen3-ASR-0.6B")
+    parser.add_argument(
+        "--speech-model-path",
+        help="Optional local path for the ASR checkpoint. Defaults to output/models/<speech-repo>.",
+    )
     parser.add_argument("--forced-aligner-repo", default="Qwen/Qwen3-ForcedAligner-0.6B")
     parser.add_argument("--no-forced-aligner", action="store_true")
     parser.add_argument("--torch-dtype", default="bfloat16")
@@ -834,6 +1007,15 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum generated tokens per local Qwen ASR chunk.",
     )
     parser.add_argument(
+        "--speech-asr-chunk-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of local Qwen ASR chunks to transcribe in one batched model call. "
+            "Use 1 if batching is unsupported or uses too much GPU memory."
+        ),
+    )
+    parser.add_argument(
         "--speech-backend",
         choices=["qwen", "faster-whisper"],
         default="qwen",
@@ -849,6 +1031,25 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
             "Compatibility alias for the official lazy PiToMe strategy. "
             "Build timestamp-only lazy ASR memory, then run local ASR only when "
             "a retrieved speech node is opened."
+        ),
+    )
+    parser.add_argument(
+        "--eager-speech-recognition",
+        "--no-lazy-speech-refinement",
+        dest="eager_speech_recognition",
+        action="store_true",
+        help=(
+            "Build full ASR transcripts during memory construction even when PiToMe "
+            "or lazy visual refinement is enabled. Use this for speech-heavy LongShot "
+            "postvalid_v1 tasks where retrieval needs searchable transcript text."
+        ),
+    )
+    parser.add_argument(
+        "--enable-targeted-asr-refinement",
+        action="store_true",
+        help=(
+            "Run a second local ASR pass on selected speech windows when the opened "
+            "coarse transcript is weak for temporal/explanatory LongShot questions."
         ),
     )
     parser.add_argument(
@@ -907,6 +1108,15 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--semantic-frame-embedding-torch-dtype", default="float32")
     parser.add_argument("--semantic-frame-embedding-batch-size", type=int, default=8)
     parser.add_argument(
+        "--speech-embedding-repo",
+        help=(
+            "Optional sentence-transformers model for speech/ASR dense retrieval, "
+            "for example sentence-transformers/all-MiniLM-L6-v2."
+        ),
+    )
+    parser.add_argument("--speech-embedding-model-path")
+    parser.add_argument("--speech-embedding-device", default="cpu")
+    parser.add_argument(
         "--enable-video-window-reranking",
         action="store_true",
         help=(
@@ -928,6 +1138,30 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--video-window-rerank-weight", type=float, default=0.75)
     parser.add_argument("--video-window-rerank-window-seconds", type=float)
     parser.add_argument("--video-window-rerank-min-score", type=float)
+    parser.add_argument(
+        "--offload-components-after-use",
+        action="store_true",
+        help=(
+            "Unload idle local models after preprocessing phases, stage-2 reranking, "
+            "and each sample run to reduce peak GPU memory."
+        ),
+    )
+    parser.add_argument(
+        "--disable-dynamic-evidence-retrieval",
+        action="store_true",
+        help=(
+            "Disable the LongShot multi-target dynamic-programming retrieval planner. "
+            "By default complex LongShot questions retrieve an ordered evidence chain."
+        ),
+    )
+    parser.add_argument(
+        "--disable-refinement-frontier",
+        action="store_true",
+        help=(
+            "Disable OPEN-time refinement frontier expansion so controller search stays "
+            "on the selected retrieval chain instead of chasing child nodes."
+        ),
+    )
 
 
 if __name__ == "__main__":

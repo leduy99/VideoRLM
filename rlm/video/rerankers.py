@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from rlm.video.adapters import VideoWindowEmbeddingProvider
+from rlm.video.gpu_memory import unload_component
 from rlm.video.types import FrontierItem, TimeSpan, VideoMemory
 
 
@@ -15,6 +16,7 @@ class VideoWindowReranker:
     window_seconds: float | None = None
     min_stage2_score: float | None = None
     adaptive_stage2_weight: bool = True
+    offload_after_rerank: bool = False
 
     def __post_init__(self) -> None:
         if self.candidate_count <= 0:
@@ -108,6 +110,8 @@ class VideoWindowReranker:
             if item.node_id not in reranked_node_ids
         ]
         output = [item for item, _score in filtered] + remainder
+        if self.offload_after_rerank:
+            unload_component(self.embedding_provider)
         return output[:top_k], {
             "stage2_rerank_applied": True,
             "stage2_rerank_model": getattr(

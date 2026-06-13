@@ -9,7 +9,7 @@ from rlm.video.types import FrontierItem, Modality, TimeSpan, VideoMemory, Video
 
 TOKEN_PATTERN = re.compile(r"\b\w+\b")
 SearchMode = Literal["lexical", "graph"]
-GRAPH_MODALITIES = {"visual", "ocr"}
+GRAPH_MODALITIES = {"visual"}
 FRAME_SIMILARITY_THRESHOLD = 0.88
 SEMANTIC_FRAME_SIMILARITY_THRESHOLD = 0.16
 SEMANTIC_FRAME_EDGE_THRESHOLD = 0.78
@@ -203,20 +203,25 @@ class VideoMemoryIndex:
         self,
         memory: VideoMemory,
         embedding_provider: EmbeddingProvider | None = None,
+        speech_embedding_provider: EmbeddingProvider | None = None,
         image_text_embedding_provider: ImageTextEmbeddingProvider | None = None,
         lexical_weight: float = 0.7,
         semantic_weight: float = 0.3,
+        speech_semantic_min_score: float = 0.28,
         search_mode: SearchMode = "lexical",
     ):
         if search_mode not in {"lexical", "graph"}:
             raise ValueError(f"Unsupported search mode: {search_mode}")
         self.memory = memory
         self.embedding_provider = embedding_provider
+        self.speech_embedding_provider = speech_embedding_provider
         self.image_text_embedding_provider = image_text_embedding_provider
         self.lexical_weight = lexical_weight
         self.semantic_weight = semantic_weight
+        self.speech_semantic_min_score = speech_semantic_min_score
         self.search_mode = search_mode
         self._embedding_cache: dict[tuple[str, str], list[float]] = {}
+        self._speech_embedding_cache: dict[tuple[str, str], list[float]] = {}
         self._image_text_embedding_cache: dict[str, list[float]] = {}
         self._semantic_frame_vector_index = self._build_semantic_frame_vector_index()
 
@@ -227,6 +232,14 @@ class VideoMemoryIndex:
         top_k: int = 5,
         levels: Iterable[VideoNodeLevel] | None = None,
     ) -> list[SearchHit]:
+        if modality == "speech":
+            hits = self.lexical_search(
+                query=query,
+                modality=modality,
+                top_k=max(top_k * 5, 30),
+                levels=levels,
+            )
+            return self._prioritize_fine_speech_hits(hits, top_k)
         if self.search_mode == "graph" and (modality in GRAPH_MODALITIES or modality is None):
             return self.graph_search(
                 query=query,
@@ -957,17 +970,34 @@ class VideoMemoryIndex:
             if not text:
                 continue
 
-            semantic_score = self._semantic_score(query, text)
+            semantic_score = self._semantic_score(query, text, current_modality)
             temporal_score = self._temporal_score(query_tokens, node.time_span)
             section_score = self._section_score(query_lower, query_tokens, node)
             if lexical_score <= 0 and semantic_score <= 0 and section_score <= 0:
                 continue
+            if (
+                current_modality == "speech"
+                and lexical_score <= 0
+                and section_score <= 0
+                and semantic_score < self.speech_semantic_min_score
+            ):
+                continue
 
             score = round(
-                self._combine_scores(lexical_score, semantic_score, temporal_score)
+                self._combine_scores(
+                    lexical_score,
+                    semantic_score,
+                    temporal_score,
+                    current_modality,
+                )
                 + section_score,
                 4,
             )
+            fine_speech_window = (
+                current_modality == "speech" and self._is_fine_speech_window_node(node.node_id)
+            )
+            if fine_speech_window:
+                score = round(score + 0.12, 4)
             reason = self._build_reason(
                 modality=current_modality,
                 node_id=node.node_id,
@@ -977,6 +1007,8 @@ class VideoMemoryIndex:
                 temporal_score=temporal_score,
                 section_score=section_score,
             )
+            if fine_speech_window:
+                reason = f"{reason}; fine ASR retrieval window"
             hit = SearchHit(
                 node_id=node.node_id,
                 time_span=node.time_span,
@@ -991,12 +1023,30 @@ class VideoMemoryIndex:
                     "temporal": temporal_score,
                     "section": section_score,
                     "combined": score,
+                    "fine_speech_window": 1.0 if fine_speech_window else 0.0,
                 },
             )
             if best_hit is None or hit.score > best_hit.score:
                 best_hit = hit
 
         return best_hit
+
+    def _prioritize_fine_speech_hits(
+        self,
+        hits: list[SearchHit],
+        top_k: int,
+    ) -> list[SearchHit]:
+        if top_k <= 0:
+            return []
+        fine_hits = [hit for hit in hits if self._is_fine_speech_window_node(hit.node_id)]
+        if not fine_hits:
+            return hits[:top_k]
+        coarse_hits = [hit for hit in hits if not self._is_fine_speech_window_node(hit.node_id)]
+        return [*fine_hits, *coarse_hits][:top_k]
+
+    def _is_fine_speech_window_node(self, node_id: str) -> bool:
+        node = self.memory.nodes.get(node_id)
+        return bool(node and node.metadata.get("speech_window_kind") == "fine_asr_window")
 
     def _node_text(self, node, modality: Modality) -> str:
         if modality == "speech":
@@ -1147,11 +1197,12 @@ class VideoMemoryIndex:
         score = min(1.0, overlap_ratio + density_bonus + phrase_bonus)
         return round(score, 4), overlap
 
-    def _semantic_score(self, query: str, text: str) -> float:
-        if self.embedding_provider is None:
+    def _semantic_score(self, query: str, text: str, modality: Modality) -> float:
+        provider = self._semantic_provider_for_modality(modality)
+        if provider is None:
             return 0.0
-        query_vector = self._embed_cached(("query", query), query)
-        text_vector = self._embed_cached(("text", text), text)
+        query_vector = self._embed_cached(("query", query), query, modality)
+        text_vector = self._embed_cached(("text", text), text, modality)
         if not query_vector or not text_vector:
             return 0.0
         return round(self._cosine_similarity(query_vector, text_vector), 4)
@@ -1161,8 +1212,9 @@ class VideoMemoryIndex:
         lexical_score: float,
         semantic_score: float,
         temporal_score: float,
+        modality: Modality,
     ) -> float:
-        if self.embedding_provider is None:
+        if self._semantic_provider_for_modality(modality) is None:
             return round(lexical_score + temporal_score, 4)
         combined = (self.lexical_weight * lexical_score) + (self.semantic_weight * semantic_score)
         return round(combined + temporal_score, 4)
@@ -1300,9 +1352,26 @@ class VideoMemoryIndex:
             deduped.append(tag)
         return deduped
 
-    def _embed_cached(self, cache_key: tuple[str, str], text: str) -> list[float]:
+    def _semantic_provider_for_modality(self, modality: Modality) -> EmbeddingProvider | None:
+        if modality == "speech" and self.speech_embedding_provider is not None:
+            return self.speech_embedding_provider
+        return self.embedding_provider
+
+    def _embed_cached(
+        self,
+        cache_key: tuple[str, str],
+        text: str,
+        modality: Modality,
+    ) -> list[float]:
+        provider = self._semantic_provider_for_modality(modality)
+        if provider is None:
+            return []
+        if modality == "speech" and self.speech_embedding_provider is not None:
+            if cache_key not in self._speech_embedding_cache:
+                self._speech_embedding_cache[cache_key] = provider.embed_text(text)
+            return self._speech_embedding_cache[cache_key]
         if cache_key not in self._embedding_cache:
-            self._embedding_cache[cache_key] = self.embedding_provider.embed_text(text)
+            self._embedding_cache[cache_key] = provider.embed_text(text)
         return self._embedding_cache[cache_key]
 
     def _image_text_embed_cached(self, text: str) -> list[float]:

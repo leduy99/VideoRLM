@@ -62,6 +62,8 @@ def build_cross_modal_temporal_index(
     ]
     sections = _build_sections(all_events, artifacts.duration_seconds)
     _assign_section_memberships(all_events, sections)
+    _annotate_occurrences(all_events, sections)
+    _link_audio_events(audio_events, all_events)
     operator_events = _build_operator_events(all_events)
     code_snapshots = _build_code_snapshots(code_line_events)
     temporal_links = _build_temporal_links(all_events, sections, operator_events, code_snapshots)
@@ -289,10 +291,136 @@ def _build_audio_events(
                 confidence=float(event.confidence if event.confidence is not None else 0.75),
                 section_id=_primary_section_id(tags),
                 source_node_id=node.node_id if node is not None else None,
-                metadata={"section_tags": tags},
+                metadata={
+                    "section_tags": tags,
+                    "audio_index_source": "prepared_audio_events",
+                    "audio_tags": _audio_tags_from_label(label),
+                    "audio_caption": event.label.strip(),
+                },
             )
         )
     return events
+
+
+def _annotate_occurrences(
+    events: list[RawTemporalEvent],
+    sections: list[SectionNode],
+) -> None:
+    by_signature: dict[str, list[RawTemporalEvent]] = defaultdict(list)
+    by_section: dict[str, list[RawTemporalEvent]] = defaultdict(list)
+    for event in sorted(events, key=lambda item: (item.time_span.start, item.event_id)):
+        signature = _occurrence_signature(event)
+        if signature:
+            by_signature[signature].append(event)
+        if event.section_id:
+            by_section[event.section_id].append(event)
+
+    for group in by_signature.values():
+        if not group:
+            continue
+        first_seen = min(item.time_span.start for item in group)
+        last_seen = max(item.time_span.end for item in group)
+        chain = [item.event_id for item in group]
+        for index, event in enumerate(group, start=1):
+            event.metadata["first_seen"] = first_seen
+            event.metadata["last_seen"] = last_seen
+            event.metadata["occurrence_index"] = index
+            event.metadata["occurrence_count"] = len(group)
+            event.metadata["version_chain"] = list(chain)
+            event.metadata["change_type"] = _change_type_for_occurrence(event, index, group)
+            if index > 1:
+                previous = group[index - 2]
+                event.metadata["previous_same_entity_event"] = previous.event_id
+                event.linked_events = _dedupe([*event.linked_events, previous.event_id])
+            if index < len(group):
+                next_event = group[index]
+                event.metadata["next_same_entity_event"] = next_event.event_id
+                event.linked_events = _dedupe([*event.linked_events, next_event.event_id])
+
+    section_ordinals = {section.section_id: section.ordinal for section in sections}
+    for section_id, group in by_section.items():
+        for ordinal, event in enumerate(
+            sorted(group, key=lambda item: (item.time_span.start, item.event_id)),
+            start=1,
+        ):
+            event.metadata["section_local_ordinal"] = ordinal
+            event.metadata["section_ordinal"] = section_ordinals.get(section_id)
+
+
+def _link_audio_events(
+    audio_events: list[RawTemporalEvent],
+    all_events: list[RawTemporalEvent],
+) -> None:
+    for audio_event in audio_events:
+        aligned: list[str] = []
+        for event in all_events:
+            if event.event_id == audio_event.event_id:
+                continue
+            if event.modality not in {"visual", "ocr", "asr"}:
+                continue
+            if not audio_event.time_span.overlaps(event.time_span):
+                continue
+            aligned.append(event.event_id)
+            if len(aligned) >= 8:
+                break
+        audio_event.linked_events = _dedupe([*audio_event.linked_events, *aligned])
+        if aligned:
+            audio_event.event_type = "audio_visual_alignment"
+            audio_event.metadata["aligned_event_ids"] = aligned
+            audio_event.metadata["alignment_modalities"] = _dedupe(
+                [
+                    event.modality
+                    for event in all_events
+                    if event.event_id in set(aligned)
+                ]
+            )
+
+
+def _occurrence_signature(event: RawTemporalEvent) -> str:
+    text = event.text or ""
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9_]+", text.lower().replace("-", "_"))
+        if token not in {"the", "a", "an", "and", "or", "to", "in", "on", "of", "is", "are"}
+    ]
+    if not tokens:
+        return ""
+    if event.modality in {"audio", "visual"}:
+        key_tokens = tokens[:6]
+    elif event.modality == "code":
+        key_tokens = tokens[:2]
+    else:
+        key_tokens = tokens[:5]
+    return f"{event.modality}:{event.event_type}:{' '.join(key_tokens)}"
+
+
+def _change_type_for_occurrence(
+    event: RawTemporalEvent,
+    index: int,
+    group: list[RawTemporalEvent],
+) -> str:
+    if index == 1:
+        return "introduced"
+    previous = group[index - 2]
+    if (event.text or "").strip().casefold() == (previous.text or "").strip().casefold():
+        return "repeated"
+    return "changed"
+
+
+def _audio_tags_from_label(label: str) -> list[str]:
+    lowered = label.lower()
+    tags = []
+    for tag, cues in {
+        "speech_like": ("speech", "voice", "talking", "conversation"),
+        "music": ("music", "song", "melody", "instrument"),
+        "alert": ("beep", "alarm", "alert", "ring"),
+        "impact": ("bang", "hit", "crash", "knock"),
+        "crowd": ("applause", "cheer", "crowd", "clapping"),
+        "environment": ("wind", "rain", "traffic", "engine", "noise"),
+    }.items():
+        if any(cue in lowered for cue in cues):
+            tags.append(tag)
+    return tags or ["ambient_audio"]
 
 
 def _build_sections(

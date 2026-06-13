@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import json
 import math
@@ -9,12 +10,17 @@ from typing import Any, Literal
 
 from rlm.video.controller import VideoRLM
 from rlm.video.memory import VideoMemoryBuilder
+from rlm.video.timing import TimingRecorder, merge_timing_summaries
 from rlm.video.types import TimeSpan, VideoMemory, VideoRLMResult
 
 LongShOTHistoryMode = Literal["gold", "candidate"]
 
 LONGSHOT_DATASET_PATH = "MBZUAI/longshot-bench"
-LONGSHOT_DATASET_NAME = "postvalid_v1"
+# MBZUAI/longshot-bench moved the public benchmark config from postvalid_v1 to
+# postvalid_v2. Keep the VideoRLM context name separate below so existing
+# postvalid routing and prompt behavior remains enabled.
+LONGSHOT_DATASET_NAME = "postvalid_v2"
+LONGSHOT_CONTEXT_DATASET_NAME = "postvalid_v1"
 LONGSHOT_DATASET_SPLIT = "test"
 LONGSHOT_VIDEO_URL_TEMPLATE = "https://www.youtube.com/watch?v={video_id}"
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm", ".m4v")
@@ -31,9 +37,18 @@ def _load_hf_dataset(path: str, name: str | None, split: str):
             "LongShOT dataset loading requires the optional 'datasets' package."
         ) from exc
 
-    if name is None:
+    if _normalize_dataset_name(name) is None:
         return load_dataset(path, split=split)
-    return load_dataset(path, name=name, split=split)
+    return load_dataset(path, name=_normalize_dataset_name(name), split=split)
+
+
+def _normalize_dataset_name(name: str | None) -> str | None:
+    if name is None:
+        return None
+    normalized = str(name).strip()
+    if normalized.lower() in {"", "none", "null", "default"}:
+        return None
+    return normalized
 
 
 def load_longshot_samples(
@@ -42,10 +57,23 @@ def load_longshot_samples(
     split: str = LONGSHOT_DATASET_SPLIT,
     *,
     sample_limit: int | None = None,
+    sample_start_index: int | None = None,
+    sample_end_index: int | None = None,
     sample_ids: Sequence[str] | None = None,
     video_ids: Sequence[str] | None = None,
     task_filters: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
+    if sample_start_index is not None and sample_start_index < 1:
+        raise ValueError("sample_start_index is 1-based and must be >= 1")
+    if sample_end_index is not None and sample_end_index < 1:
+        raise ValueError("sample_end_index is 1-based and must be >= 1")
+    if (
+        sample_start_index is not None
+        and sample_end_index is not None
+        and sample_end_index < sample_start_index
+    ):
+        raise ValueError("sample_end_index must be >= sample_start_index")
+
     dataset = _load_hf_dataset(dataset_path, dataset_name, split)
     samples = [dict(sample) for sample in dataset]
 
@@ -61,6 +89,10 @@ def load_longshot_samples(
         samples = [sample for sample in samples if sample.get("task") in task_filter]
 
     samples.sort(key=lambda sample: (sample.get("video_id", ""), sample.get("sample_id", "")))
+    if sample_start_index is not None or sample_end_index is not None:
+        start = (sample_start_index or 1) - 1
+        end = sample_end_index
+        samples = samples[start:end]
     if sample_limit is not None:
         return samples[:sample_limit]
     return samples
@@ -80,11 +112,13 @@ def _longshot_user_turn_context(turn: dict[str, Any]) -> dict[str, Any]:
 def _longshot_global_context(
     sample: dict[str, Any],
     turn_context: dict[str, Any] | None,
+    dataset_name: str | None = None,
 ) -> dict[str, Any]:
     context = _drop_none_values(
         {
             "sample_id": sample.get("sample_id"),
             "video_id": sample.get("video_id"),
+            "dataset_name": dataset_name,
             "task": sample.get("task"),
             "sample_type": sample.get("sample_type"),
             "scenario": sample.get("scenario"),
@@ -215,6 +249,8 @@ class LongShOTBenchmarkRunner:
         artifact_cache_dir: str | Path | None = None,
         memory_cache_dir: str | Path | None = None,
         trace_dir: str | Path | None = None,
+        dataset_name: str | None = None,
+        context_dataset_name: str | None = LONGSHOT_CONTEXT_DATASET_NAME,
         history_mode: LongShOTHistoryMode = "gold",
         verbose: bool = False,
         show_progress: bool = True,
@@ -230,6 +266,9 @@ class LongShOTBenchmarkRunner:
         self.artifact_cache_dir = Path(artifact_cache_dir) if artifact_cache_dir else None
         self.memory_cache_dir = Path(memory_cache_dir) if memory_cache_dir else None
         self.trace_dir = Path(trace_dir) if trace_dir else None
+        self.dataset_name = _normalize_dataset_name(context_dataset_name) or _normalize_dataset_name(
+            dataset_name
+        )
         self.history_mode = history_mode
         self.verbose = verbose
         self.show_progress = show_progress
@@ -364,10 +403,13 @@ class LongShOTBenchmarkRunner:
         sample: dict[str, Any],
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        sample_start = time.perf_counter()
+        timing_recorder = TimingRecorder()
         payload = copy.deepcopy(sample)
         video_id = str(payload["video_id"])
         sample_id = str(payload.get("sample_id", video_id))
-        cached = self._load_cached_memory(video_id)
+        with timing_recorder.record("longshot.memory.load_cached"):
+            cached = self._load_cached_memory(video_id)
         if cached is not None:
             memory, memory_path = cached
             source_video_path = memory.metadata.get("source_video_path")
@@ -381,7 +423,8 @@ class LongShOTBenchmarkRunner:
                 )
             self._log(f"resolve video start video_id={video_id}")
             try:
-                video_path = self.video_resolver.resolve(video_id)
+                with timing_recorder.record("longshot.video.resolve"):
+                    video_path = self.video_resolver.resolve(video_id)
             except (FileNotFoundError, RuntimeError) as exc:
                 raise LongShOTVideoUnavailableError(
                     sample_id=sample_id,
@@ -393,6 +436,7 @@ class LongShOTBenchmarkRunner:
                 payload,
                 video_path,
                 progress_callback=progress_callback,
+                timing_recorder=timing_recorder,
             )
         self._log(f"memory ready video_id={video_id} memory_path={memory_path}")
 
@@ -440,6 +484,7 @@ class LongShOTBenchmarkRunner:
                 continue
 
             self._log(f"VideoRLM run start sample_id={sample_id} turn={index}")
+            controller_start = time.perf_counter()
             result = self.video_rlm.run(
                 pending_question,
                 memory,
@@ -449,18 +494,41 @@ class LongShOTBenchmarkRunner:
                 global_context_overrides=_longshot_global_context(
                     payload,
                     pending_turn_context,
+                    self.dataset_name,
                 ),
             )
+            controller_seconds = time.perf_counter() - controller_start
+            timing_recorder.add("longshot.controller.run", controller_seconds)
             self._log(
                 f"VideoRLM run done sample_id={sample_id} turn={index} "
                 f"steps={result.state.budget.steps_used} "
                 f"tool_calls={result.state.budget.tool_calls_used} "
                 f"answer={_truncate_for_log(result.answer)}"
             )
+            ground_truth_response = content
+            turn["ground_truth_response"] = ground_truth_response
             turn["candidate_response"] = result.answer
+            turn["content"] = result.answer
+            trace_write_start = time.perf_counter()
             trace_path = self._write_trace(sample_id, index, result)
+            timing_recorder.add(
+                "longshot.trace.write",
+                time.perf_counter() - trace_write_start,
+            )
             if trace_path is not None:
                 self._log(f"trace written path={trace_path}")
+            turn_timing = merge_timing_summaries(
+                result.timing,
+                {
+                    "components": {
+                        "longshot.controller.run": {
+                            "seconds": round(controller_seconds, 6),
+                            "calls": 1,
+                        }
+                    }
+                },
+            )
+            turn_timing["controller_wall_seconds"] = round(controller_seconds, 6)
             turn_results.append(
                 {
                     "turn_index": index,
@@ -470,6 +538,7 @@ class LongShOTBenchmarkRunner:
                     "steps_used": result.state.budget.steps_used,
                     "tool_calls_used": result.state.budget.tool_calls_used,
                     "trace_path": str(trace_path) if trace_path else None,
+                    "timing": turn_timing,
                 }
             )
 
@@ -478,11 +547,14 @@ class LongShOTBenchmarkRunner:
             pending_question = None
             pending_turn_context = None
 
+        timing_recorder.add("longshot.sample.total_wall", time.perf_counter() - sample_start)
+        sample_timing = timing_recorder.snapshot()
         payload["video_rlm_metadata"] = {
             "video_path": str(video_path) if video_path is not None else None,
             "memory_path": str(memory_path) if memory_path else None,
             "history_mode": self.history_mode,
             "turn_results": turn_results,
+            "timing": sample_timing,
         }
         return payload
 
@@ -491,9 +563,43 @@ class LongShOTBenchmarkRunner:
         sample: dict[str, Any],
         video_path: Path,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        timing_recorder: TimingRecorder | None = None,
     ) -> tuple[VideoMemory, Path | None]:
         video_id = str(sample["video_id"])
+        cached_start = time.perf_counter()
+        cached = self._memory_cache.get(video_id)
+        if timing_recorder is not None:
+            timing_recorder.add("longshot.memory.load_cached", time.perf_counter() - cached_start)
+        if cached is not None:
+            self._log(f"memory cache hit video_id={video_id}")
+            return cached
+
+        lock_wait_start = time.perf_counter()
+        with self._video_cache_lock(video_id):
+            if timing_recorder is not None:
+                timing_recorder.add(
+                    "longshot.memory.cache_lock_wait",
+                    time.perf_counter() - lock_wait_start,
+                )
+            return self._load_or_build_memory_locked(
+                sample=sample,
+                video_path=video_path,
+                progress_callback=progress_callback,
+                timing_recorder=timing_recorder,
+            )
+
+    def _load_or_build_memory_locked(
+        self,
+        sample: dict[str, Any],
+        video_path: Path,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        timing_recorder: TimingRecorder | None = None,
+    ) -> tuple[VideoMemory, Path | None]:
+        video_id = str(sample["video_id"])
+        cached_start = time.perf_counter()
         cached = self._load_cached_memory(video_id)
+        if timing_recorder is not None:
+            timing_recorder.add("longshot.memory.load_cached_after_lock", time.perf_counter() - cached_start)
         if cached is not None:
             return cached
 
@@ -509,9 +615,16 @@ class LongShOTBenchmarkRunner:
         artifacts = None
         if artifact_dir is not None and artifact_dir.exists():
             self._log(f"loading artifacts cache dir={artifact_dir}")
+            artifacts_start = time.perf_counter()
             artifacts = self.memory_builder.load_artifacts_dir(artifact_dir)
+            if timing_recorder is not None:
+                timing_recorder.add(
+                    "longshot.artifacts.load_cache",
+                    time.perf_counter() - artifacts_start,
+                )
         if artifacts is None:
             self._log(f"preparing artifacts video_id={video_id}")
+            prepare_start = time.perf_counter()
             artifacts = self.memory_builder.prepare_artifacts(
                 video_path=str(video_path),
                 duration_seconds=self._resolve_duration_seconds(sample),
@@ -519,21 +632,66 @@ class LongShOTBenchmarkRunner:
                 metadata={
                     "longshot_sample_id": sample.get("sample_id"),
                     "longshot_task": sample.get("task"),
+                    "longshot_dataset_name": self.dataset_name,
                 },
                 progress_callback=progress_callback,
             )
+            if timing_recorder is not None:
+                timing_recorder.add(
+                    "longshot.artifacts.prepare",
+                    time.perf_counter() - prepare_start,
+                )
             if artifact_dir is not None:
+                save_artifacts_start = time.perf_counter()
                 self.memory_builder.save_artifacts_dir(artifacts, artifact_dir)
+                if timing_recorder is not None:
+                    timing_recorder.add(
+                        "longshot.artifacts.save_cache",
+                        time.perf_counter() - save_artifacts_start,
+                    )
                 self._log(f"artifacts saved dir={artifact_dir}")
 
         self._log(f"building memory video_id={video_id}")
+        build_start = time.perf_counter()
         memory = self.memory_builder.build_from_artifacts(artifacts)
+        if timing_recorder is not None:
+            timing_recorder.add("longshot.memory.build", time.perf_counter() - build_start)
         if memory_path is not None:
+            save_memory_start = time.perf_counter()
             self.memory_builder.save_memory(memory, memory_path)
+            if timing_recorder is not None:
+                timing_recorder.add(
+                    "longshot.memory.save",
+                    time.perf_counter() - save_memory_start,
+                )
             self._log(f"memory saved path={memory_path}")
 
         self._memory_cache[video_id] = (memory, memory_path)
         return memory, memory_path
+
+    @contextlib.contextmanager
+    def _video_cache_lock(self, video_id: str):
+        lock_root = self.memory_cache_dir or self.artifact_cache_dir
+        if lock_root is None:
+            yield
+            return
+        lock_dir = lock_root / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"{video_id}.lock"
+        with lock_path.open("w", encoding="utf-8") as handle:
+            try:
+                import fcntl
+            except ImportError:
+                yield
+                return
+            self._log(f"waiting memory cache lock video_id={video_id} path={lock_path}")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            self._log(f"acquired memory cache lock video_id={video_id}")
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                self._log(f"released memory cache lock video_id={video_id}")
 
     def _load_cached_memory(self, video_id: str) -> tuple[VideoMemory, Path | None] | None:
         if video_id in self._memory_cache:
@@ -544,6 +702,9 @@ class LongShOTBenchmarkRunner:
         if memory_path is not None and memory_path.exists():
             self._log(f"loading memory cache path={memory_path}")
             memory = self.memory_builder.load_memory(memory_path)
+            if not self.memory_builder.memory_matches_builder_config(memory):
+                self._log(f"memory cache config mismatch path={memory_path}; rebuilding")
+                return None
             self._memory_cache[video_id] = (memory, memory_path)
             return memory, memory_path
 

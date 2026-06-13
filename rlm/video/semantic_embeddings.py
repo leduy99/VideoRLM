@@ -3,12 +3,48 @@ from __future__ import annotations
 import json
 import os
 import unicodedata
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from rlm.video.types import TimeSpan
+
+
+@dataclass
+class LocalSentenceTransformerEmbeddingProvider:
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    model_path: str | None = None
+    device: str = "cpu"
+    batch_size: int = 32
+    model: Any | None = None
+
+    def embed_text(self, text: str) -> list[float]:
+        model = self._ensure_loaded()
+        embedding = model.encode(
+            [text],
+            batch_size=self.batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )[0]
+        return [round(float(value), 6) for value in embedding.tolist()]
+
+    def _ensure_loaded(self):
+        if self.model is not None:
+            return self.model
+        from sentence_transformers import SentenceTransformer
+
+        model_path = self.model_path or self.model_name
+        self.model = SentenceTransformer(model_path, device=self.device)
+        return self.model
+
+    def unload(self) -> None:
+        self.model = None
+        from rlm.video.gpu_memory import clear_torch_cache
+
+        clear_torch_cache()
 
 
 @dataclass
@@ -89,6 +125,13 @@ class LocalImageTextEmbeddingProvider:
         )
         return self.model, self.processor
 
+    def unload(self) -> None:
+        self.model = None
+        self.processor = None
+        from rlm.video.gpu_memory import clear_torch_cache
+
+        clear_torch_cache()
+
     def _to_device(self, inputs, dtype=None):
         return _move_inputs_to_device(inputs, self.device, dtype)
 
@@ -168,6 +211,12 @@ class LocalInternVideoWindowEmbeddingProvider:
         self.model.eval()
         self._set_model_device_config(torch)
         return self.model
+
+    def unload(self) -> None:
+        self.model = None
+        from rlm.video.gpu_memory import clear_torch_cache
+
+        clear_torch_cache()
 
     def _set_model_device_config(self, torch_module) -> None:
         if self.model is None:
