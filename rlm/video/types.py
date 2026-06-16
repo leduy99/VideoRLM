@@ -1193,6 +1193,7 @@ class ControllerAction:
     evidence_ids: list[str] = field(default_factory=list)
     answer: str | None = None
     rationale: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.action_type == "SEARCH" and (not self.query or not self.modality):
@@ -1214,6 +1215,7 @@ class ControllerAction:
             "evidence_ids": list(self.evidence_ids),
             "answer": self.answer,
             "rationale": self.rationale,
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -1227,6 +1229,7 @@ class ControllerAction:
             evidence_ids=list(data.get("evidence_ids", [])),
             answer=data.get("answer"),
             rationale=data.get("rationale"),
+            metadata=dict(data.get("metadata", {})),
         )
 
 

@@ -5,7 +5,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from rlm.video.evidence_pipeline import search_v2
+from rlm.video.evidence_pipeline import POSTVALID_ASR_ALIAS_GROUPS, search_v2
+from rlm.video.index import STOPWORDS, SearchHit
 from rlm.video.question_router import QuestionRoute, route_from_metadata, route_question
 from rlm.video.types import (
     ControllerState,
@@ -145,7 +146,7 @@ def build_dynamic_evidence_targets(
     state: ControllerState,
     question_spec: QuestionSpec,
     query_override: str | None = None,
-    max_targets: int = 4,
+    max_targets: int = 6,
 ) -> list[EvidenceRetrievalTarget]:
     route = _route_for_state(state, question_spec)
     if not should_use_dynamic_evidence_retrieval(state, question_spec, route):
@@ -189,8 +190,8 @@ def select_dynamic_evidence_chain(
     question_spec: QuestionSpec,
     top_k: int,
     query_override: str | None = None,
-    max_targets: int = 4,
-    candidates_per_target: int = 8,
+    max_targets: int = 6,
+    candidates_per_target: int = 10,
 ) -> DynamicEvidencePlan | None:
     targets = build_dynamic_evidence_targets(
         state=state,
@@ -201,41 +202,38 @@ def select_dynamic_evidence_chain(
     if len(targets) < 2:
         return None
 
-    candidates_by_target: list[list[DynamicEvidenceCandidate]] = []
-    target_searches: list[dict[str, Any]] = []
     search_total_start = time.perf_counter()
-    for target in targets:
-        search_start = time.perf_counter()
-        target_frontier, _metadata = search_v2(
+    pooled_result = (
+        _pooled_speech_candidates_by_target(
             index=index,
-            question_spec=question_spec,
-            target_slot=target.target_slot,
+            targets=targets,
             state=state,
-            top_k=candidates_per_target,
-            query_override=target.query,
-            modality=target.modality,
+            candidates_per_target=candidates_per_target,
         )
-        search_seconds = time.perf_counter() - search_start
-        target_searches.append(
-            {
-                "target_id": target.target_id,
-                "label": target.label,
-                "target_slot": target.target_slot,
-                "modality": target.modality,
-                "seconds": round(search_seconds, 6),
-                "hit_count": len(target_frontier),
-                "search_mode": _metadata.get("search_mode"),
-                "searched_modalities": _metadata.get("searched_modalities", []),
-                "transcript_section_hit_count": (
-                    _metadata.get("transcript_section_index", {}).get("hit_count", 0)
-                    if isinstance(_metadata.get("transcript_section_index"), dict)
-                    else 0
-                ),
-            }
+        if _can_use_pooled_speech_target_search(state, targets)
+        else None
+    )
+    if pooled_result is not None and len(pooled_result[0]) >= 2:
+        candidates_by_target, target_searches = pooled_result
+    else:
+        candidates_by_target, target_searches = _search_candidates_by_target(
+            index=index,
+            state=state,
+            question_spec=question_spec,
+            targets=targets,
+            candidates_per_target=candidates_per_target,
         )
-        candidates = _target_candidates(target, target_frontier)
-        if candidates:
-            candidates_by_target.append(candidates)
+        if pooled_result is not None:
+            target_searches.insert(
+                0,
+                {
+                    "target_id": "pooled_speech",
+                    "label": "pooled_speech",
+                    "seconds": 0.0,
+                    "hit_count": 0,
+                    "search_mode": "pooled_speech_fallback_to_target_search",
+                },
+            )
 
     if len(candidates_by_target) < 2:
         return None
@@ -249,7 +247,7 @@ def select_dynamic_evidence_chain(
     if len(selected) < 2:
         return None
 
-    frontier = _frontier_from_selected_chain(selected, limit=top_k)
+    frontier = _frontier_from_selected_chain(selected, limit=max(top_k, len(selected)))
     if len(frontier) < 2:
         return None
     return DynamicEvidencePlan(
@@ -419,6 +417,222 @@ def _multimodal_question_needs_dynamic_chain(
     )
 
 
+def _search_candidates_by_target(
+    *,
+    index: Any,
+    state: ControllerState,
+    question_spec: QuestionSpec,
+    targets: list[EvidenceRetrievalTarget],
+    candidates_per_target: int,
+) -> tuple[list[list[DynamicEvidenceCandidate]], list[dict[str, Any]]]:
+    candidates_by_target: list[list[DynamicEvidenceCandidate]] = []
+    target_searches: list[dict[str, Any]] = []
+    for target in targets:
+        search_start = time.perf_counter()
+        target_frontier, metadata = search_v2(
+            index=index,
+            question_spec=question_spec,
+            target_slot=target.target_slot,
+            state=state,
+            top_k=candidates_per_target,
+            query_override=target.query,
+            modality=target.modality,
+        )
+        search_seconds = time.perf_counter() - search_start
+        target_searches.append(
+            {
+                "target_id": target.target_id,
+                "label": target.label,
+                "target_slot": target.target_slot,
+                "modality": target.modality,
+                "seconds": round(search_seconds, 6),
+                "hit_count": len(target_frontier),
+                "search_mode": metadata.get("search_mode"),
+                "searched_modalities": metadata.get("searched_modalities", []),
+                "transcript_section_hit_count": (
+                    metadata.get("transcript_section_index", {}).get("hit_count", 0)
+                    if isinstance(metadata.get("transcript_section_index"), dict)
+                    else 0
+                ),
+            }
+        )
+        candidates = _target_candidates(target, target_frontier)
+        if candidates:
+            candidates_by_target.append(candidates)
+    return candidates_by_target, target_searches
+
+
+def _can_use_pooled_speech_target_search(
+    state: ControllerState,
+    targets: list[EvidenceRetrievalTarget],
+) -> bool:
+    if not _is_postvalid_context_with_speech(state):
+        return False
+    if len(targets) < 2:
+        return False
+    return all(target.modality == "speech" for target in targets)
+
+
+def _pooled_speech_candidates_by_target(
+    *,
+    index: Any,
+    targets: list[EvidenceRetrievalTarget],
+    state: ControllerState,
+    candidates_per_target: int,
+) -> tuple[list[list[DynamicEvidenceCandidate]], list[dict[str, Any]]] | None:
+    if not hasattr(index, "search") or not hasattr(index, "memory"):
+        return None
+
+    pool_limit = min(max(candidates_per_target * max(3, len(targets)) * 3, 24), 72)
+    pooled_query = _pooled_speech_query(state, targets)
+    search_start = time.perf_counter()
+    hits = index.search(
+        pooled_query,
+        modality="speech",
+        top_k=pool_limit,
+    )
+    search_seconds = time.perf_counter() - search_start
+    if not hits:
+        return None
+
+    candidates_by_target: list[list[DynamicEvidenceCandidate]] = []
+    target_searches: list[dict[str, Any]] = [
+        {
+            "target_id": "pooled_speech",
+            "label": "shared_speech_candidate_pool",
+            "target_slot": None,
+            "modality": "speech",
+            "seconds": round(search_seconds, 6),
+            "hit_count": len(hits),
+            "search_mode": "pooled_speech_bm25_dense",
+            "searched_modalities": ["speech"],
+            "pool_limit": pool_limit,
+        }
+    ]
+    for target in targets:
+        target_start = time.perf_counter()
+        target_candidates = _score_pooled_speech_hits_for_target(
+            index=index,
+            target=target,
+            hits=hits,
+            candidates_per_target=candidates_per_target,
+        )
+        target_searches.append(
+            {
+                "target_id": target.target_id,
+                "label": target.label,
+                "target_slot": target.target_slot,
+                "modality": target.modality,
+                "seconds": round(time.perf_counter() - target_start, 6),
+                "hit_count": len(target_candidates),
+                "search_mode": "pooled_speech_target_rescore",
+                "searched_modalities": ["speech"],
+                "shared_candidate_pool": True,
+            }
+        )
+        if target_candidates:
+            candidates_by_target.append(target_candidates)
+    return candidates_by_target, target_searches
+
+
+def _pooled_speech_query(
+    state: ControllerState,
+    targets: list[EvidenceRetrievalTarget],
+) -> str:
+    parts = [
+        state.global_context.get("clean_question") or state.question,
+        _postvalid_dialogue_query_context(state),
+    ]
+    parts.extend(target.query for target in targets)
+    return _clean_text(" ".join(str(part or "") for part in parts))
+
+
+def _score_pooled_speech_hits_for_target(
+    *,
+    index: Any,
+    target: EvidenceRetrievalTarget,
+    hits: list[SearchHit],
+    candidates_per_target: int,
+) -> list[DynamicEvidenceCandidate]:
+    query_tokens = _expanded_content_tokens(target.query)
+    raw_candidates: list[tuple[FrontierItem, float]] = []
+    for hit in hits:
+        text = _speech_text_for_hit(index, hit.node_id)
+        text_tokens = _expanded_content_tokens(text)
+        overlap = query_tokens & text_tokens
+        overlap_score = len(overlap) / max(1, min(len(query_tokens), 12))
+        phrase_score = _target_phrase_score(target.query, text)
+        score = round(
+            (0.45 * max(0.0, min(1.0, hit.score)))
+            + (0.45 * min(1.0, overlap_score))
+            + (0.10 * phrase_score),
+            4,
+        )
+        if score <= 0.02:
+            continue
+        item = hit.to_frontier_item()
+        item.score = score
+        item.why_candidate = (
+            f"{item.why_candidate}; pooled_dynamic_speech_search; "
+            f"target={target.label}; target_query={target.query[:160]!r}; "
+            f"target_overlap_terms={sorted(overlap)[:12]}; "
+            f"target_phrase_score={phrase_score:.2f}"
+        )
+        raw_candidates.append((item, score))
+
+    raw_candidates.sort(key=lambda item: (-item[1], item[0].time_span.start, item[0].node_id))
+    raw_candidates = raw_candidates[:candidates_per_target]
+    max_score = max((score for _item, score in raw_candidates), default=0.0)
+    if max_score <= 0.0:
+        return []
+    return [
+        DynamicEvidenceCandidate(
+            target=target,
+            frontier_item=item,
+            target_score=score,
+            normalized_score=score / max_score,
+        )
+        for item, score in raw_candidates
+    ]
+
+
+def _speech_text_for_hit(index: Any, node_id: str) -> str:
+    node = index.memory.get_node(node_id)
+    return _clean_text(" ".join(span.text for span in node.speech_spans))
+
+
+def _expanded_content_tokens(text: str) -> set[str]:
+    lowered = text.lower()
+    tokens = _content_tokens(lowered)
+    for alias_group in POSTVALID_ASR_ALIAS_GROUPS:
+        if any(alias.lower() in lowered for alias in alias_group):
+            for alias in alias_group:
+                tokens.update(_content_tokens(alias))
+    return tokens
+
+
+def _content_tokens(text: str) -> set[str]:
+    return {
+        token.lower()
+        for token in TOKEN_PATTERN.findall(text)
+        if token.lower() not in STOPWORDS and len(token) > 1
+    }
+
+
+def _target_phrase_score(query: str, text: str) -> float:
+    query_parts = _direct_question_parts(query) or [query]
+    text_lower = text.lower()
+    phrase_hits = 0
+    for part in query_parts:
+        content = " ".join(sorted(_content_tokens(part)))
+        if not content:
+            continue
+        tokens = content.split()
+        if len(tokens) >= 2 and all(token in text_lower for token in tokens[:4]):
+            phrase_hits += 1
+    return min(1.0, phrase_hits / max(1, len(query_parts)))
+
+
 def _target_candidates(
     target: EvidenceRetrievalTarget,
     frontier: list[FrontierItem],
@@ -527,7 +741,7 @@ def _transition_score(
     current_item = current.frontier_item
     score = 0.0
     if previous_item.node_id == current_item.node_id:
-        score -= 0.7
+        score -= 1.2
     elif previous_item.time_span.overlaps(current_item.time_span):
         overlap = min(previous_item.time_span.end, current_item.time_span.end) - max(
             previous_item.time_span.start,
@@ -535,9 +749,9 @@ def _transition_score(
         )
         shorter = max(1e-6, min(previous_item.time_span.duration, current_item.time_span.duration))
         overlap_ratio = max(0.0, min(1.0, overlap / shorter))
-        score -= 0.45 + (0.25 * overlap_ratio)
+        score -= 0.7 + (0.4 * overlap_ratio)
         if temporal_policy == "ordered" and current_item.time_span.start <= previous_item.time_span.start:
-            score -= 0.25
+            score -= 0.6
         if current_item.level in {"scene", "video"} and previous_item.level in {
             "clip",
             "event",
@@ -546,14 +760,14 @@ def _transition_score(
             score -= 0.18
     else:
         if current_item.time_span.start >= previous_item.time_span.start:
-            score += 0.14 if temporal_policy == "ordered" else 0.04
+            score += 0.2 if temporal_policy == "ordered" else 0.04
         else:
-            score -= 0.32 if temporal_policy == "ordered" else 0.08
+            score -= 0.75 if temporal_policy == "ordered" else 0.08
         gap = max(0.0, current_item.time_span.start - previous_item.time_span.end)
         if 0.0 <= gap <= 300.0:
-            score += 0.04
+            score += 0.08 if temporal_policy == "ordered" else 0.04
         elif gap > 1200.0:
-            score -= 0.04
+            score -= 0.12
     if _candidate_modality(previous) != _candidate_modality(current):
         if _spans_are_near(previous_item.time_span, current_item.time_span, seconds=90.0):
             score += 0.08
@@ -627,7 +841,7 @@ def _direct_question_targets(
 ) -> list[EvidenceRetrievalTarget]:
     parts = _direct_question_parts(question)
     targets: list[EvidenceRetrievalTarget] = []
-    for index, part in enumerate(parts[:4], start=1):
+    for index, part in enumerate(parts[:6], start=1):
         targets.append(
             EvidenceRetrievalTarget(
                 target_id=f"direct:{index}",

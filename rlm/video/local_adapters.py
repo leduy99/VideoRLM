@@ -5,8 +5,9 @@ import difflib
 import json
 import os
 import re
+import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -1309,7 +1310,11 @@ class FasterWhisperSpeechRecognizer:
     model_name: str = "small"
     device: str = "cpu"
     compute_type: str = "default"
+    batch_size: int = 1
+    chunk_workers: int = 1
     ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = "ffprobe"
+    chunk_duration_seconds: float = 300.0
     language: str | None = None
     vad_filter: bool = True
     model: Any | None = None
@@ -1317,7 +1322,7 @@ class FasterWhisperSpeechRecognizer:
     progress_callback: Callable[[dict[str, Any]], None] | None = None
 
     def recognize(self, video_path: str) -> list[SpeechSpan]:
-        model = self._ensure_loaded()
+        model = None if self.chunk_workers > 1 else self._ensure_loaded()
         media_path = Path(video_path)
         temp_root = get_videorlm_output_root() / "tmp"
         temp_root.mkdir(parents=True, exist_ok=True)
@@ -1335,54 +1340,184 @@ class FasterWhisperSpeechRecognizer:
                     output_path=temp_dir / f"{media_path.stem}.wav",
                     ffmpeg_bin=self.ffmpeg_bin,
                 )
-            self._notify_progress(
-                phase="asr",
-                event="planned",
-                total=1,
-                status="asr faster-whisper 0/1",
+            return self._recognize_audio_in_chunks(
+                model=model,
+                audio_path=audio_path,
+                stack=stack,
             )
-            segments, _info = model.transcribe(
-                str(audio_path),
-                language=self.language,
-                vad_filter=self.vad_filter,
+
+    def _recognize_audio_in_chunks(
+        self,
+        *,
+        model: Any | None,
+        audio_path: Path,
+        stack: contextlib.ExitStack,
+    ) -> list[SpeechSpan]:
+        duration_seconds = probe_media_duration(audio_path, ffprobe_bin=self.ffprobe_bin)
+        if self.chunk_duration_seconds <= 0:
+            chunks = [TimeSpan(0.0, duration_seconds)] if duration_seconds > 0 else []
+        else:
+            chunks = _chunk_time_spans(duration_seconds, self.chunk_duration_seconds)
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.chunk_workers <= 0:
+            raise ValueError(f"chunk_workers must be positive, got {self.chunk_workers}")
+        self._notify_progress(
+            phase="asr",
+            event="planned",
+            total=len(chunks),
+            status=(
+                f"asr faster-whisper 0/{len(chunks)} "
+                f"chunk_seconds={self.chunk_duration_seconds:.0f} "
+                f"batch_size={self.batch_size} "
+                f"chunk_workers={self.chunk_workers}"
+            ),
+        )
+        temp_root = get_videorlm_output_root() / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        temp_dir = Path(
+            stack.enter_context(
+                _temporary_directory(prefix="videorlm_faster_whisper_chunks_", dir_path=temp_root)
             )
-            spans = [
-                SpeechSpan(
-                    text=str(segment.text).strip(),
-                    time_span=TimeSpan(float(segment.start), float(segment.end)),
-                    language=self.language,
+        )
+        chunk_jobs: list[tuple[int, TimeSpan, Path]] = []
+        for index, chunk_span in enumerate(chunks, start=1):
+            self._log(
+                f"ASR chunk {index}/{len(chunks)} span={chunk_span.to_display()}"
+            )
+            chunk_path = extract_audio_segment(
+                media_path=audio_path,
+                span=chunk_span,
+                output_path=temp_dir / f"chunk_{index:03d}.wav",
+                ffmpeg_bin=self.ffmpeg_bin,
+            )
+            chunk_jobs.append((index, chunk_span, chunk_path))
+        spans: list[SpeechSpan] = []
+        if self.chunk_workers == 1 or len(chunk_jobs) <= 1:
+            active_model = model if model is not None else self._ensure_loaded()
+            transcriber = (
+                self._batched_transcriber(active_model) if self.batch_size > 1 else active_model
+            )
+            for index, chunk_span, chunk_path in chunk_jobs:
+                parsed = self._transcribe_audio_path(transcriber, chunk_path)
+                for item in parsed:
+                    spans.append(_offset_speech_span(item, chunk_span))
+                self._notify_progress(
+                    phase="asr",
+                    event="advance",
+                    advance=1,
+                    index=index,
+                    total=len(chunks),
+                    status=(
+                        f"asr faster-whisper {index}/{len(chunks)} "
+                        f"parsed_spans={len(parsed)}"
+                    ),
                 )
-                for segment in segments
-                if str(segment.text).strip()
-            ]
-            self._notify_progress(
-                phase="asr",
-                event="advance",
-                advance=1,
-                index=1,
-                total=1,
-                status=f"asr faster-whisper done spans={len(spans)}",
-            )
             return spans
+
+        results_by_index: dict[int, tuple[TimeSpan, list[SpeechSpan]]] = {}
+        worker_cache = threading.local()
+        worker_count = min(self.chunk_workers, len(chunk_jobs))
+        self._log(f"parallel faster-whisper chunk workers={worker_count}")
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    self._transcribe_audio_path_with_worker_model,
+                    worker_cache,
+                    chunk_path,
+                ): (index, chunk_span)
+                for index, chunk_span, chunk_path in chunk_jobs
+            }
+            completed = 0
+            for future in as_completed(futures):
+                index, chunk_span = futures[future]
+                parsed = future.result()
+                results_by_index[index] = (chunk_span, parsed)
+                completed += 1
+                self._notify_progress(
+                    phase="asr",
+                    event="advance",
+                    advance=1,
+                    index=completed,
+                    total=len(chunks),
+                    status=(
+                        f"asr faster-whisper {completed}/{len(chunks)} "
+                        f"completed_chunk={index} parsed_spans={len(parsed)}"
+                    ),
+                )
+        for index in sorted(results_by_index):
+            chunk_span, parsed = results_by_index[index]
+            for item in parsed:
+                spans.append(_offset_speech_span(item, chunk_span))
+        return spans
+
+    def _transcribe_audio_path_with_worker_model(
+        self,
+        worker_cache: threading.local,
+        audio_path: Path,
+    ) -> list[SpeechSpan]:
+        transcriber = getattr(worker_cache, "transcriber", None)
+        if transcriber is None:
+            model = self._load_whisper_model()
+            transcriber = self._batched_transcriber(model) if self.batch_size > 1 else model
+            worker_cache.transcriber = transcriber
+        return self._transcribe_audio_path(transcriber, audio_path)
+
+    def _transcribe_audio_path(self, transcriber: Any, audio_path: Path) -> list[SpeechSpan]:
+        transcribe_kwargs: dict[str, Any] = {
+            "language": self.language,
+            "vad_filter": self.vad_filter,
+        }
+        if self.batch_size > 1:
+            transcribe_kwargs["batch_size"] = self.batch_size
+        segments, _info = transcriber.transcribe(str(audio_path), **transcribe_kwargs)
+        return [
+            SpeechSpan(
+                text=str(segment.text).strip(),
+                time_span=TimeSpan(float(segment.start), float(segment.end)),
+                language=self.language,
+            )
+            for segment in segments
+            if str(segment.text).strip()
+        ]
 
     def _ensure_loaded(self):
         if self.model is not None:
             return self.model
+        self.model = self._load_whisper_model()
+        return self.model
+
+    def _load_whisper_model(self) -> Any:
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:
             raise ImportError(
                 "faster-whisper speech backend requires `faster-whisper` to be installed."
             ) from exc
-        kwargs = {"device": self.device}
+        whisper_device, device_index = _parse_faster_whisper_device(self.device)
+        kwargs = {"device": whisper_device}
+        if device_index is not None:
+            kwargs["device_index"] = device_index
         if self.compute_type != "default":
             kwargs["compute_type"] = self.compute_type
         self._log(
             f"loading faster-whisper model={self.model_name} "
-            f"device={self.device} compute_type={self.compute_type}"
+            f"device={self.device} compute_type={self.compute_type} "
+            f"batch_size={self.batch_size} "
+            f"chunk_seconds={self.chunk_duration_seconds:.0f} "
+            f"chunk_workers={self.chunk_workers}"
         )
-        self.model = WhisperModel(self.model_name, **kwargs)
-        return self.model
+        return WhisperModel(self.model_name, **kwargs)
+
+    def _batched_transcriber(self, model: Any) -> Any:
+        try:
+            from faster_whisper import BatchedInferencePipeline
+        except ImportError as exc:
+            raise ImportError(
+                "faster-whisper batch_size > 1 requires a faster-whisper version "
+                "with BatchedInferencePipeline."
+            ) from exc
+        return BatchedInferencePipeline(model=model)
 
     def unload(self) -> None:
         self.model = None
@@ -1397,6 +1532,15 @@ class FasterWhisperSpeechRecognizer:
     def _log(self, message: str) -> None:
         if self.verbose:
             print(f"[FasterWhisper] {message}", flush=True)
+
+
+def _parse_faster_whisper_device(device: str) -> tuple[str, int | None]:
+    if device.startswith("cuda:"):
+        index_text = device.split(":", 1)[1]
+        if not index_text.isdigit():
+            raise ValueError(f"Invalid faster-whisper CUDA device: {device}")
+        return "cuda", int(index_text)
+    return device, None
 
 
 def _truncate_for_log(text: str, max_length: int = 180) -> str:

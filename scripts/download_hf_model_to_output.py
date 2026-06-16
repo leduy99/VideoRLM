@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 
-DEFAULT_REPO = "OpenGVLab/InternVideo2-Stage2_6B"
+DEFAULT_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 
 
 def sanitize_repo_id(repo_id: str) -> str:

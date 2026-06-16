@@ -21,15 +21,23 @@ class LocalSentenceTransformerEmbeddingProvider:
     model: Any | None = None
 
     def embed_text(self, text: str) -> list[float]:
+        return self.embed_texts([text])[0]
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
         model = self._ensure_loaded()
-        embedding = model.encode(
-            [text],
+        embeddings = model.encode(
+            texts,
             batch_size=self.batch_size,
             normalize_embeddings=True,
             convert_to_numpy=True,
             show_progress_bar=False,
-        )[0]
-        return [round(float(value), 6) for value in embedding.tolist()]
+        )
+        return [
+            [round(float(value), 6) for value in embedding.tolist()]
+            for embedding in embeddings
+        ]
 
     def _ensure_loaded(self):
         if self.model is not None:

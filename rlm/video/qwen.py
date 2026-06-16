@@ -135,6 +135,7 @@ class QwenVideoStackConfig:
     vrrqa_visual_verifier_frame_count: int = 8
     enable_refinement_frontier: bool = True
     enable_dynamic_evidence_retrieval: bool = True
+    disable_question_routing: bool = True
     visual_image_url_format: Literal["object", "string"] = "object"
     verbose: bool = False
 
@@ -309,6 +310,7 @@ class QwenVideoStackConfig:
             vrrqa_visual_verifier_frame_count=self.vrrqa_visual_verifier_frame_count,
             enable_refinement_frontier=self.enable_refinement_frontier,
             enable_dynamic_evidence_retrieval=self.enable_dynamic_evidence_retrieval,
+            disable_question_routing=self.disable_question_routing,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,
@@ -338,6 +340,8 @@ class QwenLocalVideoStackConfig:
     faster_whisper_model: str = "small"
     faster_whisper_device: str = "cpu"
     faster_whisper_compute_type: str = "default"
+    faster_whisper_batch_size: int = 1
+    faster_whisper_chunk_workers: int = 1
     lazy_speech_refinement: bool = False
     force_eager_speech_recognition: bool = False
     lazy_visual_refinement: bool = False
@@ -409,6 +413,7 @@ class QwenLocalVideoStackConfig:
     enable_refinement_frontier: bool = True
     offload_components_after_use: bool = False
     enable_dynamic_evidence_retrieval: bool = True
+    disable_question_routing: bool = True
     verbose: bool = False
 
     @classmethod
@@ -564,6 +569,9 @@ class QwenLocalVideoStackConfig:
                     model_name=self.faster_whisper_model,
                     device=self.faster_whisper_device,
                     compute_type=self.faster_whisper_compute_type,
+                    batch_size=self.faster_whisper_batch_size,
+                    chunk_workers=self.faster_whisper_chunk_workers,
+                    chunk_duration_seconds=self.speech_chunk_duration_seconds,
                     ffmpeg_bin=self.ffmpeg_bin,
                     verbose=self.verbose,
                 )
@@ -737,6 +745,7 @@ class QwenLocalVideoStackConfig:
             enable_refinement_frontier=self.enable_refinement_frontier,
             offload_components_after_use=self.offload_components_after_use,
             enable_dynamic_evidence_retrieval=self.enable_dynamic_evidence_retrieval,
+            disable_question_routing=self.disable_question_routing,
         )
         return QwenVideoRuntimeBundle(
             controller=controller,

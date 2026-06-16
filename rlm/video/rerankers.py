@@ -1,4 +1,7 @@
+import os
 import re
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -6,6 +9,15 @@ from typing import Any
 from rlm.video.adapters import VideoWindowEmbeddingProvider
 from rlm.video.gpu_memory import unload_component
 from rlm.video.types import FrontierItem, TimeSpan, VideoMemory
+
+_VIDEO_WINDOW_TEXT_EMBEDDING_CACHE: OrderedDict[tuple[Any, str], list[float]] = OrderedDict()
+_VIDEO_WINDOW_EMBEDDING_CACHE: OrderedDict[tuple[Any, str, float, float], list[float]] = (
+    OrderedDict()
+)
+_VIDEO_WINDOW_TEXT_CACHE_SIZE = int(os.environ.get("VIDEORLM_VIDEO_WINDOW_TEXT_CACHE_SIZE", "2048"))
+_VIDEO_WINDOW_EMBEDDING_CACHE_SIZE = int(
+    os.environ.get("VIDEORLM_VIDEO_WINDOW_EMBEDDING_CACHE_SIZE", "4096")
+)
 
 
 @dataclass
@@ -17,6 +29,7 @@ class VideoWindowReranker:
     min_stage2_score: float | None = None
     adaptive_stage2_weight: bool = True
     offload_after_rerank: bool = False
+    before_stage2_load: Callable[[], bool] | None = None
 
     def __post_init__(self) -> None:
         if self.candidate_count <= 0:
@@ -51,7 +64,10 @@ class VideoWindowReranker:
             }
 
         source_video_path = self._source_video_path(memory, visual_candidates)
-        query_embedding = self.embedding_provider.embed_text(query)
+        preload_offload_applied = False
+        if self.before_stage2_load is not None:
+            preload_offload_applied = self.before_stage2_load()
+        query_embedding, text_cache_hit = self._embed_text_cached(query)
         if not query_embedding:
             raise ValueError("Video window reranker text embedding provider returned no embedding.")
 
@@ -60,7 +76,10 @@ class VideoWindowReranker:
             self._candidate_window(item, memory, query=query) for item in rerank_candidates
         ]
         windows = [record[0] for record in window_records]
-        video_embeddings = self.embedding_provider.embed_video_windows(source_video_path, windows)
+        video_embeddings, video_cache_hits, video_cache_misses = self._embed_video_windows_cached(
+            source_video_path,
+            windows,
+        )
         if len(video_embeddings) != len(windows):
             raise ValueError(
                 "Video window embedding provider returned "
@@ -128,7 +147,94 @@ class VideoWindowReranker:
             "stage2_rerank_window_seconds": self.window_seconds,
             "stage2_rerank_min_score": self.min_stage2_score,
             "stage2_rerank_floor_relaxed": floor_relaxed,
+            "stage2_rerank_preload_offload_applied": preload_offload_applied,
+            "stage2_rerank_text_embedding_cache_hit": text_cache_hit,
+            "stage2_rerank_video_embedding_cache_hits": video_cache_hits,
+            "stage2_rerank_video_embedding_cache_misses": video_cache_misses,
         }
+
+    def _embed_text_cached(self, query: str) -> tuple[list[float], bool]:
+        cache_key = (self._provider_cache_key(), query)
+        cached = _cache_get(_VIDEO_WINDOW_TEXT_EMBEDDING_CACHE, cache_key)
+        if cached is not None:
+            return cached, True
+        embedding = self.embedding_provider.embed_text(query)
+        _cache_set(
+            _VIDEO_WINDOW_TEXT_EMBEDDING_CACHE,
+            cache_key,
+            embedding,
+            _VIDEO_WINDOW_TEXT_CACHE_SIZE,
+        )
+        return embedding, False
+
+    def _embed_video_windows_cached(
+        self,
+        source_video_path: Path,
+        windows: list[TimeSpan],
+    ) -> tuple[list[list[float]], int, int]:
+        provider_key = self._provider_cache_key()
+        output: list[list[float] | None] = []
+        missing_windows: list[TimeSpan] = []
+        missing_positions: list[int] = []
+        cache_hits = 0
+        for window in windows:
+            cache_key = self._video_window_cache_key(provider_key, source_video_path, window)
+            cached = _cache_get(_VIDEO_WINDOW_EMBEDDING_CACHE, cache_key)
+            if cached is None:
+                missing_positions.append(len(output))
+                missing_windows.append(window)
+                output.append(None)
+                continue
+            cache_hits += 1
+            output.append(cached)
+
+        if missing_windows:
+            computed = self.embedding_provider.embed_video_windows(source_video_path, missing_windows)
+            if len(computed) != len(missing_windows):
+                raise ValueError(
+                    "Video window embedding provider returned "
+                    f"{len(computed)} embeddings for {len(missing_windows)} missing windows."
+                )
+            for position, window, embedding in zip(
+                missing_positions,
+                missing_windows,
+                computed,
+                strict=True,
+            ):
+                cache_key = self._video_window_cache_key(provider_key, source_video_path, window)
+                _cache_set(
+                    _VIDEO_WINDOW_EMBEDDING_CACHE,
+                    cache_key,
+                    embedding,
+                    _VIDEO_WINDOW_EMBEDDING_CACHE_SIZE,
+                )
+                output[position] = embedding
+
+        return [embedding or [] for embedding in output], cache_hits, len(missing_windows)
+
+    def _provider_cache_key(self) -> tuple[Any, ...]:
+        return (
+            self.embedding_provider.__class__.__name__,
+            getattr(self.embedding_provider, "model_name", None),
+            getattr(self.embedding_provider, "model_path", None),
+            getattr(self.embedding_provider, "frame_count", None),
+            getattr(self.embedding_provider, "frame_size", None),
+            getattr(self.embedding_provider, "device", None),
+            getattr(self.embedding_provider, "torch_dtype", None),
+        )
+
+    def _video_window_cache_key(
+        self,
+        provider_key: tuple[Any, ...],
+        source_video_path: Path,
+        window: TimeSpan,
+    ) -> tuple[Any, str, float, float]:
+        return (
+            provider_key,
+            str(source_video_path.resolve()),
+            round(float(window.start), 3),
+            round(float(window.end), 3),
+        )
 
     def _apply_min_stage2_score(
         self,
@@ -282,6 +388,28 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     if left_norm == 0.0 or right_norm == 0.0:
         return 0.0
     return max(0.0, min(1.0, dot / (left_norm * right_norm)))
+
+
+def _cache_get(cache: OrderedDict, key: tuple[Any, ...]) -> list[float] | None:
+    value = cache.get(key)
+    if value is None:
+        return None
+    cache.move_to_end(key)
+    return list(value)
+
+
+def _cache_set(
+    cache: OrderedDict,
+    key: tuple[Any, ...],
+    value: list[float],
+    max_size: int,
+) -> None:
+    if max_size <= 0:
+        return
+    cache[key] = list(value)
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+        cache.popitem(last=False)
 
 
 VISUAL_TERMS = {

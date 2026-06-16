@@ -4,14 +4,14 @@ import json
 import math
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
 from rlm.video.controller import VideoRLM
 from rlm.video.memory import VideoMemoryBuilder
 from rlm.video.timing import TimingRecorder, merge_timing_summaries
-from rlm.video.types import TimeSpan, VideoMemory, VideoRLMResult
+from rlm.video.types import Evidence, TimeSpan, VideoMemory, VideoRLMResult
 
 LongShOTHistoryMode = Literal["gold", "candidate"]
 
@@ -24,6 +24,7 @@ LONGSHOT_CONTEXT_DATASET_NAME = "postvalid_v1"
 LONGSHOT_DATASET_SPLIT = "test"
 LONGSHOT_VIDEO_URL_TEMPLATE = "https://www.youtube.com/watch?v={video_id}"
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm", ".m4v")
+UNSUPPORTED_VIDEO_EXTENSIONS = {".webm"}
 SPEECH_PROGRESS_UNIT_WEIGHT = 1
 GENERIC_VISUAL_PROGRESS_UNIT_WEIGHT = 1
 LOCAL_QWEN_VISUAL_PROGRESS_UNIT_WEIGHT = 6
@@ -132,6 +133,16 @@ def _drop_none_values(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
+def _preferred_video_match(paths: Sequence[Path]) -> Path:
+    return sorted(
+        paths,
+        key=lambda path: (
+            path.suffix.lower() in UNSUPPORTED_VIDEO_EXTENSIONS,
+            str(path),
+        ),
+    )[0]
+
+
 class LongShOTVideoResolver:
     def __init__(
         self,
@@ -168,7 +179,7 @@ class LongShOTVideoResolver:
             if candidate.exists():
                 direct_matches.append(candidate)
         if direct_matches:
-            return sorted(direct_matches)[0]
+            return _preferred_video_match(direct_matches)
 
         recursive_matches = [
             path
@@ -176,7 +187,7 @@ class LongShOTVideoResolver:
             if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
         ]
         if recursive_matches:
-            return sorted(recursive_matches)[0]
+            return _preferred_video_match(recursive_matches)
         return None
 
     def download(self, video_id: str) -> Path:
@@ -276,7 +287,11 @@ class LongShOTBenchmarkRunner:
         self.memory_cache_only = memory_cache_only
         self._memory_cache: dict[str, tuple[VideoMemory, Path | None]] = {}
 
-        for directory in (self.artifact_cache_dir, self.memory_cache_dir, self.trace_dir):
+        for directory in (
+            self.artifact_cache_dir,
+            self.memory_cache_dir,
+            self.trace_dir,
+        ):
             if directory is not None:
                 directory.mkdir(parents=True, exist_ok=True)
 
@@ -386,8 +401,7 @@ class LongShOTBenchmarkRunner:
                 results.append(result)
                 if output_file is not None:
                     with output_file.open("a", encoding="utf-8") as handle:
-                        json.dump(result, handle, ensure_ascii=False)
-                        handle.write("\n")
+                        handle.write(json.dumps(result, ensure_ascii=False) + "\n")
                     self._log(f"sample {sample_id} appended output={output_file}")
                 elapsed = time.perf_counter() - sample_start
                 sample_progress.finish(status=f"done {sample_id} in {_format_duration(elapsed)}")
@@ -414,6 +428,11 @@ class LongShOTBenchmarkRunner:
             memory, memory_path = cached
             source_video_path = memory.metadata.get("source_video_path")
             video_path = Path(source_video_path) if source_video_path else None
+            self._raise_if_unsupported_video_path(
+                sample_id=sample_id,
+                video_id=video_id,
+                video_path=video_path,
+            )
         else:
             if self.memory_cache_only:
                 raise LongShOTMemoryUnavailableError(
@@ -432,6 +451,11 @@ class LongShOTBenchmarkRunner:
                     reason=str(exc),
                 ) from exc
             self._log(f"resolve video done path={video_path}")
+            self._raise_if_unsupported_video_path(
+                sample_id=sample_id,
+                video_id=video_id,
+                video_path=video_path,
+            )
             memory, memory_path = self._load_or_build_memory(
                 payload,
                 video_path,
@@ -441,6 +465,7 @@ class LongShOTBenchmarkRunner:
         self._log(f"memory ready video_id={video_id} memory_path={memory_path}")
 
         dialogue_context: list[dict[str, str]] = []
+        carried_evidence: list[Evidence] = []
         turn_results: list[dict[str, Any]] = []
         pending_question: str | None = None
         pending_turn_context: dict[str, Any] | None = None
@@ -496,6 +521,7 @@ class LongShOTBenchmarkRunner:
                     pending_turn_context,
                     self.dataset_name,
                 ),
+                prior_evidence=carried_evidence,
             )
             controller_seconds = time.perf_counter() - controller_start
             timing_recorder.add("longshot.controller.run", controller_seconds)
@@ -538,10 +564,18 @@ class LongShOTBenchmarkRunner:
                     "steps_used": result.state.budget.steps_used,
                     "tool_calls_used": result.state.budget.tool_calls_used,
                     "trace_path": str(trace_path) if trace_path else None,
+                    "prior_evidence_count": len(carried_evidence),
                     "timing": turn_timing,
                 }
             )
 
+            carried_evidence = _update_longshot_carried_evidence(
+                carried_evidence,
+                result,
+                turn_index=index,
+                question=pending_question,
+                answer=result.answer,
+            )
             assistant_history = content if self.history_mode == "gold" else result.answer
             dialogue_context.append({"role": "assistant", "content": assistant_history})
             pending_question = None
@@ -713,6 +747,27 @@ class LongShOTBenchmarkRunner:
     def _expected_memory_path(self, video_id: str) -> Path | None:
         return self.memory_cache_dir / f"{video_id}.json" if self.memory_cache_dir else None
 
+    def _raise_if_unsupported_video_path(
+        self,
+        *,
+        sample_id: str,
+        video_id: str,
+        video_path: Path | None,
+    ) -> None:
+        if video_path is None:
+            return
+        suffix = video_path.suffix.lower()
+        if suffix not in UNSUPPORTED_VIDEO_EXTENSIONS:
+            return
+        raise LongShOTVideoUnavailableError(
+            sample_id=sample_id,
+            video_id=video_id,
+            reason=(
+                f"unsupported video format {suffix}; skipping to avoid ffmpeg frame "
+                f"extraction failures for {video_path}"
+            ),
+        )
+
     def _resolve_duration_seconds(self, sample: dict[str, Any]) -> float:
         duration = sample.get("duration")
         if duration is None:
@@ -811,15 +866,38 @@ class LongShOTBenchmarkRunner:
         output_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
         return output_path
 
+    def _iter_output_records(self, output_path: Path) -> Iterator[dict[str, Any]]:
+        decoder = json.JSONDecoder()
+        with output_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                text = line.strip()
+                if not text:
+                    continue
+                index = 0
+                while index < len(text):
+                    try:
+                        record, end = decoder.raw_decode(text, index)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"Malformed JSONL in {output_path} at line {line_number}, "
+                            f"column {exc.colno}: {exc.msg}"
+                        ) from exc
+                    if not isinstance(record, dict):
+                        raise ValueError(
+                            f"Malformed JSONL in {output_path} at line {line_number}: "
+                            f"expected an object, got {type(record).__name__}"
+                        )
+                    yield record
+                    index = end
+                    while index < len(text) and text[index].isspace():
+                        index += 1
+
     def _load_completed_ids(self, output_path: Path) -> set[str]:
         if not output_path.exists():
             return set()
         completed = set()
-        with output_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                completed.add(json.loads(line)["sample_id"])
+        for record in self._iter_output_records(output_path):
+            completed.add(record["sample_id"])
         return completed
 
     def _log(self, message: str) -> None:
@@ -972,6 +1050,103 @@ class _LongShOTProgressReporter:
         if phase and total is not None:
             return f"{phase} 0/{total}"
         return str(phase or "running")
+
+
+LONGSHOT_CARRIED_EVIDENCE_LIMIT = 12
+
+
+def _update_longshot_carried_evidence(
+    existing: list[Evidence],
+    result: VideoRLMResult,
+    *,
+    turn_index: int,
+    question: str,
+    answer: str,
+    limit: int = LONGSHOT_CARRIED_EVIDENCE_LIMIT,
+) -> list[Evidence]:
+    candidates = [*existing, *result.state.evidence_ledger]
+    best_by_key: dict[str, Evidence] = {}
+    for item in candidates:
+        if not _longshot_evidence_has_text(item):
+            continue
+        carried = copy.deepcopy(item)
+        key = str(
+            carried.metadata.get("longshot_carryover_key")
+            or _longshot_evidence_carryover_key(carried)
+        )
+        fresh_current_turn = not bool(carried.metadata.get("prior_turn_evidence"))
+        metadata = dict(carried.metadata)
+        metadata["prior_turn_evidence"] = True
+        metadata["carried_from_current_turn"] = fresh_current_turn
+        metadata["longshot_carryover_key"] = key
+        metadata.setdefault("prior_turn_index", turn_index)
+        metadata.setdefault("prior_question", question[:500])
+        metadata.setdefault("prior_answer", answer[:500])
+        metadata.setdefault("role", "support")
+        metadata.setdefault("slot", "prior_turn_context")
+        carried.metadata = metadata
+        previous = best_by_key.get(key)
+        carried_score = _longshot_carryover_score(carried)
+        previous_score = (
+            _longshot_carryover_score(previous) if previous is not None else None
+        )
+        if previous is None or (
+            previous_score is not None and carried_score > previous_score
+        ):
+            best_by_key[key] = carried
+    ranked = sorted(
+        best_by_key.values(),
+        key=lambda item: (
+            -_longshot_carryover_score(item),
+            item.time_span.start,
+            item.evidence_id,
+        ),
+    )
+    return ranked[:limit]
+
+
+def _longshot_evidence_has_text(item: Evidence) -> bool:
+    return bool(
+        str(item.metadata.get("answer_span") or "").strip()
+        or item.detail.strip()
+        or item.claim.strip()
+    )
+
+
+def _longshot_evidence_carryover_key(item: Evidence) -> str:
+    text = str(item.metadata.get("answer_span") or item.detail or item.claim).strip()
+    return "|".join(
+        [
+            item.source_node_id,
+            item.modality,
+            f"{item.time_span.start:.2f}",
+            f"{item.time_span.end:.2f}",
+            text[:160],
+        ]
+    )
+
+
+def _longshot_carryover_score(item: Evidence) -> float:
+    metadata = item.metadata
+    role = str(metadata.get("role") or "")
+    score = float(item.confidence)
+    if item.used_in_final_answer:
+        score += 100.0
+    if metadata.get("carried_from_current_turn"):
+        score += 8.0
+    if role == "core":
+        score += 30.0
+    elif role == "support":
+        score += 18.0
+    elif role == "background":
+        score += 4.0
+    if str(metadata.get("answer_span") or "").strip():
+        score += 12.0
+    if isinstance(metadata.get("evidence_bundle"), dict):
+        score += 6.0
+    if metadata.get("support_fills_required_slot"):
+        score += 5.0
+    return score
 
 
 def _truncate_for_log(text: str, max_length: int = 180) -> str:

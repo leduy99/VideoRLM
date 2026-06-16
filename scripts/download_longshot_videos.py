@@ -34,8 +34,11 @@ def main() -> int:
         cookies_from_browser=args.cookies_from_browser,
         extra_ytdlp_args=args.yt_dlp_arg,
     )
+    dataset_label = args.dataset_path
+    if args.dataset_name:
+        dataset_label = f"{dataset_label}/{args.dataset_name}"
     print(
-        f"[download-longshot] dataset={args.dataset_path}/{args.dataset_name} "
+        f"[download-longshot] dataset={dataset_label} "
         f"split={args.split} samples={len(samples)} unique_videos={len(video_ids)}"
     )
     failed: list[str] = []
@@ -59,7 +62,11 @@ def main() -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download LongShOTBench videos without running inference.")
     parser.add_argument("--dataset-path", default="MBZUAI/longshot-bench")
-    parser.add_argument("--dataset-name", default="postvalid_tools_v1")
+    parser.add_argument(
+        "--dataset-name",
+        default="postvalid_v2",
+        help="Optional Hugging Face dataset config name. Current benchmark config is postvalid_v2.",
+    )
     parser.add_argument("--split", default="test")
     parser.add_argument("--video-dir", default="data/longshotbench/videos")
     parser.add_argument("--sample-limit", type=int)

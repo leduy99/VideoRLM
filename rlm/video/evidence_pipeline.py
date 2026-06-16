@@ -25,6 +25,7 @@ from rlm.video.types import (
     Observation,
     OpenedTarget,
     QuestionSpec,
+    TimeSpan,
 )
 
 GENERIC_SLOT_KEYWORDS: dict[str, list[str]] = {
@@ -138,6 +139,9 @@ POSTVALID_CAUSAL_CUES = (
     "nervous",
     "prove",
 )
+POSTVALID_NEGATIVE_EVIDENCE_MEMORY_KEY = "postvalid_negative_evidence_memory"
+POSTVALID_NEGATIVE_MEMORY_NEARBY_SECONDS = 45.0
+POSTVALID_NEGATIVE_MEMORY_NEARBY_MULTIPLIER = 0.35
 CONTROL_QUERY_TOKENS = {"why", "first", "last", "earliest", "initial", "beginning", "final"}
 VISUAL_ROUTE_TERMS = {
     "appear",
@@ -801,8 +805,14 @@ def search_v2(
                     hits_by_node[candidate.node_id] = candidate
                 query_sources[candidate.node_id].append(query)
 
+    candidates = _apply_postvalid_negative_evidence_memory(
+        list(hits_by_node.values()),
+        state=state,
+        target_slot=target_slot,
+        modality=selected_modality,
+    )
     ranked_candidates = sorted(
-        hits_by_node.values(),
+        candidates,
         key=lambda item: (-item.score, item.time_span.start, item.node_id),
     )
     ranked_hits = _select_temporally_diverse_hits(ranked_candidates, top_k)
@@ -862,10 +872,163 @@ def _select_temporally_diverse_hits(hits: list[SearchHit], top_k: int) -> list[S
     return selected[:top_k]
 
 
+def _apply_postvalid_negative_evidence_memory(
+    hits: list[SearchHit],
+    *,
+    state: ControllerState,
+    target_slot: str | None,
+    modality: Modality | None,
+) -> list[SearchHit]:
+    records = _postvalid_negative_evidence_records(
+        state=state,
+        target_slot=target_slot,
+        modality=modality,
+    )
+    if not records:
+        return hits
+
+    adjusted: list[SearchHit] = []
+    blocked_count = 0
+    downranked_count = 0
+    for hit in hits:
+        blocked, multiplier, reason = _postvalid_negative_memory_adjustment(
+            hit,
+            records,
+            state=state,
+        )
+        if blocked:
+            blocked_count += 1
+            continue
+        if multiplier < 1.0:
+            downranked_count += 1
+            hit.score = round(max(0.0, hit.score * multiplier), 4)
+            hit.score_breakdown = {
+                **dict(hit.score_breakdown),
+                "postvalid_negative_memory_multiplier": round(multiplier, 4),
+            }
+            hit.reason = f"{hit.reason}; negative_evidence_memory={reason}"
+        adjusted.append(hit)
+
+    state.global_context["postvalid_negative_evidence_memory_applied"] = {
+        "record_count": len(records),
+        "blocked_count": blocked_count,
+        "downranked_count": downranked_count,
+        "target_slot": target_slot,
+    }
+    return adjusted
+
+
+def _postvalid_negative_evidence_records(
+    *,
+    state: ControllerState,
+    target_slot: str | None,
+    modality: Modality | None,
+) -> list[dict[str, Any]]:
+    raw_records = state.global_context.get(POSTVALID_NEGATIVE_EVIDENCE_MEMORY_KEY)
+    if not isinstance(raw_records, list):
+        return []
+    route = route_from_metadata(state.global_context)
+    if route is None:
+        route = route_from_metadata(state.question_spec.metadata if state.question_spec else None)
+    postvalid_speech_context = _is_postvalid_v1_context(state) and (
+        modality is None or modality in {"speech", "cross_modal"}
+    )
+    if route is None:
+        if not postvalid_speech_context:
+            return []
+    elif route.label not in {
+        "speech_explanation",
+        "causal_chain",
+        "temporal_occurrence",
+        "rubric_explanation",
+    } and not postvalid_speech_context:
+        return []
+    selected: list[dict[str, Any]] = []
+    for raw_record in raw_records:
+        if not isinstance(raw_record, dict):
+            continue
+        record_slot = str(raw_record.get("target_slot") or "")
+        if target_slot and record_slot and record_slot != target_slot:
+            continue
+        record_modality = str(raw_record.get("modality") or "")
+        if modality and record_modality and record_modality not in {str(modality), "speech"}:
+            continue
+        span_payload = raw_record.get("time_span")
+        if not isinstance(span_payload, dict):
+            continue
+        try:
+            span = TimeSpan(
+                start=float(span_payload.get("start")),
+                end=float(span_payload.get("end")),
+            )
+        except (TypeError, ValueError):
+            continue
+        record = dict(raw_record)
+        record["_time_span"] = span
+        selected.append(record)
+    return selected
+
+
+def _postvalid_negative_memory_adjustment(
+    hit: SearchHit,
+    records: list[dict[str, Any]],
+    *,
+    state: ControllerState,
+) -> tuple[bool, float, str]:
+    local_context = _postvalid_question_requests_local_context(state.question)
+    multiplier = 1.0
+    reason = "none"
+    for record in records:
+        span = record.get("_time_span")
+        if not isinstance(span, TimeSpan):
+            continue
+        if str(record.get("node_id") or "") == hit.node_id:
+            return True, 0.0, "same_node"
+        if hit.time_span.overlaps(span):
+            return True, 0.0, "overlap"
+        if local_context:
+            continue
+        distance = _timespan_distance(hit.time_span, span)
+        nearby_seconds = float(
+            record.get("nearby_seconds") or POSTVALID_NEGATIVE_MEMORY_NEARBY_SECONDS
+        )
+        if distance <= nearby_seconds:
+            multiplier = min(multiplier, POSTVALID_NEGATIVE_MEMORY_NEARBY_MULTIPLIER)
+            reason = "nearby_span"
+    return False, multiplier, reason
+
+
+def _postvalid_question_requests_local_context(question: str) -> bool:
+    lowered = question.lower()
+    return any(
+        cue in lowered
+        for cue in (
+            "right after",
+            "immediately after",
+            "just after",
+            "what happened next",
+            "same moment",
+            "at the same time",
+            "nearby",
+            "around then",
+        )
+    )
+
+
+def _timespan_distance(first: TimeSpan, second: TimeSpan) -> float:
+    if first.overlaps(second):
+        return 0.0
+    if first.end <= second.start:
+        return second.start - first.end
+    return first.start - second.end
+
+
 def _effective_search_mode(index: VideoMemoryIndex, search_modalities: list[Modality]) -> str:
     configured_mode = str(getattr(index, "search_mode", "lexical"))
     if search_modalities and set(search_modalities) == {"speech"}:
-        return "speech_lexical_semantic"
+        if getattr(index, "speech_embedding_provider", None) is not None:
+            return "speech_bm25_dense_asr"
+        return "speech_bm25"
     if "speech" in search_modalities and configured_mode == "graph":
         return "graph_visual_plus_speech_lexical_semantic"
     return configured_mode
@@ -2064,6 +2227,8 @@ def _should_force_postvalid_speech_search(
     question_spec: QuestionSpec | None,
     question_route: QuestionRoute,
 ) -> bool:
+    if state.global_context.get("question_routing_enabled") is False:
+        return False
     if not _is_postvalid_v1_context(state):
         return False
     non_speech_routes = {

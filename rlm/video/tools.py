@@ -11,7 +11,10 @@ from typing import Any, cast
 
 from rlm.clients.base_lm import BaseLM
 from rlm.video.adapters import SpeechRecognizer, VisualSummarizer
-from rlm.video.dynamic_retrieval import select_dynamic_evidence_chain
+from rlm.video.dynamic_retrieval import (
+    dynamic_evidence_retrieval_policy,
+    select_dynamic_evidence_chain,
+)
 from rlm.video.evidence_pipeline import (
     build_question_spec,
     is_reopen_blocked,
@@ -330,6 +333,7 @@ class VideoToolExecutor:
                     modality=action.modality,
                     state=state,
                     target_slot=action.target_slot,
+                    allow_reopen=self._allow_reopen_for_dynamic_chain_action(action, state),
                 )
         elif action.action_type == "SPLIT":
             observation = self.split(action.node_id or "")
@@ -356,6 +360,65 @@ class VideoToolExecutor:
             observation.metadata["timing"] = timing
         return timing
 
+    def _cached_dynamic_frontier(
+        self,
+        state: ControllerState,
+        *,
+        limit: int,
+    ) -> tuple[list[FrontierItem], dict[str, Any]] | None:
+        metadata = state.global_context.get("dynamic_evidence_retrieval")
+        if not isinstance(metadata, dict) or not metadata.get("enabled"):
+            return None
+        selected = metadata.get("selected")
+        if not isinstance(selected, list):
+            return None
+        frontier: list[FrontierItem] = []
+        seen: set[str] = set()
+        for raw in selected:
+            if not isinstance(raw, dict):
+                continue
+            node_id = str(raw.get("node_id") or "")
+            if not node_id or node_id in seen:
+                continue
+            span_payload = raw.get("time_span")
+            if node_id in self.memory.nodes:
+                node = self.memory.get_node(node_id)
+                time_span = node.time_span
+                level = node.level
+            elif isinstance(span_payload, dict):
+                try:
+                    time_span = TimeSpan(
+                        start=float(span_payload.get("start")),
+                        end=float(span_payload.get("end")),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                level = "clip"
+            else:
+                continue
+            modality = str(raw.get("modality") or "speech")
+            frontier.append(
+                FrontierItem(
+                    node_id=node_id,
+                    time_span=time_span,
+                    level=level,
+                    score=float(raw.get("score") or 0.5),
+                    why_candidate=(
+                        "cached dynamic multi-evidence DP chain; "
+                        f"target={raw.get('label') or raw.get('target_id')}; "
+                        f"target_query={str(raw.get('query') or '')[:160]!r}"
+                    ),
+                    recommended_modalities=[cast(Modality, modality)],
+                    status="unopened",
+                )
+            )
+            seen.add(node_id)
+            if len(frontier) >= limit:
+                break
+        if not frontier:
+            return None
+        return frontier, metadata
+
     def search(
         self,
         query: str,
@@ -368,30 +431,120 @@ class VideoToolExecutor:
         question_spec = state.question_spec or build_question_spec(state.question, state.task_type)
         selected_slot = target_slot or select_target_slot(question_spec, state.evidence_board)
         search_top_k = self._search_candidate_count(top_k, modality, state)
-        search_start = time.perf_counter()
-        frontier, metadata = search_v2(
-            index=self.index,
-            question_spec=question_spec,
-            target_slot=selected_slot,
-            state=state,
-            top_k=search_top_k,
-            query_override=query or None,
-            modality=modality,
-        )
-        search_seconds = time.perf_counter() - search_start
-        self._record_timing("tool.search.search_v2", search_seconds)
         dynamic_plan_metadata: dict[str, Any] = {"enabled": False}
-        dynamic_plan = select_dynamic_evidence_chain(
-            index=self.index,
-            state=state,
-            question_spec=question_spec,
-            top_k=max(top_k, 3),
-            query_override=query or None,
+        question_route = route_from_metadata(question_spec.metadata) or route_question(
+            state.question,
+            state.task_type,
         )
-        dynamic_plan_applied = dynamic_plan is not None
+        dynamic_policy_enabled, dynamic_policy_reason = dynamic_evidence_retrieval_policy(
+            state,
+            question_spec,
+            question_route,
+        )
+        search_seconds = 0.0
+        dynamic_seconds = 0.0
+        dynamic_plan = None
+        frontier: list[FrontierItem] = []
+        metadata: dict[str, Any] = {
+            "target_slot": selected_slot,
+            "queries": [query] if query else [],
+            "modality": modality,
+            "question_route": question_route.to_dict(),
+            "search_mode": "dynamic_policy_pending",
+            "searched_modalities": [modality] if modality else [],
+            "hit_count": 0,
+        }
+        if dynamic_policy_enabled:
+            dynamic_metadata = state.global_context.get("dynamic_evidence_retrieval")
+            selected_count = (
+                len(dynamic_metadata.get("selected", []))
+                if isinstance(dynamic_metadata, dict)
+                and isinstance(dynamic_metadata.get("selected"), list)
+                else 0
+            )
+            cached_dynamic = self._cached_dynamic_frontier(
+                state,
+                limit=max(top_k, selected_count, 3),
+            )
+            if cached_dynamic is not None:
+                frontier, dynamic_plan_metadata = cached_dynamic
+                selected_modalities = [
+                    str(item.get("modality"))
+                    for item in dynamic_plan_metadata.get("selected", [])
+                    if isinstance(item, dict) and item.get("modality")
+                ]
+                metadata = {
+                    "target_slot": selected_slot,
+                    "queries": [query] if query else [],
+                    "modality": modality or (selected_modalities[0] if selected_modalities else None),
+                    "question_route": question_route.to_dict(),
+                    "search_mode": "dynamic_multi_evidence_dp_cached",
+                    "searched_modalities": sorted(set(selected_modalities)),
+                    "hit_count": len(frontier),
+                    "dynamic_policy_reason": dynamic_policy_reason,
+                    "timing": {
+                        "dynamic_evidence_plan_seconds": 0.0,
+                    },
+                }
+            else:
+                dynamic_start = time.perf_counter()
+                dynamic_plan = select_dynamic_evidence_chain(
+                    index=self.index,
+                    state=state,
+                    question_spec=question_spec,
+                    top_k=max(top_k, 3),
+                    query_override=query or None,
+                )
+                dynamic_seconds = time.perf_counter() - dynamic_start
+                self._record_timing("tool.search.dynamic_evidence_plan", dynamic_seconds)
+            if dynamic_plan is not None:
+                selected_modalities = [
+                    str(item.get("modality"))
+                    for item in dynamic_plan.to_metadata().get("selected", [])
+                    if item.get("modality")
+                ]
+                frontier = dynamic_plan.frontier
+                metadata = {
+                    "target_slot": selected_slot,
+                    "queries": [query] if query else [],
+                    "modality": modality or (selected_modalities[0] if selected_modalities else None),
+                    "question_route": question_route.to_dict(),
+                    "search_mode": "dynamic_multi_evidence_dp",
+                    "searched_modalities": sorted(set(selected_modalities)),
+                    "hit_count": len(frontier),
+                    "dynamic_policy_reason": dynamic_policy_reason,
+                    "timing": {
+                        "dynamic_evidence_plan_seconds": round(dynamic_seconds, 6),
+                    },
+                }
+            elif cached_dynamic is None:
+                metadata["dynamic_policy_reason"] = dynamic_policy_reason
+                metadata["dynamic_policy_fallback"] = "no_chain"
+        if not frontier:
+            search_start = time.perf_counter()
+            frontier, metadata = search_v2(
+                index=self.index,
+                question_spec=question_spec,
+                target_slot=selected_slot,
+                state=state,
+                top_k=search_top_k,
+                query_override=query or None,
+                modality=modality,
+            )
+            search_seconds = time.perf_counter() - search_start
+            self._record_timing("tool.search.search_v2", search_seconds)
+            if dynamic_policy_enabled:
+                metadata["dynamic_policy_reason"] = dynamic_policy_reason
+                metadata["dynamic_policy_fallback"] = "normal_search_v2"
+        dynamic_plan_applied = dynamic_plan is not None or (
+            dynamic_policy_enabled and bool(frontier) and metadata.get("search_mode")
+            == "dynamic_multi_evidence_dp_cached"
+        )
         if dynamic_plan is not None:
-            frontier = dynamic_plan.frontier
-            dynamic_plan_metadata = dynamic_plan.to_metadata()
+            dynamic_plan_metadata = {
+                **dynamic_plan.to_metadata(),
+                "policy_reason": dynamic_policy_reason,
+            }
             state.global_context["dynamic_evidence_retrieval"] = dynamic_plan_metadata
         rerank_metadata: dict[str, Any] = {"stage2_rerank_applied": False}
         speech_rerank_metadata: dict[str, Any] = {"speech_rerank_applied": False}
@@ -478,6 +631,7 @@ class VideoToolExecutor:
                 "timing": {
                     "search_total_seconds": round(total_seconds, 6),
                     "search_v2_seconds": round(search_seconds, 6),
+                    "dynamic_evidence_plan_seconds": round(dynamic_seconds, 6),
                     "postvalid_speech_rerank_seconds": round(speech_rerank_seconds, 6),
                     "stage2_video_window_rerank_seconds": round(rerank_seconds, 6),
                     "zero_hit_temporal_expansion_seconds": round(zero_hit_seconds, 6),
@@ -770,6 +924,7 @@ class VideoToolExecutor:
         modality: Modality | None,
         state: ControllerState,
         target_slot: str | None = None,
+        allow_reopen: bool = False,
     ) -> Observation:
         total_start = time.perf_counter()
         selected_modality = modality or "visual"
@@ -802,7 +957,13 @@ class VideoToolExecutor:
                 ),
             }
 
-        if is_reopen_blocked(state.evidence_board, node.node_id, selected_modality, selected_slot):
+        reopen_blocked = is_reopen_blocked(
+            state.evidence_board,
+            node.node_id,
+            selected_modality,
+            selected_slot,
+        )
+        if reopen_blocked and not allow_reopen:
             return Observation(
                 kind="open",
                 summary=(
@@ -912,6 +1073,12 @@ class VideoToolExecutor:
             open_metadata.update(consolidation_metadata)
             for item in evidence:
                 item.metadata.update(consolidation_metadata)
+        if reopen_blocked and allow_reopen:
+            open_metadata["reopen_allowed"] = True
+            open_metadata["reopen_allowed_reason"] = "dynamic_multi_evidence_dp"
+            for item in evidence:
+                item.metadata["reopen_allowed"] = True
+                item.metadata["reopen_allowed_reason"] = "dynamic_multi_evidence_dp"
         refinement_frontier: list[FrontierItem] = []
         needs_refinement = (
             open_metadata.get("background_only")
@@ -998,40 +1165,51 @@ class VideoToolExecutor:
         all_evidence: list[Evidence] = []
         frontier: list[FrontierItem] = []
         timing: dict[str, float] = {}
-        for item in chain_items:
-            node_id = str(item.get("node_id") or "")
-            modality = str(item.get("modality") or "speech")
-            target_slot = str(item.get("target_slot") or "") or None
-            if modality not in {"speech", "visual", "ocr", "audio", "cross_modal"}:
-                modality = "speech"
-            observation = self.open(
-                node_id=node_id,
-                modality=cast(Modality, modality),
-                state=state,
-                target_slot=target_slot,
-            )
-            observations.append(observation)
-            opened_targets.append(
-                {
-                    "node_id": observation.node_id or node_id,
-                    "modality": observation.metadata.get("modality") or modality,
-                    "target_slot": observation.metadata.get("target_slot") or target_slot,
-                    "result": observation.metadata.get("result", "unknown"),
-                    "dynamic_target_id": item.get("target_id"),
-                    "dynamic_target_label": item.get("label"),
-                    "dynamic_target_query": item.get("query"),
-                    "temporal_role": item.get("temporal_role"),
-                }
-            )
-            all_evidence.extend(observation.evidence)
-            frontier.extend(observation.frontier)
-            observation_timing = observation.metadata.get("timing")
-            if isinstance(observation_timing, dict):
-                for key, value in observation_timing.items():
-                    try:
-                        timing[key] = round(timing.get(key, 0.0) + float(value), 6)
-                    except (TypeError, ValueError):
-                        continue
+        span_limit_key = "_dynamic_chain_speech_span_limit"
+        previous_span_limit = state.global_context.get(span_limit_key)
+        had_previous_span_limit = span_limit_key in state.global_context
+        state.global_context[span_limit_key] = self._dynamic_chain_speech_span_limit(chain_items)
+        try:
+            for item in chain_items:
+                node_id = str(item.get("node_id") or "")
+                modality = str(item.get("modality") or "speech")
+                target_slot = str(item.get("target_slot") or "") or None
+                if modality not in {"speech", "visual", "ocr", "audio", "cross_modal"}:
+                    modality = "speech"
+                observation = self.open(
+                    node_id=node_id,
+                    modality=cast(Modality, modality),
+                    state=state,
+                    target_slot=target_slot,
+                    allow_reopen=True,
+                )
+                observations.append(observation)
+                opened_targets.append(
+                    {
+                        "node_id": observation.node_id or node_id,
+                        "modality": observation.metadata.get("modality") or modality,
+                        "target_slot": observation.metadata.get("target_slot") or target_slot,
+                        "result": observation.metadata.get("result", "unknown"),
+                        "dynamic_target_id": item.get("target_id"),
+                        "dynamic_target_label": item.get("label"),
+                        "dynamic_target_query": item.get("query"),
+                        "temporal_role": item.get("temporal_role"),
+                    }
+                )
+                all_evidence.extend(observation.evidence)
+                frontier.extend(observation.frontier)
+                observation_timing = observation.metadata.get("timing")
+                if isinstance(observation_timing, dict):
+                    for key, value in observation_timing.items():
+                        try:
+                            timing[key] = round(timing.get(key, 0.0) + float(value), 6)
+                        except (TypeError, ValueError):
+                            continue
+        finally:
+            if had_previous_span_limit:
+                state.global_context[span_limit_key] = previous_span_limit
+            else:
+                state.global_context.pop(span_limit_key, None)
 
         evidence = self._dedupe_chain_evidence(all_evidence)
         chain_metadata = self._attach_evidence_bundle_metadata(
@@ -1140,7 +1318,29 @@ class VideoToolExecutor:
                 str(item["node_id"]),
             )
         )
-        return selected_items[:4]
+        return selected_items
+
+    def _allow_reopen_for_dynamic_chain_action(
+        self,
+        action: ControllerAction,
+        state: ControllerState,
+    ) -> bool:
+        if action.action_type != "OPEN" or not action.node_id:
+            return False
+        if action.metadata.get("dynamic_chain_open") is not True:
+            return False
+        if action.metadata.get("allow_reopen") is not True:
+            return False
+        metadata = state.global_context.get("dynamic_evidence_retrieval")
+        if not isinstance(metadata, dict) or not metadata.get("enabled"):
+            return False
+        selected = metadata.get("selected")
+        if not isinstance(selected, list):
+            return False
+        return any(
+            isinstance(raw, dict) and str(raw.get("node_id") or "") == action.node_id
+            for raw in selected
+        )
 
     def _opened_node_ids_for_state(self, state: ControllerState) -> set[str]:
         opened = {
@@ -1176,6 +1376,14 @@ class VideoToolExecutor:
         if "background" in roles:
             return "chain_background_only"
         return "chain_no_evidence"
+
+    def _dynamic_chain_speech_span_limit(self, chain_items: list[dict[str, object]]) -> int:
+        speech_targets = sum(
+            1
+            for item in chain_items
+            if str(item.get("modality") or "speech") in {"speech", "cross_modal"}
+        )
+        return min(12, max(4, speech_targets * 3))
 
     def _attach_evidence_bundle_metadata(
         self,
@@ -4980,6 +5188,7 @@ class VideoToolExecutor:
         state: ControllerState,
         max_items: int = 2,
     ) -> list[tuple[SpeechSpan, float]]:
+        max_items = self._speech_span_selection_limit(state, default=max_items)
         cleaned_spans = [span for span in spans if span.text.strip()]
         if not cleaned_spans:
             return []
@@ -5053,6 +5262,16 @@ class VideoToolExecutor:
         return [
             (cleaned_spans[index], score_by_index[index]) for index in ordered_indices[:max_items]
         ]
+
+    def _speech_span_selection_limit(self, state: ControllerState, *, default: int) -> int:
+        raw_limit = state.global_context.get("_dynamic_chain_speech_span_limit")
+        if raw_limit is None:
+            return default
+        try:
+            parsed = int(raw_limit)
+        except (TypeError, ValueError):
+            return default
+        return max(default, min(parsed, 12))
 
     def _score_speech_span(
         self,

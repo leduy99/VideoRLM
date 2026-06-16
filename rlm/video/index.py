@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import os
 import re
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -15,6 +18,10 @@ SEMANTIC_FRAME_SIMILARITY_THRESHOLD = 0.16
 SEMANTIC_FRAME_EDGE_THRESHOLD = 0.78
 MAX_FRAME_SIMILARITY_NEIGHBORS = 3
 MAX_SEMANTIC_FRAME_SIMILARITY_NEIGHBORS = 3
+SPEECH_DENSE_ONLY_SCORE_CAP = 0.35
+SPEECH_ANCHORLESS_TEMPORAL_SCORE_CAP = 0.42
+SPEECH_ANCHOR_AFTER_SECONDS = 120.0
+SPEECH_ANCHOR_BEFORE_SECONDS = 120.0
 STOPWORDS = {
     "a",
     "an",
@@ -123,6 +130,110 @@ class FrameVectorRecord:
 
 
 @dataclass
+class TextSearchRecord:
+    node_id: str
+    text: str
+    tokens: list[str]
+    term_counts: Counter[str]
+    level: VideoNodeLevel
+    time_span: TimeSpan
+
+    @property
+    def doc_len(self) -> int:
+        return len(self.tokens)
+
+
+class BM25TextIndex:
+    def __init__(
+        self,
+        records: list[TextSearchRecord],
+        *,
+        k1: float = 1.5,
+        b: float = 0.75,
+    ):
+        self.records = records
+        self.k1 = k1
+        self.b = b
+        self.avg_doc_len = (
+            sum(record.doc_len for record in records) / len(records) if records else 0.0
+        )
+        self.idf = self._build_idf(records)
+
+    def search(
+        self,
+        query_tokens: Iterable[str],
+        *,
+        top_k: int,
+        allowed_levels: set[VideoNodeLevel] | None = None,
+    ) -> list[tuple[TextSearchRecord, float]]:
+        if top_k <= 0 or not self.records:
+            return []
+        unique_query_tokens = sorted(set(query_tokens))
+        if not unique_query_tokens:
+            return []
+        scored: list[tuple[TextSearchRecord, float]] = []
+        for record in self.records:
+            if allowed_levels is not None and record.level not in allowed_levels:
+                continue
+            score = self._score_record(record, unique_query_tokens)
+            if score <= 0:
+                continue
+            scored.append((record, round(score, 6)))
+        scored.sort(key=lambda item: (-item[1], item[0].time_span.start, item[0].node_id))
+        return scored[:top_k]
+
+    def _score_record(self, record: TextSearchRecord, query_tokens: list[str]) -> float:
+        if record.doc_len <= 0:
+            return 0.0
+        score = 0.0
+        length_norm = self.k1 * (
+            1.0 - self.b + self.b * (record.doc_len / max(self.avg_doc_len, 1e-6))
+        )
+        for token in query_tokens:
+            frequency = record.term_counts.get(token, 0)
+            if frequency <= 0:
+                continue
+            numerator = frequency * (self.k1 + 1.0)
+            denominator = frequency + length_norm
+            score += self.idf.get(token, 0.0) * (numerator / max(denominator, 1e-6))
+        return score
+
+    def _build_idf(self, records: list[TextSearchRecord]) -> dict[str, float]:
+        import math
+
+        document_count = len(records)
+        document_frequency: Counter[str] = Counter()
+        for record in records:
+            document_frequency.update(set(record.tokens))
+        return {
+            token: math.log(1.0 + ((document_count - frequency + 0.5) / (frequency + 0.5)))
+            for token, frequency in document_frequency.items()
+        }
+
+
+@dataclass
+class SpeechCandidateIndex:
+    records: list[TextSearchRecord]
+    bm25: BM25TextIndex
+    dense_index: FrameVectorIndex | None = None
+
+    def record_by_node_id(self) -> dict[str, TextSearchRecord]:
+        return {record.node_id: record for record in self.records}
+
+
+@dataclass(frozen=True)
+class SpeechAnchorConstraint:
+    kind: str
+    anchor_query: str
+    answer_type: str | None = None
+    before_seconds: float = 0.0
+    after_seconds: float = 0.0
+
+
+_SPEECH_CANDIDATE_INDEX_CACHE: dict[tuple[int, int, int], SpeechCandidateIndex] = {}
+
+
+@dataclass
 class FrameVectorMatch:
     node_id: str
     score: float
@@ -223,6 +334,7 @@ class VideoMemoryIndex:
         self._embedding_cache: dict[tuple[str, str], list[float]] = {}
         self._speech_embedding_cache: dict[tuple[str, str], list[float]] = {}
         self._image_text_embedding_cache: dict[str, list[float]] = {}
+        self._search_cache: dict[tuple[str, str, int, tuple[str, ...]], list[SearchHit]] = {}
         self._semantic_frame_vector_index = self._build_semantic_frame_vector_index()
 
     def search(
@@ -232,22 +344,589 @@ class VideoMemoryIndex:
         top_k: int = 5,
         levels: Iterable[VideoNodeLevel] | None = None,
     ) -> list[SearchHit]:
+        level_tuple = tuple(str(level) for level in levels) if levels else ()
+        cache_key = (query, str(modality or ""), top_k, level_tuple)
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        search_levels: tuple[str, ...] | None = level_tuple or None
         if modality == "speech":
-            hits = self.lexical_search(
+            results = self.speech_search(
                 query=query,
-                modality=modality,
-                top_k=max(top_k * 5, 30),
-                levels=levels,
+                top_k=top_k,
+                levels=search_levels,
             )
-            return self._prioritize_fine_speech_hits(hits, top_k)
+            self._search_cache[cache_key] = list(results)
+            return results
         if self.search_mode == "graph" and (modality in GRAPH_MODALITIES or modality is None):
-            return self.graph_search(
+            results = self.graph_search(
                 query=query,
                 modality=modality,
                 top_k=top_k,
-                levels=levels,
+                levels=search_levels,
             )
-        return self.lexical_search(query=query, modality=modality, top_k=top_k, levels=levels)
+            self._search_cache[cache_key] = list(results)
+            return results
+        results = self.lexical_search(
+            query=query,
+            modality=modality,
+            top_k=top_k,
+            levels=search_levels,
+        )
+        self._search_cache[cache_key] = list(results)
+        return results
+
+    def speech_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        levels: Iterable[VideoNodeLevel] | None = None,
+    ) -> list[SearchHit]:
+        query_terms = self._tokenize_terms(query)
+        if not query_terms or top_k <= 0:
+            return []
+
+        allowed_levels = set(levels) if levels else None
+        candidate_limit = max(top_k * 12, 96)
+        candidate_index = self._speech_candidate_index()
+        record_lookup = candidate_index.record_by_node_id()
+        candidate_scores: dict[str, dict[str, float]] = {}
+        anchor_constraint = self._speech_anchor_constraint(query)
+        anchor_intervals = self._speech_anchor_intervals(
+            candidate_index=candidate_index,
+            constraint=anchor_constraint,
+            allowed_levels=allowed_levels,
+        )
+
+        bm25_matches = candidate_index.bm25.search(
+            query_terms,
+            top_k=candidate_limit,
+            allowed_levels=allowed_levels,
+        )
+        max_bm25_score = max((score for _record, score in bm25_matches), default=0.0)
+        for record, score in bm25_matches:
+            normalized_score = score / max_bm25_score if max_bm25_score > 0 else 0.0
+            candidate_scores.setdefault(record.node_id, {})["bm25"] = normalized_score
+
+        dense_matches = self._speech_dense_matches(
+            candidate_index,
+            query=query,
+            top_k=candidate_limit,
+            allowed_levels=allowed_levels,
+        )
+        for record, score in dense_matches:
+            candidate_scores.setdefault(record.node_id, {})["dense"] = score
+
+        if anchor_intervals:
+            for record in candidate_index.records:
+                if allowed_levels is not None and record.level not in allowed_levels:
+                    continue
+                interval_score = self._anchor_interval_score(record.time_span, anchor_intervals)
+                if interval_score <= 0:
+                    continue
+                candidate_scores.setdefault(record.node_id, {})["anchor_interval"] = interval_score
+
+        hits: list[SearchHit] = []
+        query_tokens = set(query_terms)
+        for node_id, scores in candidate_scores.items():
+            if node_id not in record_lookup:
+                continue
+            anchor_interval_score = scores.get("anchor_interval", 0.0)
+            if anchor_intervals and anchor_interval_score <= 0:
+                continue
+            hit = self._score_speech_candidate(
+                node_id=node_id,
+                query=query,
+                query_tokens=query_tokens,
+                bm25_score=scores.get("bm25", 0.0),
+                dense_score=scores.get("dense", 0.0),
+                anchor_constraint=anchor_constraint,
+                anchor_interval_score=anchor_interval_score,
+            )
+            if hit is not None:
+                hits.append(hit)
+
+        hits.sort(key=lambda item: (-item.score, item.time_span.start, item.node_id))
+        return self._prioritize_fine_speech_hits(hits, top_k)
+
+    def _speech_candidate_index(self) -> SpeechCandidateIndex:
+        provider_key = id(self.speech_embedding_provider) if self.speech_embedding_provider else 0
+        cache_key = (id(self.memory), provider_key, len(self.memory.nodes))
+        cached = _SPEECH_CANDIDATE_INDEX_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        records = self._speech_text_records()
+        bm25 = BM25TextIndex(records)
+        dense_index = self._build_speech_dense_index(records)
+        candidate_index = SpeechCandidateIndex(
+            records=records,
+            bm25=bm25,
+            dense_index=dense_index,
+        )
+        _SPEECH_CANDIDATE_INDEX_CACHE[cache_key] = candidate_index
+        return candidate_index
+
+    def _speech_text_records(self) -> list[TextSearchRecord]:
+        records: list[TextSearchRecord] = []
+        for node in self.memory.nodes.values():
+            if node.level == "video":
+                continue
+            text = self._node_text(node, "speech")
+            if not text:
+                continue
+            tokens = self._tokenize_terms(text)
+            if not tokens:
+                continue
+            records.append(
+                TextSearchRecord(
+                    node_id=node.node_id,
+                    text=text,
+                    tokens=tokens,
+                    term_counts=Counter(tokens),
+                    level=node.level,
+                    time_span=node.time_span,
+                )
+            )
+        return records
+
+    def _build_speech_dense_index(
+        self,
+        records: list[TextSearchRecord],
+    ) -> FrameVectorIndex | None:
+        if self.speech_embedding_provider is None or not records:
+            return None
+        texts = [record.text for record in records]
+        embeddings = self._embed_text_batch(texts, "speech")
+        vector_records = [
+            FrameVectorRecord(node_id=record.node_id, embedding=embedding)
+            for record, embedding in zip(records, embeddings, strict=False)
+            if embedding
+        ]
+        if not vector_records:
+            return None
+        return FrameVectorIndex(vector_records)
+
+    def _speech_dense_matches(
+        self,
+        candidate_index: SpeechCandidateIndex,
+        *,
+        query: str,
+        top_k: int,
+        allowed_levels: set[VideoNodeLevel] | None,
+    ) -> list[tuple[TextSearchRecord, float]]:
+        if candidate_index.dense_index is None:
+            return []
+        query_embedding = self._embed_cached(("query", query), query, "speech")
+        if not query_embedding:
+            return []
+        record_lookup = candidate_index.record_by_node_id()
+        matches: list[tuple[TextSearchRecord, float]] = []
+        for match in candidate_index.dense_index.search(query_embedding, top_k * 2):
+            record = record_lookup.get(match.node_id)
+            if record is None:
+                continue
+            if allowed_levels is not None and record.level not in allowed_levels:
+                continue
+            matches.append((record, round(max(0.0, match.score), 6)))
+            if len(matches) >= top_k:
+                break
+        return matches
+
+    def _speech_anchor_constraint(self, query: str) -> SpeechAnchorConstraint | None:
+        lowered = query.lower()
+        answer_type = self._speech_answer_type(query)
+        after_anchor = self._extract_temporal_anchor(
+            query,
+            patterns=(
+                r"\bright\s+after\s+(.+?)(?:\?|$)",
+                r"\bimmediately\s+after\s+(.+?)(?:\?|$)",
+                r"\bjust\s+after\s+(.+?)(?:\?|$)",
+                r"\bafter\s+(.+?)(?:\?|$)",
+            ),
+        )
+        if after_anchor:
+            return SpeechAnchorConstraint(
+                kind="after",
+                anchor_query=after_anchor,
+                answer_type=answer_type or "consequence_event",
+                before_seconds=15.0,
+                after_seconds=SPEECH_ANCHOR_AFTER_SECONDS,
+            )
+        before_anchor = self._extract_temporal_anchor(
+            query,
+            patterns=(
+                r"\bbefore\s+(.+?)(?:\?|$)",
+                r"\bprior\s+to\s+(.+?)(?:\?|$)",
+            ),
+        )
+        if before_anchor:
+            return SpeechAnchorConstraint(
+                kind="before",
+                anchor_query=before_anchor,
+                answer_type=answer_type,
+                before_seconds=SPEECH_ANCHOR_BEFORE_SECONDS,
+                after_seconds=15.0,
+            )
+        if any(
+            cue in lowered
+            for cue in (
+                "first",
+                "earliest",
+                "beginning",
+                "initial",
+                "early in",
+                "early lead",
+                "strong start",
+            )
+        ):
+            return SpeechAnchorConstraint(kind="early", anchor_query="", answer_type=answer_type)
+        if any(cue in lowered for cue in ("later", "afterward", "afterwards", "rest of", "final")):
+            return SpeechAnchorConstraint(kind="late", anchor_query="", answer_type=answer_type)
+        if answer_type is not None:
+            return SpeechAnchorConstraint(
+                kind="answer_type",
+                anchor_query="",
+                answer_type=answer_type,
+            )
+        return None
+
+    def _extract_temporal_anchor(self, query: str, *, patterns: Iterable[str]) -> str:
+        for pattern in patterns:
+            match = re.search(pattern, query, flags=re.IGNORECASE)
+            if match is None:
+                continue
+            anchor = self._clean_anchor_query(match.group(1))
+            if anchor:
+                return anchor
+        return ""
+
+    def _clean_anchor_query(self, text: str) -> str:
+        cleaned = re.split(
+            r"\b(?:and why|and how|and what|because|so that|but|while|even though)\b",
+            text,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        cleaned = re.sub(r"\b(?:in this video|in the video|from the video)\b", " ", cleaned)
+        cleaned = re.sub(r"^[\s,.;:!?]*(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+        tokens = [
+            token
+            for token in self._tokenize_terms(cleaned)
+            if token
+            not in {
+                "after",
+                "before",
+                "right",
+                "immediately",
+                "just",
+                "next",
+                "happen",
+                "happened",
+                "happens",
+                "thing",
+                "part",
+            }
+        ]
+        return " ".join(tokens[:8])
+
+    def _speech_anchor_intervals(
+        self,
+        *,
+        candidate_index: SpeechCandidateIndex,
+        constraint: SpeechAnchorConstraint | None,
+        allowed_levels: set[VideoNodeLevel] | None,
+    ) -> list[TimeSpan]:
+        if constraint is None or not constraint.anchor_query:
+            return []
+        anchor_terms = self._tokenize_terms(constraint.anchor_query)
+        if not anchor_terms:
+            return []
+        matches = candidate_index.bm25.search(
+            anchor_terms,
+            top_k=32,
+            allowed_levels=allowed_levels,
+        )
+        max_bm25 = max((score for _record, score in matches), default=0.0)
+        ranked: list[tuple[float, TextSearchRecord]] = []
+        anchor_lower = constraint.anchor_query.lower()
+        anchor_tokens = set(anchor_terms)
+        for record, bm25_score in matches:
+            lexical_score, overlap = self._lexical_score(anchor_lower, anchor_tokens, record.text)
+            if not overlap:
+                continue
+            normalized_bm25 = bm25_score / max_bm25 if max_bm25 > 0 else 0.0
+            score = (0.65 * lexical_score) + (0.35 * normalized_bm25)
+            if score <= 0.08:
+                continue
+            ranked.append((round(score, 4), record))
+        ranked.sort(key=lambda item: (-item[0], item[1].time_span.start, item[1].node_id))
+        intervals: list[TimeSpan] = []
+        duration = float(self.memory.metadata.get("duration_seconds") or 0.0)
+        for _score, record in ranked[:3]:
+            start = record.time_span.start
+            end = record.time_span.end
+            if constraint.kind == "after":
+                interval = TimeSpan(
+                    max(0.0, start - constraint.before_seconds),
+                    self._clamp_time(end + constraint.after_seconds, duration),
+                )
+            elif constraint.kind == "before":
+                interval = TimeSpan(
+                    max(0.0, start - constraint.before_seconds),
+                    self._clamp_time(end + constraint.after_seconds, duration),
+                )
+            else:
+                continue
+            intervals.append(interval)
+        return self._merge_intervals(intervals)
+
+    def _anchor_interval_score(self, span: TimeSpan, intervals: list[TimeSpan]) -> float:
+        best = 0.0
+        for interval in intervals:
+            overlap = min(span.end, interval.end) - max(span.start, interval.start)
+            if overlap <= 0:
+                continue
+            shorter = max(1e-6, min(span.duration, interval.duration))
+            overlap_ratio = max(0.0, min(1.0, overlap / shorter))
+            best = max(best, 0.5 + (0.5 * overlap_ratio))
+        return round(best, 4)
+
+    def _speech_anchor_text_score(
+        self,
+        constraint: SpeechAnchorConstraint | None,
+        text: str,
+    ) -> float:
+        if constraint is None or not constraint.anchor_query:
+            return 0.0
+        anchor_tokens = set(self._tokenize_terms(constraint.anchor_query))
+        if not anchor_tokens:
+            return 0.0
+        doc_tokens = set(self._tokenize_terms(text))
+        overlap = anchor_tokens & doc_tokens
+        return round(min(1.0, len(overlap) / max(1, min(len(anchor_tokens), 6))), 4)
+
+    def _speech_answer_type(self, query: str) -> str | None:
+        lowered = query.lower()
+        if any(cue in lowered for cue in ("why", "reason", "because", "made", "meant")):
+            return "causal_explanation"
+        if any(cue in lowered for cue in ("what happened", "right after", "immediately after", "next")):
+            return "consequence_event"
+        if any(cue in lowered for cue in ("how did", "how was", "fix", "solve", "address")):
+            return "process_fix"
+        if any(cue in lowered for cue in ("first piece", "which piece", "what piece", "object")):
+            return "object_identification"
+        return None
+
+    def _speech_answer_type_score(
+        self,
+        constraint: SpeechAnchorConstraint | None,
+        query: str,
+        text: str,
+    ) -> float:
+        answer_type = constraint.answer_type if constraint is not None else None
+        answer_type = answer_type or self._speech_answer_type(query)
+        if answer_type is None:
+            return 0.0
+        lowered = text.lower()
+        keyword_groups = {
+            "causal_explanation": (
+                "because",
+                "reason",
+                "meant",
+                "so",
+                "therefore",
+                "caused",
+                "led",
+                "wanted",
+                "needed",
+                "had to",
+                "couldn't",
+                "could not",
+            ),
+            "consequence_event": (
+                "then",
+                "after",
+                "next",
+                "damaged",
+                "leaking",
+                "lost",
+                "losing",
+                "started",
+                "began",
+                "result",
+                "oxygen",
+                "electricity",
+            ),
+            "process_fix": (
+                "used",
+                "using",
+                "made",
+                "built",
+                "adapted",
+                "fixed",
+                "solve",
+                "address",
+                "tape",
+                "cardboard",
+                "sock",
+                "filter",
+                "canister",
+            ),
+            "object_identification": (
+                "ring",
+                "bracelet",
+                "necklace",
+                "earrings",
+                "piece",
+                "object",
+                "diamond",
+                "jewelry",
+            ),
+        }
+        hits = sum(1 for keyword in keyword_groups.get(answer_type, ()) if keyword in lowered)
+        if hits <= 0:
+            return 0.0
+        return round(min(0.18, 0.07 + (0.04 * hits)), 4)
+
+    def _merge_intervals(self, intervals: list[TimeSpan]) -> list[TimeSpan]:
+        if not intervals:
+            return []
+        ordered = sorted(intervals, key=lambda item: (item.start, item.end))
+        merged = [ordered[0]]
+        for interval in ordered[1:]:
+            current = merged[-1]
+            if interval.start <= current.end:
+                merged[-1] = TimeSpan(current.start, max(current.end, interval.end))
+            else:
+                merged.append(interval)
+        return merged
+
+    def _clamp_time(self, value: float, duration: float) -> float:
+        if duration <= 0:
+            return max(0.0, value)
+        return max(0.0, min(duration, value))
+
+    def _score_speech_candidate(
+        self,
+        *,
+        node_id: str,
+        query: str,
+        query_tokens: set[str],
+        bm25_score: float,
+        dense_score: float,
+        anchor_constraint: SpeechAnchorConstraint | None = None,
+        anchor_interval_score: float = 0.0,
+    ) -> SearchHit | None:
+        node = self.memory.get_node(node_id)
+        query_lower = query.lower()
+        text = self._node_text(node, "speech")
+        if not text:
+            return None
+
+        lexical_score, overlap = self._lexical_score(query_lower, query_tokens, text)
+        semantic_score = dense_score
+        temporal_score = self._temporal_score(query_tokens, node.time_span)
+        section_score = self._section_score(query_lower, query_tokens, node)
+        anchor_score = self._speech_anchor_text_score(anchor_constraint, text)
+        answer_type_score = self._speech_answer_type_score(anchor_constraint, query, text)
+        if (
+            lexical_score <= 0
+            and semantic_score <= 0
+            and section_score <= 0
+            and bm25_score <= 0
+            and anchor_interval_score <= 0
+            and answer_type_score <= 0
+        ):
+            return None
+        if (
+            lexical_score <= 0
+            and section_score <= 0
+            and bm25_score <= 0
+            and anchor_score <= 0
+            and anchor_interval_score <= 0
+            and semantic_score < self.speech_semantic_min_score
+        ):
+            return None
+
+        bm25_bonus = 0.12 * max(0.0, min(1.0, bm25_score))
+        anchor_interval_bonus = 0.22 * max(0.0, min(1.0, anchor_interval_score))
+        score = round(
+            self._combine_scores(
+                lexical_score,
+                semantic_score,
+                temporal_score,
+                "speech",
+            )
+            + section_score
+            + bm25_bonus
+            + anchor_interval_bonus
+            + answer_type_score,
+            4,
+        )
+        dense_only = (
+            semantic_score > 0
+            and lexical_score <= 0
+            and bm25_score <= 0
+            and section_score <= 0
+            and anchor_score <= 0
+            and anchor_interval_score <= 0
+        )
+        if dense_only:
+            score = min(score, SPEECH_DENSE_ONLY_SCORE_CAP)
+        elif (
+            anchor_constraint is not None
+            and anchor_constraint.anchor_query
+            and anchor_score <= 0
+            and anchor_interval_score <= 0
+        ):
+            score = min(score, SPEECH_ANCHORLESS_TEMPORAL_SCORE_CAP)
+        fine_speech_window = self._is_fine_speech_window_node(node.node_id)
+        if fine_speech_window:
+            score = round(score + 0.12, 4)
+
+        reason = self._build_reason(
+            modality="speech",
+            node_id=node.node_id,
+            overlap=overlap,
+            lexical_score=lexical_score,
+            semantic_score=semantic_score,
+            temporal_score=temporal_score,
+            section_score=section_score,
+        )
+        if bm25_score > 0:
+            reason = f"{reason}; bm25_asr={bm25_score:.2f}"
+        if anchor_constraint is not None:
+            reason = (
+                f"{reason}; speech_anchor={anchor_constraint.kind}; "
+                f"anchor_score={anchor_score:.2f}; "
+                f"anchor_interval={anchor_interval_score:.2f}; "
+                f"answer_type={answer_type_score:.2f}"
+            )
+        if fine_speech_window:
+            reason = f"{reason}; fine ASR retrieval window"
+        return SearchHit(
+            node_id=node.node_id,
+            time_span=node.time_span,
+            level=node.level,
+            score=score,
+            reason=reason,
+            modality="speech",
+            matched_terms=overlap,
+            score_breakdown={
+                "lexical": lexical_score,
+                "semantic": semantic_score,
+                "temporal": temporal_score,
+                "section": section_score,
+                "bm25": round(bm25_score, 4),
+                "anchor_text": anchor_score,
+                "anchor_interval": round(anchor_interval_score, 4),
+                "answer_type": answer_type_score,
+                "dense_only_cap": 1.0 if dense_only else 0.0,
+                "combined": score,
+                "fine_speech_window": 1.0 if fine_speech_window else 0.0,
+            },
+        )
 
     def lexical_search(
         self,
@@ -1374,6 +2053,46 @@ class VideoMemoryIndex:
             self._embedding_cache[cache_key] = provider.embed_text(text)
         return self._embedding_cache[cache_key]
 
+    def _embed_text_batch(self, texts: list[str], modality: Modality) -> list[list[float]]:
+        provider = self._semantic_provider_for_modality(modality)
+        if provider is None or not texts:
+            return []
+
+        cache = (
+            self._speech_embedding_cache
+            if modality == "speech" and self.speech_embedding_provider is not None
+            else self._embedding_cache
+        )
+        embeddings: list[list[float] | None] = []
+        uncached_texts: list[str] = []
+        uncached_positions: list[int] = []
+        for text in texts:
+            cache_key = ("text", text)
+            cached = cache.get(cache_key)
+            if cached is None:
+                uncached_positions.append(len(embeddings))
+                uncached_texts.append(text)
+                embeddings.append(None)
+            else:
+                embeddings.append(cached)
+
+        if uncached_texts:
+            batch_embed = getattr(provider, "embed_texts", None)
+            if callable(batch_embed):
+                computed = batch_embed(uncached_texts)
+            else:
+                computed = [provider.embed_text(text) for text in uncached_texts]
+            for position, text, embedding in zip(
+                uncached_positions,
+                uncached_texts,
+                computed,
+                strict=False,
+            ):
+                cache[("text", text)] = embedding
+                embeddings[position] = embedding
+
+        return [embedding or [] for embedding in embeddings]
+
     def _image_text_embed_cached(self, text: str) -> list[float]:
         if self.image_text_embedding_provider is None:
             return []
@@ -1387,11 +2106,14 @@ class VideoMemoryIndex:
         return _cosine_similarity(left, right)
 
     def _tokenize(self, text: str) -> set[str]:
-        return {
+        return set(self._tokenize_terms(text))
+
+    def _tokenize_terms(self, text: str) -> list[str]:
+        return [
             token
             for token in (match.group(0).lower() for match in TOKEN_PATTERN.finditer(text))
             if token not in STOPWORDS and len(token) > 1
-        }
+        ]
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:

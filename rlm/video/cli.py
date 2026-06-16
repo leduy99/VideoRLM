@@ -163,6 +163,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the LongShOT benchmark progress bar.",
     )
     _add_visual_preprocessing_args(longshot)
+    longshot.add_argument(
+        "--disable-question-routing",
+        action="store_true",
+        dest="disable_question_routing",
+        default=True,
+        help=(
+            "Disable route-specific LongShot question specs, required slots, stop "
+            "verification, and postvalid_v1 controller prompt additions. This keeps the "
+            "framework in a generic LongShOT-style SEARCH/OPEN/STOP loop. This is the "
+            "default."
+        ),
+    )
+    longshot.add_argument(
+        "--enable-question-routing",
+        action="store_false",
+        dest="disable_question_routing",
+        help=(
+            "Re-enable route-specific LongShot question specs and hard evidence slots "
+            "for ablation runs."
+        ),
+    )
     _add_shared_qwen_endpoint_args(longshot)
 
     download_local = subparsers.add_parser(
@@ -499,6 +520,7 @@ def _build_runner(args: argparse.Namespace, logger: VideoRLMLogger | None = None
         search_top_k=args.search_top_k,
         max_frontier_items=args.max_frontier_items,
         search_mode=args.search_mode,
+        disable_question_routing=getattr(args, "disable_question_routing", True),
     )
 
 
@@ -542,6 +564,7 @@ def _build_qwen_bundle(args: argparse.Namespace, logger: VideoRLMLogger | None):
         "disable_dynamic_evidence_retrieval",
         False,
     )
+    stack.disable_question_routing = getattr(args, "disable_question_routing", True)
     _apply_visual_preprocessing_args(stack, args)
     return stack.build_bundle(
         logger=logger,
@@ -597,6 +620,34 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     controller_max_new_tokens = getattr(args, "controller_max_new_tokens", None)
     if controller_max_new_tokens is not None:
         config.controller.max_new_tokens = controller_max_new_tokens
+    controller_gpu_memory = getattr(args, "controller_gpu_memory", None)
+    controller_cpu_memory = getattr(args, "controller_cpu_memory", None)
+    controller_offload_folder = getattr(args, "controller_offload_folder", None)
+    controller_device_map = getattr(args, "controller_device_map", None)
+    if (
+        not controller_device_map
+        and (controller_gpu_memory or controller_cpu_memory or controller_offload_folder)
+    ):
+        controller_device_map = "auto"
+    if controller_device_map:
+        config.controller.device_map = controller_device_map
+    if controller_gpu_memory or controller_cpu_memory or controller_offload_folder:
+        controller_model_kwargs = dict(config.controller.model_kwargs or {})
+        if controller_device_map == "auto":
+            controller_model_kwargs.setdefault("low_cpu_mem_usage", True)
+        max_memory = dict(controller_model_kwargs.get("max_memory") or {})
+        if controller_gpu_memory:
+            max_memory[_controller_cuda_memory_key(args.controller_device)] = (
+                controller_gpu_memory
+            )
+        if controller_cpu_memory:
+            max_memory["cpu"] = controller_cpu_memory
+        if max_memory:
+            controller_model_kwargs["max_memory"] = max_memory
+        if controller_offload_folder:
+            controller_model_kwargs["offload_folder"] = controller_offload_folder
+            controller_model_kwargs.setdefault("offload_state_dict", True)
+        config.controller.model_kwargs = controller_model_kwargs
     speech_model_path = getattr(args, "speech_model_path", None)
     if speech_model_path:
         config.speech.model_path = speech_model_path
@@ -682,6 +733,12 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
         "faster_whisper_compute_type",
         "default",
     )
+    config.faster_whisper_batch_size = getattr(args, "faster_whisper_batch_size", 1)
+    config.faster_whisper_chunk_workers = getattr(
+        args,
+        "faster_whisper_chunk_workers",
+        1,
+    )
     config.lazy_speech_refinement = getattr(args, "lazy_speech_refinement", False)
     config.enable_targeted_asr_refinement = getattr(
         args,
@@ -708,6 +765,7 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
         "disable_dynamic_evidence_retrieval",
         False,
     )
+    config.disable_question_routing = getattr(args, "disable_question_routing", True)
     config.enable_refinement_frontier = not getattr(
         args,
         "disable_refinement_frontier",
@@ -758,6 +816,16 @@ def _build_local_qwen_config(args: argparse.Namespace) -> QwenLocalVideoStackCon
     _apply_visual_preprocessing_args(config, args)
     _apply_official_video_strategy(config)
     return config
+
+
+def _controller_cuda_memory_key(device: str) -> int | str:
+    if device.startswith("cuda:"):
+        index_text = device.split(":", 1)[1]
+        if index_text.isdigit():
+            return int(index_text)
+    if device == "cuda":
+        return 0
+    return device
 
 
 def _build_logger(args: argparse.Namespace) -> VideoRLMLogger | None:
@@ -972,6 +1040,31 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--controller-max-new-tokens", type=int)
     parser.add_argument("--controller-trust-remote-code", action="store_true")
     parser.add_argument(
+        "--controller-device-map",
+        help=(
+            "Optional Hugging Face device_map for the local controller. Use 'auto' "
+            "to shard/offload large controller models instead of forcing one GPU."
+        ),
+    )
+    parser.add_argument(
+        "--controller-gpu-memory",
+        help=(
+            "Max memory for the controller GPU shard, e.g. 32GiB. Used with "
+            "device_map='auto'."
+        ),
+    )
+    parser.add_argument(
+        "--controller-cpu-memory",
+        help=(
+            "Max CPU RAM available for controller offload, e.g. 120GiB. Used "
+            "with device_map='auto'."
+        ),
+    )
+    parser.add_argument(
+        "--controller-offload-folder",
+        help="Folder for Hugging Face disk offload files when using device_map='auto'.",
+    )
+    parser.add_argument(
         "--controller-api-base-url",
         help="Use an OpenAI-compatible API controller instead of the local controller.",
     )
@@ -1024,6 +1117,8 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--faster-whisper-model", default="small")
     parser.add_argument("--faster-whisper-device", default="cpu")
     parser.add_argument("--faster-whisper-compute-type", default="default")
+    parser.add_argument("--faster-whisper-batch-size", type=int, default=1)
+    parser.add_argument("--faster-whisper-chunk-workers", type=int, default=1)
     parser.add_argument(
         "--lazy-speech-refinement",
         action="store_true",
@@ -1152,6 +1247,27 @@ def _add_local_qwen_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Disable the LongShot multi-target dynamic-programming retrieval planner. "
             "By default complex LongShot questions retrieve an ordered evidence chain."
+        ),
+    )
+    parser.add_argument(
+        "--disable-question-routing",
+        action="store_true",
+        dest="disable_question_routing",
+        default=True,
+        help=(
+            "Disable route-specific LongShot question specs, required slots, stop "
+            "verification, and postvalid_v1 controller prompt additions. This keeps the "
+            "framework in a generic LongShOT-style SEARCH/OPEN/STOP loop. This is the "
+            "default."
+        ),
+    )
+    parser.add_argument(
+        "--enable-question-routing",
+        action="store_false",
+        dest="disable_question_routing",
+        help=(
+            "Re-enable route-specific LongShot question specs and hard evidence slots "
+            "for ablation runs."
         ),
     )
     parser.add_argument(

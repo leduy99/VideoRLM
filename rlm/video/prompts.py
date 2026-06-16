@@ -92,6 +92,7 @@ Rules:
 - Output JSON only, with no markdown fences or extra commentary.
 """
 
+
 LONGSHOT_CONTROLLER_PROMPT_SECTION = """LongShotBench instructions:
 - Treat this as a LongShotBench post-validation task when `global_context.benchmark` is `longshotbench`.
 - Use `global_context.longshot.expected_modalities` and `required_tools` as retrieval hints, not
@@ -103,7 +104,10 @@ LONGSHOT_CONTROLLER_PROMPT_SECTION = """LongShotBench instructions:
 - Use dialogue context to resolve follow-up references, but answer only the current user turn.
 - STOP with a natural-language answer, not an option letter, unless explicit answer choices are
   present in the current question.
-- Keep the final answer concise and directly grounded in evidence ids.
+- Unless the question asks for an exact numeric/code/OCR/UI/terminal-output value, make the final
+  answer a complete LongShotBench-style response: 2-4 grounded sentences, usually 60-100 words,
+  covering the direct answer, concrete supporting details, the why/how or temporal link, and the
+  result, consequence, or contrast when relevant.
 """
 
 LONGSHOT_POSTVALID_V1_CONTROLLER_PROMPT_SECTION = """LongShotBench postvalid_v1 instructions:
@@ -140,6 +144,18 @@ LONGSHOT_POSTVALID_V1_CONTROLLER_PROMPT_SECTION = """LongShotBench postvalid_v1 
   later action. Aggregate 2-3 speech windows when the first evidence item is partial.
 - Fine ASR windows are local snippets. Use their nearby context and adjacent opened spans to
   synthesize the final answer; do not copy one raw fine-ASR snippet when it is incomplete.
+- Never include raw evidence labels such as `Fine ASR window:` or `Nearby speech context:` in the
+  final answer. Rewrite those snippets into natural answer text.
+- Match the ground-truth answer trend: most LongShot answers should include the direct answer,
+  named evidence/details, a causal or temporal link, and the consequence or contrast. Use 2-4
+  complete sentences unless the question truly asks for a short exact value.
+- Task-specific answer shape: why/how = cause + mechanism + evidence + consequence; right
+  after/then/later = anchor event + immediate next event + consequence; first/earliest = exact
+  item + context + why it mattered; summarization = event sequence + main difficulty + outcome;
+  sentiment_analysis = speech/context + visible behavior + inferred emotion; quantitative =
+  exact value + formula/process + meaning; multimodal_synthesis = explicitly combine available
+  speech, visual, and audio evidence; information_retrieval = answer + named details +
+  surrounding explanation.
 - When `dynamic_evidence_retrieval` is present, treat its `targets` and `selected` nodes as the
   planned evidence combination. Open enough distinct selected nodes to cover the targets before
   synthesizing the final answer.
@@ -327,6 +343,11 @@ def _compact_cognitive_metadata(metadata: dict) -> dict:
         "merged_event_adjacent",
         "shared_situation_index_labels",
         "stage2_window_reason",
+        "prior_turn_evidence",
+        "prior_turn_index",
+        "prior_question",
+        "prior_answer",
+        "original_evidence_id",
     )
     compact = {key: metadata[key] for key in keys if key in metadata}
     event_schema = metadata.get("event_schema") or metadata.get("merged_event_schema")

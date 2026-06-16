@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from rlm.clients.base_lm import BaseLM
@@ -147,6 +148,9 @@ class TransformersClient(BaseLM):
         }
         if self.attn_implementation is not None:
             model_kwargs["attn_implementation"] = self.attn_implementation
+        offload_folder = model_kwargs.get("offload_folder")
+        if offload_folder:
+            Path(str(offload_folder)).mkdir(parents=True, exist_ok=True)
 
         import torch
 
@@ -170,6 +174,18 @@ class TransformersClient(BaseLM):
     def _resolve_input_device(self):
         if self.model is None:
             raise ValueError("Model is not loaded")
+        device_map = getattr(self.model, "hf_device_map", None)
+        if isinstance(device_map, dict):
+            import torch
+
+            for mapped_device in device_map.values():
+                if isinstance(mapped_device, int):
+                    return torch.device(f"cuda:{mapped_device}")
+                mapped_device_str = str(mapped_device)
+                if mapped_device_str.startswith("cuda"):
+                    return torch.device(mapped_device_str)
+            if any(str(mapped_device) == "cpu" for mapped_device in device_map.values()):
+                return torch.device("cpu")
         try:
             return next(self.model.parameters()).device
         except StopIteration as exc:
